@@ -36,6 +36,8 @@ gc = GenderComputer()
 
 Base = declarative_base()
 
+ENABLE_REFERENCES = False
+
 # Association tables for many-to-many relationships
 articles_authors_table = Table(
     "articles_authors",
@@ -454,7 +456,7 @@ class OptimizedSQLCompiler:
                 print(f"Inserted {len(self.temp_data['concepts'])} concepts")
 
             # Bulk insert references
-            if self.temp_data["references"]:
+            if self.temp_data["references"] and ENABLE_REFERENCES:
                 # For SQLite, we need to handle the reserved keyword "references" differently
                 if self.database_type == 'sqlite':
                     # Use executemany with proper SQLite syntax
