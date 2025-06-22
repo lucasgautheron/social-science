@@ -40,6 +40,61 @@ def preprocess_text(text: str) -> str:
     return text
 
 
+def extract_ngrams_for_articles(args: Tuple) -> Dict:
+    """Extract n-grams from a batch of articles (new worker function)"""
+    articles_data, ngram_range, blacklist = args
+
+    if not articles_data:
+        return {
+            'year_results': {},
+            'total_processed': 0
+        }
+
+    # Group articles by year
+    year_groups = defaultdict(list)
+    year_article_ids = defaultdict(list)
+
+    for article_id, year, raw_text in articles_data:
+        processed_text = preprocess_text(raw_text)
+        if processed_text.strip():
+            year_groups[year].append(processed_text)
+            year_article_ids[year].append(article_id)
+
+    year_results = {}
+    total_processed = 0
+
+    # Process each year in this batch
+    for year, texts in year_groups.items():
+        article_ids = year_article_ids[year]
+
+        if not texts:
+            continue
+
+        # Extract n-grams for this year
+        ngram_counts, doc_presence, ngram_articles = extract_ngrams_for_year(
+            texts, article_ids, ngram_range, blacklist
+        )
+
+        # Count total words for this year
+        total_words = sum(len(text.split()) for text in texts)
+
+        year_results[year] = {
+            'year_doc_count': len(texts),
+            'year_word_count': total_words,
+            'ngram_counts': ngram_counts,
+            'doc_presence': doc_presence,
+            'ngram_articles': ngram_articles,
+            'total_docs': len(texts)
+        }
+
+        total_processed += len(texts)
+
+    return {
+        'year_results': year_results,
+        'total_processed': total_processed
+    }
+
+
 def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_range: Tuple[int, int],
                             blacklist: Set[str]) -> Tuple[Dict[str, int], Set[str], Dict[str, set]]:
     """Extract n-grams from texts for a specific year, excluding blacklisted ones"""
@@ -89,45 +144,12 @@ def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_rang
         return {}, set(), {}
 
 
-def process_year_worker(args: Tuple) -> Dict:
-    """Worker function to process texts for a specific year"""
-    year, text_data, ngram_range, blacklist = args
-
-    # Extract texts and article_ids
-    texts = []
-    article_ids = []
-    for article_id, raw_text in text_data:
-        processed_text = preprocess_text(raw_text)
-        if processed_text.strip():
-            texts.append(processed_text)
-            article_ids.append(article_id)
-
-    if not texts:
-        return {
-            'year': year,
-            'year_doc_count': 0,
-            'year_word_count': 0,
-            'ngram_counts': {},
-            'doc_presence': set(),
-            'ngram_articles': {},
-            'total_docs': 0
-        }
-
-    # Extract n-grams
-    ngram_counts, doc_presence, ngram_articles = extract_ngrams_for_year(texts, article_ids, ngram_range, blacklist)
-
-    # Count total words for this year
-    total_words = sum(len(text.split()) for text in texts)
-
-    return {
-        'year': year,
-        'year_doc_count': len(texts),
-        'year_word_count': total_words,
-        'ngram_counts': ngram_counts,
-        'doc_presence': doc_presence,
-        'ngram_articles': ngram_articles,
-        'total_docs': len(texts)
-    }
+def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tuple]]:
+    """Split articles into chunks for parallel processing"""
+    chunks = []
+    for i in range(0, len(articles_data), chunk_size):
+        chunks.append(articles_data[i:i + chunk_size])
+    return chunks
 
 
 class TemporalVariationNgramAnalyzer:
@@ -137,9 +159,10 @@ class TemporalVariationNgramAnalyzer:
                  confidence_level: float = 0.95,
                  min_total_frequency: int = 10,
                  min_years_present: int = 3,
-                 n_processes: Optional[int] = None):
+                 n_processes: Optional[int] = None,
+                 articles_per_chunk: int = 1000):
         """
-        Initialize the temporal variation N-gram analyzer with blacklist filtering
+        Initialize the temporal variation N-gram analyzer with improved parallelization
 
         Args:
             database_url: Database connection string
@@ -150,6 +173,7 @@ class TemporalVariationNgramAnalyzer:
             min_total_frequency: Minimum total frequency across all years
             min_years_present: Minimum number of years n-gram must appear in
             n_processes: Number of processes to use for n-gram extraction
+            articles_per_chunk: Number of articles per chunk for parallel processing
         """
         self.database_url = database_url
         self.batch_size = batch_size
@@ -159,6 +183,7 @@ class TemporalVariationNgramAnalyzer:
         self.min_total_frequency = min_total_frequency
         self.min_years_present = min_years_present
         self.n_processes = n_processes or mp.cpu_count()
+        self.articles_per_chunk = articles_per_chunk
         self.engine = create_engine(database_url)
 
         # Progressive filtering state
@@ -182,7 +207,9 @@ class TemporalVariationNgramAnalyzer:
         # Article tracking
         self.ngram_articles = defaultdict(set)
 
-        logger.info(f"Initialized temporal variation analyzer targeting {min_fold_change}x fold changes")
+        logger.info(f"Initialized temporal variation analyzer with {self.n_processes} processes, "
+                    f"targeting {min_fold_change}x fold changes, "
+                    f"{articles_per_chunk} articles per chunk")
 
     def get_total_records(self) -> int:
         """Get total number of records to process"""
@@ -341,27 +368,28 @@ class TemporalVariationNgramAnalyzer:
                 if ngram in year_counts:
                     del year_counts[ngram]
 
-    def process_years_parallel(self, df: pd.DataFrame) -> List[Dict]:
-        """Process all years in a batch using parallel processing"""
-        if df.empty:
+    def process_articles_parallel(self, articles_data: List[Tuple]) -> List[Dict]:
+        """Process articles using improved parallel processing"""
+        if not articles_data:
             return []
 
-        year_args = []
-        for year, year_group in df.groupby('publication_year'):
-            # Include article_ids in the data
-            text_data = list(zip(year_group['article_id'], year_group['abstract']))
-            year_args.append((year, text_data, self.ngram_range, self.ngram_blacklist))
+        # Split articles into chunks for parallel processing
+        chunks = chunk_articles(articles_data, self.articles_per_chunk)
 
-        if len(year_args) == 1:
-            return [process_year_worker(year_args[0])]
+        # Prepare arguments for worker processes
+        chunk_args = [(chunk, self.ngram_range, self.ngram_blacklist) for chunk in chunks]
 
-        with Pool(processes=min(self.n_processes, len(year_args))) as pool:
-            year_results = pool.map(process_year_worker, year_args)
+        logger.info(f"Processing {len(articles_data)} articles in {len(chunks)} chunks "
+                    f"using {self.n_processes} processes")
 
-        return year_results
+        # Use fixed number of processes regardless of data size
+        with Pool(processes=self.n_processes) as pool:
+            chunk_results = pool.map(extract_ngrams_for_articles, chunk_args)
+
+        return chunk_results
 
     def process_batch(self, offset: int, batch_size: int) -> bool:
-        """Process a single batch with blacklist filtering"""
+        """Process a single batch with improved parallelization"""
         query = f"""
         SELECT 
             a.article_id, a.publication_year, ab.abstract
@@ -384,52 +412,57 @@ class TemporalVariationNgramAnalyzer:
 
             logger.info(f"Processing batch at offset {offset}, {len(df)} records...")
 
-            # Process all years in parallel
-            year_results = self.process_years_parallel(df)
+            # Prepare articles data as list of tuples
+            articles_data = [(row['article_id'], row['publication_year'], row['abstract'])
+                             for _, row in df.iterrows()]
 
-            logger.info(f"Aggregating batch results...")
+            # Process articles in parallel
+            chunk_results = self.process_articles_parallel(articles_data)
 
-            # Aggregate results from all years
-            for result in year_results:
-                year = result['year']
-                self.observed_years.add(year)
+            logger.info(f"Aggregating batch results from {len(chunk_results)} chunks...")
 
-                # Update year totals
-                self.year_doc_counts[year] += result['year_doc_count']
-                self.year_word_counts[year] += result['year_word_count']
-                self.year_total_words[year] += result['year_word_count']
+            # Aggregate results from all chunks
+            total_processed = 0
+            for chunk_result in chunk_results:
+                total_processed += chunk_result['total_processed']
 
-                # Update n-gram counts and temporal data
-                for ngram, count in result['ngram_counts'].items():
-                    self.year_ngram_counts[year][ngram] += count
-                    self.global_ngram_counts[ngram] += count
-                    self.ngram_year_counts[ngram][year] += count
+                # Process each year's results from this chunk
+                for year, year_result in chunk_result['year_results'].items():
+                    self.observed_years.add(year)
 
-                    # Calculate normalized frequency
-                    if self.year_total_words[year] > 0:
-                        normalized_freq = self.calculate_normalized_frequency(
-                            self.ngram_year_counts[ngram][year],
-                            self.year_total_words[year]
-                        )
-                        self.year_ngram_normalized_freq[ngram][year] = normalized_freq
+                    # Update year totals
+                    self.year_doc_counts[year] += year_result['year_doc_count']
+                    self.year_word_counts[year] += year_result['year_word_count']
+                    self.year_total_words[year] += year_result['year_word_count']
 
-                # Update article tracking
-                for ngram, article_set in result['ngram_articles'].items():
-                    self.ngram_articles[ngram].update(article_set)
+                    # Update n-gram counts and temporal data
+                    for ngram, count in year_result['ngram_counts'].items():
+                        self.year_ngram_counts[year][ngram] += count
+                        self.global_ngram_counts[ngram] += count
+                        self.ngram_year_counts[ngram][year] += count
 
-                self.total_docs_processed += result['total_docs']
+                        # Calculate normalized frequency
+                        if self.year_total_words[year] > 0:
+                            normalized_freq = self.calculate_normalized_frequency(
+                                self.ngram_year_counts[ngram][year],
+                                self.year_total_words[year]
+                            )
+                            self.year_ngram_normalized_freq[ngram][year] = normalized_freq
 
+                    # Update article tracking
+                    for ngram, article_set in year_result['ngram_articles'].items():
+                        self.ngram_articles[ngram].update(article_set)
+
+            self.total_docs_processed += total_processed
             self.total_docs += len(df)
 
-            print(self.total_docs, self.batch_size)
             # Apply blacklist filtering every batch
             if self.total_docs % self.batch_size == 0:
                 logger.info(f"Applying blacklist...")
-
                 self.update_blacklist()
                 gc.collect()
 
-            del df
+            del df, articles_data
             gc.collect()
 
             return True
@@ -439,7 +472,7 @@ class TemporalVariationNgramAnalyzer:
             return False
 
     def process_all_batches(self):
-        """Process all batches with blacklist filtering"""
+        """Process all batches with improved parallelization"""
         logger.info("Getting total record count...")
         total_records = self.get_total_records()
         self.estimated_total_docs = total_records
@@ -450,7 +483,6 @@ class TemporalVariationNgramAnalyzer:
         batch_count = 0
 
         while True:
-            # while offset < 100000:
             batch_start = time.time()
 
             if not self.process_batch(offset, self.batch_size):
@@ -620,7 +652,7 @@ class TemporalVariationNgramAnalyzer:
         """Run the complete temporal variation analysis"""
         logger.info(f"Starting temporal variation analysis (min {self.min_fold_change}x fold change)...")
 
-        # Process with blacklist filtering
+        # Process with improved parallelization
         self.process_all_batches()
 
         # Calculate final statistics
@@ -643,7 +675,8 @@ def main():
         confidence_level=0.95,
         min_total_frequency=20,
         min_years_present=1,
-        n_processes=None
+        n_processes=7,
+        articles_per_chunk=1000
     )
 
     start_time = time.time()
