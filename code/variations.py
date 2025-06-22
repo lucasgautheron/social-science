@@ -40,11 +40,11 @@ def preprocess_text(text: str) -> str:
     return text
 
 
-def extract_ngrams_for_year(texts: List[str], ngram_range: Tuple[int, int], blacklist: Set[str]) -> Tuple[
-    Dict[str, int], Set[str]]:
+def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_range: Tuple[int, int],
+                            blacklist: Set[str]) -> Tuple[Dict[str, int], Set[str], Dict[str, set]]:
     """Extract n-grams from texts for a specific year, excluding blacklisted ones"""
     if not texts or all(not text.strip() for text in texts):
-        return {}, set()
+        return {}, set(), {}
 
     # Use CountVectorizer for n-gram extraction
     vectorizer = CountVectorizer(
@@ -52,7 +52,7 @@ def extract_ngrams_for_year(texts: List[str], ngram_range: Tuple[int, int], blac
         stop_words='english',
         min_df=1,
         tokenizer=LemmaTokenizer(),
-        strip_accents='unicode',  # works
+        strip_accents='unicode',
         lowercase=True
     )
 
@@ -64,6 +64,7 @@ def extract_ngrams_for_year(texts: List[str], ngram_range: Tuple[int, int], blac
         # Get counts and document presence, excluding blacklisted n-grams
         ngram_counts = {}
         ngram_doc_presence = set()
+        ngram_articles = defaultdict(set)
 
         for i, ngram in enumerate(feature_names):
             if ngram in blacklist:
@@ -76,20 +77,30 @@ def extract_ngrams_for_year(texts: List[str], ngram_range: Tuple[int, int], blac
                 if count_matrix[:, i].nnz > 0:
                     ngram_doc_presence.add(ngram)
 
-        return ngram_counts, ngram_doc_presence
+                    # Track which articles contain this ngram
+                    doc_indices = count_matrix[:, i].nonzero()[0]
+                    for doc_idx in doc_indices:
+                        ngram_articles[ngram].add(article_ids[doc_idx])
+
+        return ngram_counts, ngram_doc_presence, dict(ngram_articles)
 
     except ValueError as e:
         logger.error(f"Error extracting n-grams: {e}")
-        return {}, set()
+        return {}, set(), {}
 
 
 def process_year_worker(args: Tuple) -> Dict:
     """Worker function to process texts for a specific year"""
-    year, raw_texts, ngram_range, blacklist = args
+    year, text_data, ngram_range, blacklist = args
 
-    # Preprocess texts
-    texts = [preprocess_text(text) for text in raw_texts]
-    texts = [text for text in texts if text.strip()]
+    # Extract texts and article_ids
+    texts = []
+    article_ids = []
+    for article_id, raw_text in text_data:
+        processed_text = preprocess_text(raw_text)
+        if processed_text.strip():
+            texts.append(processed_text)
+            article_ids.append(article_id)
 
     if not texts:
         return {
@@ -98,11 +109,12 @@ def process_year_worker(args: Tuple) -> Dict:
             'year_word_count': 0,
             'ngram_counts': {},
             'doc_presence': set(),
+            'ngram_articles': {},
             'total_docs': 0
         }
 
     # Extract n-grams
-    ngram_counts, doc_presence = extract_ngrams_for_year(texts, ngram_range, blacklist)
+    ngram_counts, doc_presence, ngram_articles = extract_ngrams_for_year(texts, article_ids, ngram_range, blacklist)
 
     # Count total words for this year
     total_words = sum(len(text.split()) for text in texts)
@@ -113,6 +125,7 @@ def process_year_worker(args: Tuple) -> Dict:
         'year_word_count': total_words,
         'ngram_counts': ngram_counts,
         'doc_presence': doc_presence,
+        'ngram_articles': ngram_articles,
         'total_docs': len(texts)
     }
 
@@ -165,6 +178,9 @@ class TemporalVariationNgramAnalyzer:
         self.year_word_counts = defaultdict(int)
         self.global_ngram_counts = defaultdict(int)
         self.total_docs = 0
+
+        # Article tracking
+        self.ngram_articles = defaultdict(set)
 
         logger.info(f"Initialized temporal variation analyzer targeting {min_fold_change}x fold changes")
 
@@ -240,9 +256,6 @@ class TemporalVariationNgramAnalyzer:
         if ngram not in self.ngram_year_counts:
             return True
 
-        # if not self.has_sufficient_statistical_power(ngram):
-        #     return False
-
         year_bounds = {}
         for year in self.observed_years:
             if year in self.year_total_words and self.year_total_words[year] > 0:
@@ -262,7 +275,7 @@ class TemporalVariationNgramAnalyzer:
         return max_possible_fold_change >= self.min_fold_change
 
     def update_blacklist(self):
-        """Add n-grams to blacklist that fail filtering criteria"""
+        """Add n-grams to blacklist that fail filtering criteria and purge their data"""
         if len(self.observed_years) < 3:
             return
 
@@ -286,9 +299,6 @@ class TemporalVariationNgramAnalyzer:
             should_blacklist = False
             reason = None
 
-            # if total_freq < self.min_total_frequency:
-            #     should_blacklist = True
-            #     reason = 'low_frequency'
             if years_present < self.min_years_present:
                 should_blacklist = True
                 reason = 'insufficient_years'
@@ -324,6 +334,8 @@ class TemporalVariationNgramAnalyzer:
                 del self.ngram_year_counts[ngram]
             if ngram in self.year_ngram_normalized_freq:
                 del self.year_ngram_normalized_freq[ngram]
+            if ngram in self.ngram_articles:  # Purge article tracking
+                del self.ngram_articles[ngram]
 
             for year_counts in self.year_ngram_counts.values():
                 if ngram in year_counts:
@@ -336,8 +348,9 @@ class TemporalVariationNgramAnalyzer:
 
         year_args = []
         for year, year_group in df.groupby('publication_year'):
-            raw_texts = year_group['abstract'].tolist()
-            year_args.append((year, raw_texts, self.ngram_range, self.ngram_blacklist))
+            # Include article_ids in the data
+            text_data = list(zip(year_group['article_id'], year_group['abstract']))
+            year_args.append((year, text_data, self.ngram_range, self.ngram_blacklist))
 
         if len(year_args) == 1:
             return [process_year_worker(year_args[0])]
@@ -351,7 +364,7 @@ class TemporalVariationNgramAnalyzer:
         """Process a single batch with blacklist filtering"""
         query = f"""
         SELECT 
-            a.publication_year, ab.abstract
+            a.article_id, a.publication_year, ab.abstract
         FROM articles a
         JOIN abstracts ab ON a.article_id = ab.article_id
         JOIN articles_order ao ON a.article_id = ao.article_id
@@ -400,6 +413,10 @@ class TemporalVariationNgramAnalyzer:
                         )
                         self.year_ngram_normalized_freq[ngram][year] = normalized_freq
 
+                # Update article tracking
+                for ngram, article_set in result['ngram_articles'].items():
+                    self.ngram_articles[ngram].update(article_set)
+
                 self.total_docs_processed += result['total_docs']
 
             self.total_docs += len(df)
@@ -433,6 +450,7 @@ class TemporalVariationNgramAnalyzer:
         batch_count = 0
 
         while True:
+            # while offset < 100000:
             batch_start = time.time()
 
             if not self.process_batch(offset, self.batch_size):
@@ -579,6 +597,25 @@ class TemporalVariationNgramAnalyzer:
         logger.info(f"Exported {len(significant_data)} significant temporal n-grams")
         return len(significant_data)
 
+    def export_article_mapping(self, filename: str = "ngram_articles.npz"):
+        """Export n-gram to article mapping for non-blacklisted n-grams"""
+        logger.info("Exporting n-gram to article mapping...")
+
+        # Convert to numpy arrays with ngrams as keys
+        arrays_dict = {}
+        for ngram, article_set in self.ngram_articles.items():
+            if ngram not in self.ngram_blacklist:
+                arrays_dict[ngram] = np.array(list(article_set))
+
+        if 'file' in arrays_dict:
+            del arrays_dict['file']
+
+        # Save as NPZ with ngrams as keys
+        np.savez_compressed(f"output/{filename}", **arrays_dict)
+
+        logger.info(f"Exported article mapping for {len(arrays_dict)} n-grams to {filename}")
+        return len(arrays_dict)
+
     def run_analysis(self, export_results: bool = True) -> Dict:
         """Run the complete temporal variation analysis"""
         logger.info(f"Starting temporal variation analysis (min {self.min_fold_change}x fold change)...")
@@ -591,6 +628,7 @@ class TemporalVariationNgramAnalyzer:
 
         if export_results:
             self.export_temporal_results(results)
+            self.export_article_mapping()
 
         return results
 
