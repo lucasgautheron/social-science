@@ -155,7 +155,7 @@ def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tup
 class TemporalVariationNgramAnalyzer:
     def __init__(self, database_url: str, batch_size: int = 100000,
                  ngram_range: Tuple[int, int] = (1, 3),
-                 min_fold_change: float = 2.0,
+                 min_fold_change: float = 3.0,
                  confidence_level: float = 0.95,
                  min_total_frequency: int = 10,
                  min_years_present: int = 3,
@@ -207,6 +207,9 @@ class TemporalVariationNgramAnalyzer:
         # Article tracking
         self.ngram_articles = defaultdict(set)
 
+        # Cursor-based pagination state
+        self.last_random_rank = None
+
         logger.info(f"Initialized temporal variation analyzer with {self.n_processes} processes, "
                     f"targeting {min_fold_change}x fold changes, "
                     f"{articles_per_chunk} articles per chunk")
@@ -217,8 +220,6 @@ class TemporalVariationNgramAnalyzer:
                       SELECT COUNT(*) as total
                       FROM articles a
                                JOIN abstracts ab ON a.article_id = ab.article_id
-                      WHERE ab.abstract IS NOT NULL \
-                        AND ab.abstract != '' \
                       """
 
         with self.engine.connect() as conn:
@@ -273,7 +274,7 @@ class TemporalVariationNgramAnalyzer:
 
         estimated_total_count_upper = rate_upper * self.estimated_total_docs
 
-        return estimated_total_count_upper > 1000.0
+        return estimated_total_count_upper > 1500.0
 
     def can_achieve_fold_change(self, ngram: str) -> bool:
         """Check if an n-gram can potentially achieve the required fold change"""
@@ -335,7 +336,6 @@ class TemporalVariationNgramAnalyzer:
             elif not self.can_achieve_fold_change(ngram):
                 should_blacklist = True
                 reason = 'no_fold_change'
-                print(f"{ngram} too stable")
 
             if should_blacklist:
                 new_blacklisted.add(ngram)
@@ -388,32 +388,64 @@ class TemporalVariationNgramAnalyzer:
 
         return chunk_results
 
-    def process_batch(self, offset: int, batch_size: int) -> bool:
-        """Process a single batch with improved parallelization"""
-        query = f"""
-        SELECT 
-            a.article_id, a.publication_year, ab.abstract
-        FROM articles a
-        JOIN abstracts ab ON a.article_id = ab.article_id
-        JOIN articles_order ao ON a.article_id = ao.article_id
-        WHERE ab.abstract IS NOT NULL AND ab.abstract != ''
-        ORDER BY ao.random_rank
-        LIMIT {batch_size} OFFSET {offset}
-        """
+    def process_batch(self, batch_size: int) -> bool:
+        """Process a single batch using cursor-based pagination"""
+        if self.last_random_rank is None:
+            query = """
+                    SELECT a.article_id,
+                           a.publication_year,
+                           a.title,
+                           ab.abstract,
+                           ao.random_rank
+                    FROM articles a
+                             JOIN abstracts ab ON a.article_id = ab.article_id
+                             JOIN articles_order ao ON a.article_id = ao.article_id
+                    ORDER BY ao.random_rank LIMIT :batch_size
+                    """
+            params = {'batch_size': batch_size}
+        else:
+            query = """
+                    SELECT a.article_id,
+                           a.publication_year,
+                           a.title,
+                           ab.abstract,
+                           ao.random_rank
+                    FROM articles a
+                             JOIN abstracts ab ON a.article_id = ab.article_id
+                             JOIN articles_order ao ON a.article_id = ao.article_id
+                    WHERE ao.random_rank > :last_rank
+                    ORDER BY ao.random_rank LIMIT :batch_size
+                    """
+
+            params = {'last_rank': int(self.last_random_rank), 'batch_size': batch_size}
 
         try:
-            logger.info(f"Querying abstracts at offset {offset}")
+            logger.info(f"Querying abstracts with cursor at rank {self.last_random_rank}")
 
             with self.engine.connect() as conn:
-                df = pd.read_sql_query(query, conn)
+                result = conn.execute(text(query), params)
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
 
+            # Add this in the process_batch method when df.empty is True:
             if df.empty:
+                logger.info("No more records found - batch processing complete")
                 return False
 
-            logger.info(f"Processing batch at offset {offset}, {len(df)} records...")
+            logger.info(f"Retrieved {len(df)} records from database")
 
+            # Update cursor position - use the last random_rank from this batch
+            if len(df) > 0:
+                self.last_random_rank = df['random_rank'].iloc[-1]
+                logger.info(f"Updated cursor to random_rank: {self.last_random_rank}")
+            else:
+                logger.info("Empty batch received")
+                return False
+
+            logger.info(f"Processing batch with cursor at rank {self.last_random_rank}, {len(df)} records...")
+
+            df.fillna("", inplace=True)
             # Prepare articles data as list of tuples
-            articles_data = [(row['article_id'], row['publication_year'], row['abstract'])
+            articles_data = [(row['article_id'], row['publication_year'], row['title'] + '. ' + row['abstract'])
                              for _, row in df.iterrows()]
 
             # Process articles in parallel
@@ -468,42 +500,44 @@ class TemporalVariationNgramAnalyzer:
             return True
 
         except Exception as e:
-            logger.error(f"Error processing batch at offset {offset}: {e}")
+            logger.error(f"Error processing batch with cursor at rank {self.last_random_rank}: {e}")
             return False
 
     def process_all_batches(self):
-        """Process all batches with improved parallelization"""
+        """Process all batches using cursor-based pagination"""
         logger.info("Getting total record count...")
         total_records = self.get_total_records()
         self.estimated_total_docs = total_records
         logger.info(f"Total records to process: {total_records}")
 
         start_time = time.time()
-        offset = 0
         batch_count = 0
+        total_processed_docs = 0
 
         while True:
             batch_start = time.time()
 
-            if not self.process_batch(offset, self.batch_size):
+            if not self.process_batch(self.batch_size):
                 break
 
             batch_end = time.time()
             batch_count += 1
+            total_processed_docs = self.total_docs  # Use actual count from batches
 
             # Progress reporting
-            if batch_count % 10 == 0:
+            if batch_count % 1 == 0:  # Report every batch for debugging, change back to 10 later
                 elapsed = batch_end - start_time
                 avg_time_per_batch = elapsed / batch_count
-                estimated_remaining = ((total_records - offset) / self.batch_size) * avg_time_per_batch
+                remaining_records = max(0, total_records - total_processed_docs)
+                estimated_remaining_batches = remaining_records / self.batch_size if self.batch_size > 0 else 0
+                estimated_remaining = estimated_remaining_batches * avg_time_per_batch
 
                 active_ngrams = len(self.global_ngram_counts)
-                logger.info(f"Batch {batch_count}: {offset:,} records processed. "
+                logger.info(f"Batch {batch_count}: {total_processed_docs:,}/{total_records:,} records processed. "
                             f"Active n-grams: {active_ngrams}, Blacklisted: {len(self.ngram_blacklist)}. "
                             f"Years observed: {len(self.observed_years)}. "
+                            f"Cursor at rank: {self.last_random_rank}. "
                             f"Est. remaining: {estimated_remaining / 60:.1f} min")
-
-            offset += self.batch_size
 
         # Final blacklist update
         self.update_blacklist()
@@ -652,7 +686,7 @@ class TemporalVariationNgramAnalyzer:
         """Run the complete temporal variation analysis"""
         logger.info(f"Starting temporal variation analysis (min {self.min_fold_change}x fold change)...")
 
-        # Process with improved parallelization
+        # Process with cursor-based pagination
         self.process_all_batches()
 
         # Calculate final statistics
@@ -670,13 +704,13 @@ def main():
     analyzer = TemporalVariationNgramAnalyzer(
         database_url="sqlite:///articles.db",
         batch_size=100000,
-        ngram_range=(1, 1),
-        min_fold_change=4.0,
+        ngram_range=(1, 2),
+        min_fold_change=3.0,
         confidence_level=0.95,
         min_total_frequency=20,
         min_years_present=1,
         n_processes=7,
-        articles_per_chunk=1000
+        articles_per_chunk=2000
     )
 
     start_time = time.time()
