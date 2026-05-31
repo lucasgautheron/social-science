@@ -8,7 +8,9 @@ from copy import deepcopy
 import random
 import numba
 from numba import jit, njit, prange
+from cmdstanpy import CmdStanModel
 
+model = CmdStanModel(stan_file='code/fit.stan')
 
 @dataclass
 class TreeNode:
@@ -54,6 +56,230 @@ def gammaln_numba(x):
         # Stirling's approximation for large values
         return (x - 0.5) * np.log(x) - x + 0.5 * np.log(2.0 * np.pi)
 
+
+# === KEY OPTIMIZATION 1: Cache evidence computations ===
+class EvidenceCache:
+    """Cache for storing computed evidence values to avoid recomputation."""
+
+    def __init__(self):
+        self.cache = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get_key(self, leaf_indices_tuple, n_children):
+        """Create cache key from node configuration."""
+        return (leaf_indices_tuple, n_children)
+
+    def get(self, leaf_indices, n_children):
+        """Get cached evidence if available."""
+        key = self.get_key(tuple(sorted(leaf_indices)), n_children)
+        if key in self.cache:
+            self.hits += 1
+            return self.cache[key]
+        self.misses += 1
+        return None
+
+    def set(self, leaf_indices, n_children, evidence):
+        """Cache evidence value."""
+        key = self.get_key(tuple(sorted(leaf_indices)), n_children)
+        self.cache[key] = evidence
+
+    def stats(self):
+        total = self.hits + self.misses
+        hit_rate = self.hits / total if total > 0 else 0
+        return f"Cache: {self.hits}/{total} hits ({hit_rate:.1%})"
+
+
+# === KEY OPTIMIZATION 2: Precompute node data once ===
+@njit
+def precompute_all_node_data_numba(data, leaf_indices_list):
+    """
+    Precompute count data for all possible node configurations.
+    This avoids recomputing the same sums repeatedly.
+    """
+    n_samples = data.shape[0]
+    n_configs = len(leaf_indices_list)
+
+    # Precompute sums for each leaf set
+    precomputed = np.zeros((n_configs, n_samples))
+
+    for config_idx in range(n_configs):
+        leaf_indices = leaf_indices_list[config_idx]
+        for sample_idx in range(n_samples):
+            total = 0
+            for leaf_idx in leaf_indices:
+                total += data[sample_idx, leaf_idx]
+            precomputed[config_idx, sample_idx] = total
+
+    return precomputed
+
+
+# === KEY OPTIMIZATION 3: Faster tree traversal with iteration instead of recursion ===
+def compute_tree_evidence_optimized(root, data, cache, precomputed_data=None):
+    """
+    Optimized tree evidence computation with caching and precomputed data.
+    """
+    total_evidence = 0.0
+
+    # Use iterative traversal instead of recursive
+    nodes_to_visit = [root]
+
+    while nodes_to_visit:
+        node = nodes_to_visit.pop()  # Use stack (LIFO) for efficiency
+
+        if not node.is_leaf and len(node.children) > 1:
+            # Check cache first
+            cached_evidence = cache.get(node.leaf_indices, len(node.children))
+            if cached_evidence is not None:
+                total_evidence += cached_evidence
+            else:
+                # Compute evidence and cache it
+                if precomputed_data is not None:
+                    # Use precomputed data if available
+                    node_counts = get_node_counts_from_precomputed(node, precomputed_data)
+                else:
+                    # Fallback to original computation
+                    node_counts = compute_node_counts_optimized(node, data)
+
+                alpha = np.full(len(node.children), 1.0)  # Use fixed alpha_prior
+
+                # Prepare your data (replace with your actual data)
+                n = node_counts[node_counts.sum(axis=1)>1][:200]
+                data = {
+                    'N': n.shape[0],
+                    'M': n.shape[1],
+                    'n': n.astype(int)
+                }
+
+                print(n)
+
+                # Find MLE using optimization
+                mle_fit = model.optimize(
+                    data=data,
+                    # algorithm='newton',
+                    # iter=1000
+                    # iter=2000,
+                    # init_alpha=0.1,
+                    # tol_obj=1e-12,
+                    # tol_rel_obj=1e4,
+                    # tol_grad=1e-8,
+                    # tol_rel_grad=1e7,
+                    # tol_param=1e-8
+                )
+
+                # Retrieve MLE estimates
+                mle_estimates = mle_fit.stan_variables()
+                print(mle_estimates['p'])
+
+                evidence = compute_dirichlet_evidence_numba(node_counts, alpha)
+                cache.set(node.leaf_indices, len(node.children), evidence)
+                total_evidence += evidence
+
+        # Add children to stack (internal nodes only)
+        for child in node.children:
+            if not child.is_leaf:
+                nodes_to_visit.append(child)
+
+    return total_evidence
+
+
+@njit
+def compute_node_counts_optimized_numba(data, child_leaf_indices_flat, child_sizes, n_children):
+    """
+    Ultra-optimized node count computation using flattened arrays.
+    """
+    n_samples = data.shape[0]
+    child_counts = np.zeros((n_samples, n_children))
+
+    start_idx = 0
+    for child_idx in range(n_children):
+        child_size = child_sizes[child_idx]
+
+        for sample_idx in range(n_samples):
+            total = 0
+            for i in range(start_idx, start_idx + child_size):
+                leaf_idx = child_leaf_indices_flat[i]
+                total += data[sample_idx, leaf_idx]
+            child_counts[sample_idx, child_idx] = total
+
+        start_idx += child_size
+
+    return child_counts
+
+
+def compute_node_counts_optimized(node, data):
+    """Optimized node count computation."""
+    if node.is_leaf:
+        return data[:, list(node.leaf_indices)[0]]
+
+    # Flatten child indices for Numba
+    child_leaf_indices_flat = []
+    child_sizes = []
+
+    for child in node.children:
+        child_indices = list(child.leaf_indices)
+        child_leaf_indices_flat.extend(child_indices)
+        child_sizes.append(len(child_indices))
+
+    child_leaf_indices_flat = np.array(child_leaf_indices_flat, dtype=np.int64)
+    child_sizes = np.array(child_sizes, dtype=np.int64)
+
+    return compute_node_counts_optimized_numba(
+        data, child_leaf_indices_flat, child_sizes, len(node.children)
+    )
+
+
+# === KEY OPTIMIZATION 4: Batch validation ===
+def validate_tree_fast(root, n_categories):
+    """Fast tree validation using sets."""
+    all_leaves = set()
+    stack = [root]
+
+    while stack:
+        node = stack.pop()
+        if node.is_leaf:
+            all_leaves.update(node.leaf_indices)
+        else:
+            stack.extend(node.children)
+
+    return all_leaves == set(range(n_categories))
+
+
+# === KEY OPTIMIZATION 5: Reduce deep copying ===
+def deep_copy_tree_optimized(root):
+    """Optimized tree copying using iteration."""
+    old_to_new = {}
+    stack = [(root, None)]  # (node, new_parent)
+    new_root = None
+
+    while stack:
+        old_node, new_parent = stack.pop()
+
+        if old_node.node_id in old_to_new:
+            new_node = old_to_new[old_node.node_id]
+        else:
+            # Create new node
+            new_node = TreeNode(
+                node_id=old_node.node_id,
+                children=[],
+                is_leaf=old_node.is_leaf,
+                leaf_indices=old_node.leaf_indices.copy()
+            )
+            old_to_new[old_node.node_id] = new_node
+
+            if new_root is None:
+                new_root = new_node
+
+        # Set parent
+        if new_parent is not None:
+            new_node.parent = new_parent
+            new_parent.children.append(new_node)
+
+        # Add children to stack
+        for child in old_node.children:
+            stack.append((child, new_node))
+
+    return new_root
 
 @njit
 def compute_dirichlet_evidence_numba(counts, alpha):
@@ -674,12 +900,15 @@ class DirichletTreeLearner:
 
         # Hierarchical clustering
         condensed_dist = squareform(distance)
-        linkage_matrix = linkage(distance, method='ward')
+        linkage_matrix = linkage(condensed_dist, method='ward')
 
         print(linkage_matrix.shape)
 
         labels = list(topic_labels.values())[1:]
         dendrogram(linkage_matrix, labels=labels)
+
+        # labels = list(topic_labels.values())[1:]
+        # dendrogram(linkage_matrix, labels=list(range(n_categories)))
         plt.show()
 
         def build_tree_from_clustering(children_indices):
@@ -722,63 +951,55 @@ class DirichletTreeLearner:
         condensed_dist = squareform(distance)
         linkage_matrix = linkage(condensed_dist, method='ward')
 
-        labels = [topic_labels.get(i, f'Topic_{i}') for i in range(n_categories)]
-        dendrogram(linkage_matrix, labels=labels)
-        plt.show()
+        # labels = [topic_labels.get(i, f'Topic_{i}') for i in range(n_categories)]
+        # dendrogram(linkage_matrix, labels=labels)
+        # plt.show()
 
         # Build tree starting with all categories
         return build_tree_from_clustering(list(range(n_categories)))
 
-    def learn_structure_mcmc(self, data: np.ndarray, n_iterations: int = 10000,
-                             burn_in: int = 1000, thin: int = 10) -> Tuple[List[TreeNode], TreeNode]:
+    # === MAIN OPTIMIZED MCMC FUNCTION ===
+    def learn_structure_mcmc(self, data, n_iterations=10000, burn_in=1000):
         """
-        Learn tree structure using MCMC with local moves.
-
-        Args:
-            data: Count matrix (n_samples x n_categories)
-            n_iterations: Number of MCMC iterations
-            burn_in: Number of burn-in iterations
-            thin: Thinning interval for collecting samples
-
-        Returns:
-            Tuple of (sampled_trees, best_tree_encountered)
+        Highly optimized MCMC with multiple speedup techniques.
         """
         n_samples, n_categories = data.shape
 
-        # Initialize with random tree
+        # Initialize cache
+        cache = EvidenceCache()
+
+        # Initialize tree
+        current_tree = self.learn_structure_hierarchical(data)
         # current_tree = self._initialize_random_tree(n_categories)
-        current_tree = current_tree = self.learn_structure_hierarchical(data)
 
         self.print_tree(current_tree)
 
-        current_evidence = self._compute_tree_evidence(current_tree, data)
+        current_evidence = compute_tree_evidence_optimized(current_tree, data, cache)
 
         # Validate initial tree
-        if not self._validate_tree(current_tree, n_categories):
+        if not validate_tree_fast(current_tree, n_categories):
             raise ValueError("Initial tree is invalid!")
 
-        # Track best tree seen during run
-        best_tree = self._deep_copy_tree(current_tree)
+        # Track best tree
+        best_tree = deep_copy_tree_optimized(current_tree)
         best_evidence = current_evidence
 
         print(f"Initial tree evidence: {current_evidence:.2f}")
 
-        # MCMC sampling
+        # MCMC sampling with optimizations
         samples = []
         n_accepted = 0
         n_proposed = 0
         n_invalid = 0
 
-        for iteration in range(n_iterations):
-            # Propose a move with different probabilities
-            move_prob = random.random()
-            if move_prob < 0.33:
-                move_type = 'swap'  # Most conservative move
-            elif move_prob < 0.67:
-                move_type = 'split'
-            else:
-                move_type = 'spr'
+        # Pre-allocate random numbers to reduce overhead
+        move_types = np.random.choice(['swap', 'split', 'spr'], size=n_iterations, p=[0.5, 0.25, 0.25])
+        accept_randoms = np.random.random(n_iterations)
 
+        for iteration in range(n_iterations):
+            move_type = move_types[iteration]
+
+            # Propose move
             if move_type == 'spr':
                 proposed_tree = self._propose_subtree_prune_regraft(current_tree)
             elif move_type == 'swap':
@@ -789,45 +1010,45 @@ class DirichletTreeLearner:
             if proposed_tree is None:
                 continue
 
-            # Validate proposed tree
-            if not self._validate_tree(proposed_tree, n_categories):
+            # Fast validation
+            if not validate_tree_fast(proposed_tree, n_categories):
                 n_invalid += 1
-                if n_invalid <= 5:  # Only print first few
-                    print(f"Invalid tree proposed at iteration {iteration} ({move_type})")
                 continue
 
             n_proposed += 1
 
-            # Compute evidence for proposed tree
-            proposed_evidence = self._compute_tree_evidence(proposed_tree, data)
+            # Compute evidence with caching
+            proposed_evidence = compute_tree_evidence_optimized(proposed_tree, data, cache)
 
-            # Accept or reject (using log evidence ratio)
+            # Accept or reject
             log_ratio = proposed_evidence - current_evidence
 
-            if log_ratio > 0 or np.log(random.random()) < log_ratio:
+            if log_ratio > 0 or np.log(accept_randoms[iteration]) < log_ratio:
                 # Accept
                 current_tree = proposed_tree
                 current_evidence = proposed_evidence
                 n_accepted += 1
 
-                # Update best tree if this is better
+                # Update best tree
                 if current_evidence > best_evidence:
                     best_evidence = current_evidence
-                    best_tree = self._deep_copy_tree(current_tree)
+                    best_tree = deep_copy_tree_optimized(current_tree)
 
-            # Collect sample after burn-in (fix the logic)
+            # Collect sample after burn-in
             if iteration >= burn_in:
-                samples.append(self._deep_copy_tree(current_tree))
+                samples.append(deep_copy_tree_optimized(current_tree))
 
-            # Progress reporting
-            if iteration % 100 == 0 and iteration > 0:
+            # Progress reporting (less frequent to reduce overhead)
+            if iteration % 500 == 0 and iteration > 0:
                 acceptance_rate = n_accepted / n_proposed if n_proposed > 0 else 0
                 print(f"Iteration {iteration}: Current = {current_evidence:.2f}, "
-                      f"Best = {best_evidence:.2f}, Accept rate = {acceptance_rate:.3f}, "
-                      f"Samples = {len(samples)}, Invalid = {n_invalid}")
+                      f"Best = {best_evidence:.2f}, Accept rate = {acceptance_rate:.3f}")
+                print(f"  {cache.stats()}")
 
         final_acceptance_rate = n_accepted / n_proposed if n_proposed > 0 else 0
         print(f"Final acceptance rate: {final_acceptance_rate:.3f}")
+        print(f"Final {cache.stats()}")
+
         print(f"Total proposed moves: {n_proposed}")
         print(f"Invalid moves rejected: {n_invalid}")
         print(f"Collected {len(samples)} samples")
@@ -870,6 +1091,7 @@ def generate_sample_data(n_samples: int = 1000, n_categories: int = 8) -> np.nda
 
     for i in range(n_samples):
         # Choose a group (each pair of categories)
+        super_group = np.random.randint(0, n_categories // 4)
         group = np.random.randint(0, n_categories // 2)
 
         # Sample total count for this sample
@@ -884,7 +1106,7 @@ def generate_sample_data(n_samples: int = 1000, n_categories: int = 8) -> np.nda
                 cat = group * 2 + np.random.randint(0, 2)
             else:
                 # Choose any category
-                cat = np.random.randint(0, n_categories)
+                cat = np.random.randint(super_group*4, (super_group+1)*4)
 
             data[i, cat] += 1
 
@@ -897,14 +1119,10 @@ if __name__ == "__main__":
 
     # Generate sample data
     data = np.load("output/author_topic_1.npy")
+    data = data[np.random.choice(data.shape[0], 50000, replace=False)]
 
     print(topic_labels[data.sum(axis=0).argmax()])
 
-    data = data[np.random.choice(data.shape[0], 2500, replace=False)]
-
-    # empty_category = data.sum(axis=0) == 0
-    # print(empty_category.shape)
-    # data = data[:, ~empty_category]
 
     print(f"Data shape: {data.shape}")
     print(f"Sample counts per category: {np.mean(data, axis=0)}")
@@ -912,23 +1130,11 @@ if __name__ == "__main__":
 
     # Learn tree structure using MCMC
     learner = DirichletTreeLearner(alpha_prior=1.0)
-    samples, best_tree_from_mcmc = learner.learn_structure_mcmc(data, n_iterations=10000, burn_in=200, thin=0)
+    samples, best_tree_from_mcmc = learner.learn_structure_mcmc(data, n_iterations=10000, burn_in=200)
 
     # Use the best tree from MCMC run
     print("\nBest tree found during MCMC:")
     learner.print_tree(best_tree_from_mcmc)
-
-    # # Also check samples if we have them
-    # if samples:
-    #     print(f"\nAlso collected {len(samples)} samples for analysis")
-    #     sample_best = learner.get_best_tree(samples, data)
-    #     if sample_best is not None:
-    #         sample_evidence = learner._compute_tree_evidence(sample_best, data)
-    #         mcmc_evidence = learner._compute_tree_evidence(best_tree_from_mcmc, data)
-    #         print(f"Sample best evidence: {sample_evidence:.2f}")
-    #         print(f"MCMC best evidence: {mcmc_evidence:.2f}")
-    # else:
-    #     print("\nNo samples collected during burn-in period")
 
     # Print some statistics
     print(f"\nData statistics:")

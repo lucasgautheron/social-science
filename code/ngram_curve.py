@@ -6,6 +6,7 @@ import argparse
 import datetime
 from scipy.stats import beta
 from cmdstanpy import CmdStanModel
+import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ngram")
@@ -37,7 +38,7 @@ def get_papers_per_year(database_url="sqlite:///articles.db"):
             FROM articles
             WHERE publication_year IS NOT NULL
             GROUP BY publication_year
-            ORDER BY publication_year \
+            ORDER BY publication_year
             """
 
     with engine.connect() as conn:
@@ -55,7 +56,7 @@ def process_batch(articles):
                    a.publication_year,
                    a.article_id
             FROM articles a
-            WHERE a.article_id IN ({whitelist}) \
+            WHERE a.article_id IN ({whitelist})
             """
 
     # Execute query and get results
@@ -92,8 +93,33 @@ per_year["high"] = per_year.apply(
     axis=1,
 )
 
-plt.plot(per_year["fraction"])
-plt.errorbar(per_year.index, per_year["fraction"], yerr=(per_year["fraction"] - per_year["low"],
-                                                         per_year["high"] - per_year["fraction"]))
+years = per_year.index.values
+fraction = per_year["fraction"].values
+peak = fraction.argmax()
+
+pre_peak = years[:peak - 1]
+print(fraction[peak]/pre_peak.min())
+
+# Prepare data for SIR model
+years = per_year.index.values
+min_year = years.min()
+years_normalized = years - min_year  # Start from year 0
+
+# Convert fractions to "infected" counts (papers with the concept)
+observed_infected = per_year["n"].values.astype(int)
+total_population = per_year["total"].values  # Use max as proxy for total "susceptible" population
+
+# Plot results
+fig, ax1 = plt.subplots(1, 1, figsize=(12, 10))
+
+# Plot 1: Observed data with confidence intervals and posterior predictions
+ax1.fill_between(years, per_year["low"], per_year["high"],
+                 alpha=0.3, color='blue', label='95% Confidence Interval')
+ax1.plot(years, per_year["fraction"], 'bo-', label='Observed Fraction', markersize=6)
+
+ax1.set_xlabel('Year')
+ax1.set_ylabel('Fraction of Papers with Concept')
+ax1.set_title(f'Academic Concept Spread: {args.ngram}')
+ax1.legend()
+
 plt.show()
-print(counts)

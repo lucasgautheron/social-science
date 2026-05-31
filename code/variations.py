@@ -13,6 +13,12 @@ import time
 from scipy import stats
 from nltk import word_tokenize
 from nltk.stem import WordNetLemmatizer
+from fast_langdetect import detect, detect_multilingual, LangDetector, LangDetectConfig, DetectError
+
+
+def is_english(s: str):
+    lng = detect(s)
+    return lng["lang"] == "en"
 
 
 class LemmaTokenizer(object):
@@ -150,6 +156,132 @@ def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tup
     for i in range(0, len(articles_data), chunk_size):
         chunks.append(articles_data[i:i + chunk_size])
     return chunks
+
+
+def check_ngram_for_blacklisting(args: Tuple) -> Dict:
+    """Worker function to check if n-grams should be blacklisted"""
+    (ngrams_chunk, existing_blacklist, observed_years, ngram_year_counts,
+     global_ngram_counts, min_years_present, analyzer_data) = args
+
+    # Unpack analyzer data needed for statistical checks
+    total_docs_processed = analyzer_data['total_docs_processed']
+    estimated_total_docs = analyzer_data['estimated_total_docs']
+    confidence_level = analyzer_data['confidence_level']
+    min_fold_change = analyzer_data['min_fold_change']
+    year_total_words = analyzer_data['year_total_words']
+
+    new_blacklisted = set()
+    filter_counts = {
+        'low_frequency': 0,
+        'insufficient_years': 0,
+        'no_statistical_power': 0,
+        'no_fold_change': 0
+    }
+
+    for ngram in ngrams_chunk:
+        if ngram in existing_blacklist:
+            continue  # Already blacklisted
+
+        total_freq = global_ngram_counts.get(ngram, 0)
+        years_present = len([year for year in observed_years
+                             if ngram_year_counts[ngram].get(year, 0) > 0])
+
+        # Check filtering criteria
+        should_blacklist = False
+        reason = None
+
+        if years_present < min_years_present:
+            should_blacklist = True
+            reason = 'insufficient_years'
+        elif not has_sufficient_statistical_power_worker(
+                ngram, global_ngram_counts, total_docs_processed,
+                estimated_total_docs, confidence_level):
+            should_blacklist = True
+            reason = 'no_statistical_power'
+        elif not can_achieve_fold_change_worker(
+                ngram, ngram_year_counts, observed_years,
+                year_total_words, min_fold_change, confidence_level):
+            should_blacklist = True
+            reason = 'no_fold_change'
+
+        if should_blacklist:
+            new_blacklisted.add(ngram)
+            filter_counts[reason] += 1
+
+    return {
+        'new_blacklisted': new_blacklisted,
+        'filter_counts': filter_counts
+    }
+
+
+def has_sufficient_statistical_power_worker(ngram: str, global_ngram_counts: Dict,
+                                            total_docs_processed: int, estimated_total_docs: int,
+                                            confidence_level: float) -> bool:
+    """Worker version of has_sufficient_statistical_power method"""
+    if ngram not in global_ngram_counts:
+        return True
+
+    if total_docs_processed == 0 or estimated_total_docs is None:
+        return True
+
+    observed_count = global_ngram_counts[ngram]
+    total_docs_observed = total_docs_processed
+
+    alpha_param = observed_count + 1
+    beta_param = total_docs_observed - observed_count + 1
+
+    alpha = 1 - confidence_level
+    rate_upper = stats.beta.ppf(1 - alpha / 2, alpha_param, beta_param)
+
+    estimated_total_count_upper = rate_upper * estimated_total_docs
+
+    return estimated_total_count_upper >= 5000.0
+
+
+def can_achieve_fold_change_worker(ngram: str, ngram_year_counts: Dict, observed_years: Set,
+                                   year_total_words: Dict, min_fold_change: float,
+                                   confidence_level: float) -> bool:
+    """Worker version of can_achieve_fold_change method"""
+    if len(observed_years) < 2:
+        return True
+
+    if ngram not in ngram_year_counts:
+        return True
+
+    year_bounds = {}
+    for year in observed_years:
+        if year in year_total_words and year_total_words[year] > 0:
+            # Inline version of estimate_year_frequency_bounds
+            observed_count = ngram_year_counts[ngram].get(year, 0)
+            total_words_year = year_total_words[year]
+
+            if observed_count == 0:
+                alpha_param = 1
+                beta_param = 1
+            else:
+                alpha_param = observed_count + 1
+                beta_param = total_words_year - observed_count + 1
+
+            alpha = 1 - confidence_level
+            rate_lower = stats.beta.ppf(alpha / 2, alpha_param, beta_param)
+            rate_upper = stats.beta.ppf(1 - alpha / 2, alpha_param, beta_param)
+
+            freq_lower = rate_lower * 1000
+            freq_upper = rate_upper * 1000
+
+            year_bounds[year] = (freq_lower, freq_upper)
+
+    if len(year_bounds) < 2:
+        return True
+
+    max_upper = max(upper for lower, upper in year_bounds.values())
+    min_lower = min(lower for lower, upper in year_bounds.values() if lower > 0)
+
+    if min_lower == 0:
+        return max_upper > 0
+
+    max_possible_fold_change = max_upper / min_lower
+    return max_possible_fold_change >= min_fold_change
 
 
 class TemporalVariationNgramAnalyzer:
@@ -303,10 +435,47 @@ class TemporalVariationNgramAnalyzer:
         return max_possible_fold_change >= self.min_fold_change
 
     def update_blacklist(self):
-        """Add n-grams to blacklist that fail filtering criteria and purge their data"""
+        """Parallelized version of update_blacklist method"""
         if len(self.observed_years) < 3:
             return
 
+        # Get all n-grams to check (excluding already blacklisted ones)
+        ngrams_to_check = [ngram for ngram in self.global_ngram_counts
+                           if ngram not in self.ngram_blacklist]
+
+        if not ngrams_to_check:
+            return
+
+        # Split n-grams into chunks for parallel processing
+        chunk_size = max(1, len(ngrams_to_check) // (self.n_processes * 2))  # 2x processes for better load balancing
+        ngram_chunks = [ngrams_to_check[i:i + chunk_size]
+                        for i in range(0, len(ngrams_to_check), chunk_size)]
+
+        # Prepare data that workers need (avoiding passing self)
+        analyzer_data = {
+            'total_docs_processed': self.total_docs_processed,
+            'estimated_total_docs': self.estimated_total_docs,
+            'confidence_level': self.confidence_level,
+            'min_fold_change': self.min_fold_change,
+            'year_total_words': dict(self.year_total_words)  # Convert defaultdict to regular dict
+        }
+
+        # Prepare arguments for worker processes
+        chunk_args = [
+            (chunk, set(self.ngram_blacklist), set(self.observed_years),
+             dict(self.ngram_year_counts), dict(self.global_ngram_counts),
+             self.min_years_present, analyzer_data)
+            for chunk in ngram_chunks
+        ]
+
+        logger.info(f"Checking {len(ngrams_to_check)} n-grams for blacklisting in {len(ngram_chunks)} chunks "
+                    f"using {self.n_processes} processes")
+
+        # Process chunks in parallel
+        with Pool(processes=self.n_processes) as pool:
+            chunk_results = pool.map(check_ngram_for_blacklisting, chunk_args)
+
+        # Aggregate results from all chunks
         new_blacklisted = set()
         filter_counts = {
             'low_frequency': 0,
@@ -315,31 +484,10 @@ class TemporalVariationNgramAnalyzer:
             'no_fold_change': 0
         }
 
-        for ngram in self.global_ngram_counts:
-            if ngram in self.ngram_blacklist:
-                continue  # Already blacklisted
-
-            total_freq = self.global_ngram_counts.get(ngram, 0)
-            years_present = len([year for year in self.observed_years
-                                 if self.ngram_year_counts[ngram].get(year, 0) > 0])
-
-            # Check filtering criteria
-            should_blacklist = False
-            reason = None
-
-            if years_present < self.min_years_present:
-                should_blacklist = True
-                reason = 'insufficient_years'
-            elif not self.has_sufficient_statistical_power(ngram):
-                should_blacklist = True
-                reason = 'no_statistical_power'
-            elif not self.can_achieve_fold_change(ngram):
-                should_blacklist = True
-                reason = 'no_fold_change'
-
-            if should_blacklist:
-                new_blacklisted.add(ngram)
-                filter_counts[reason] += 1
+        for chunk_result in chunk_results:
+            new_blacklisted.update(chunk_result['new_blacklisted'])
+            for reason, count in chunk_result['filter_counts'].items():
+                filter_counts[reason] += count
 
         # Add to blacklist
         self.ngram_blacklist.update(new_blacklisted)
@@ -445,8 +593,11 @@ class TemporalVariationNgramAnalyzer:
 
             df.fillna("", inplace=True)
             # Prepare articles data as list of tuples
-            articles_data = [(row['article_id'], row['publication_year'], row['title'] + '. ' + row['abstract'])
-                             for _, row in df.iterrows()]
+            articles_data = [
+                (row['article_id'], row['publication_year'], row['title'] + '. ' + row['abstract'])
+                for _, row in df.iterrows()
+                if ((row['title'] and is_english(row['title'])) or (row['abstract'] and is_english(row['abstract'])))
+            ]
 
             # Process articles in parallel
             chunk_results = self.process_articles_parallel(articles_data)
@@ -704,12 +855,12 @@ def main():
     analyzer = TemporalVariationNgramAnalyzer(
         database_url="sqlite:///articles.db",
         batch_size=100000,
-        ngram_range=(1, 2),
+        ngram_range=(1, 1),
         min_fold_change=3.0,
         confidence_level=0.95,
         min_total_frequency=20,
         min_years_present=1,
-        n_processes=7,
+        n_processes=6,
         articles_per_chunk=2000
     )
 
