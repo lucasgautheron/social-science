@@ -11,7 +11,7 @@ import time
 # Social Science domain ID
 domain_id = "https://openalex.org/domains/3"
 
-DEFAULT_START_DATE = "20015-01-01"
+DEFAULT_START_DATE = "2015-01-01"
 DEFAULT_END_DATE = "2025-12-31"
 
 
