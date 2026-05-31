@@ -84,6 +84,9 @@ articles_concepts_table = Table(
     Column(
         "concept_id", BigInteger, ForeignKey("concepts.concept_id"), primary_key=True
     ),
+    Column(
+        "score", Float
+    ),
 )
 
 
@@ -223,7 +226,7 @@ class Reference(Base):
     )
 
 
-early_date = 2012
+early_date = 2016
 
 
 def now():
@@ -527,14 +530,14 @@ class OptimizedSQLCompiler:
                 if self.database_type == 'sqlite':
                     session.execute(
                         text(
-                            'INSERT OR IGNORE INTO "articles_concepts" ("article_id", "concept_id") VALUES (:article_id, :concept_id)'),
+                            'INSERT OR IGNORE INTO "articles_concepts" ("article_id", "concept_id", "score") VALUES (:article_id, :concept_id, :score)'),
                         self.temp_data["articles_concepts"]
                     )
                 else:
                     articles_concepts_sql = self._get_upsert_sql(
                         'articles_concepts',
-                        ['article_id', 'concept_id'],
-                        ['article_id', 'concept_id']
+                        ['article_id', 'concept_id', "score"],
+                        ['article_id', 'concept_id', "score"]
                     )
                     session.execute(text(articles_concepts_sql), self.temp_data["articles_concepts"])
                 print(f"Inserted {len(self.temp_data['articles_concepts'])} article-concept relationships")
