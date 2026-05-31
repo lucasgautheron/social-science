@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from pyalex import Works, Subfields, Topics
 import json
 import gzip
