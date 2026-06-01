@@ -1,11 +1,5 @@
-import requests
-import time
-from urllib import parse
-from functools import reduce
 import os
 import gzip
-import numpy as np
-import pandas as pd
 import json
 import datetime
 import re
@@ -30,9 +24,16 @@ from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.types import JSON
 
-from genderComputer import GenderComputer
+gc = None
 
-gc = GenderComputer()
+
+def resolve_gender(author_name):
+    global gc
+    if gc is None:
+        from genderComputer import GenderComputer
+
+        gc = GenderComputer()
+    return gc.resolveGender(author_name, None)
 
 Base = declarative_base()
 
@@ -246,6 +247,15 @@ def url_to_id(url):
     return int(url.replace("https://openalex.org/", "")[1:])
 
 
+def safe_url_to_id(url):
+    if url is None:
+        return None
+    try:
+        return url_to_id(url)
+    except (AttributeError, ValueError):
+        return None
+
+
 def clean_domain(url):
     return int(url.replace("https://openalex.org/domains/", ""))
 
@@ -296,18 +306,19 @@ class OptimizedSQLCompiler:
             database_url: SQLAlchemy database URL
             batch_size: Number of records to insert in each batch (increased default)
         """
-        # Optimize connection pool for bulk operations
-        self.engine = create_engine(
-            database_url,
-            echo=False,
-            pool_size=20,
-            max_overflow=30,
-            pool_pre_ping=True,
-            pool_recycle=3600
-        )
+        self.database_type = self._detect_database_type(database_url)
+        engine_options = {"echo": False}
+        if self.database_type != "sqlite":
+            # Optimize connection pool for bulk operations on server databases.
+            engine_options.update(
+                pool_size=20,
+                max_overflow=30,
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
+        self.engine = create_engine(database_url, **engine_options)
         self.Session = sessionmaker(bind=self.engine)
         self.batch_size = batch_size
-        self.database_type = self._detect_database_type(database_url)
 
         # Create all tables
         Base.metadata.create_all(self.engine)
@@ -581,10 +592,17 @@ class OptimizedSQLCompiler:
         if source is None:
             source = 0
 
-        if not (data["publication_year"] >= early_date):
+        minimum_publication_year = getattr(self, "minimum_publication_year", early_date)
+        if minimum_publication_year is not None and not (
+            data["publication_year"] >= minimum_publication_year
+        ):
             return
 
-        if data.get("language", "") != "en":
+        allowed_languages = getattr(self, "allowed_languages", {"en"})
+        if (
+            allowed_languages is not None
+            and data.get("language", "") not in allowed_languages
+        ):
             return
 
         article = {
@@ -616,13 +634,12 @@ class OptimizedSQLCompiler:
         # Process abstract
         if data["abstract_inverted_index"] is not None:
             if len(data["abstract_inverted_index"]) > 1:
-                abstract_words = [""] * int(
-                    reduce(
-                        lambda x, y: np.max(np.maximum(x, np.max(y))),
-                        data["abstract_inverted_index"].values(),
-                    )
-                    + 1
+                max_position = max(
+                    max(positions)
+                    for positions in data["abstract_inverted_index"].values()
+                    if positions
                 )
+                abstract_words = [""] * (max_position + 1)
 
                 for word in data["abstract_inverted_index"]:
                     for pos in data["abstract_inverted_index"][word]:
@@ -635,9 +652,15 @@ class OptimizedSQLCompiler:
 
         # Process topics
         for topic in data["topics"]:
-            domains.append(clean_domain(topic["domain"]["id"]))
-            fields.append(clean_field(topic["field"]["id"]))
-            subfields.append(clean_subfield(topic["subfield"]["id"]))
+            domain_id = ((topic.get("domain") or {}).get("id"))
+            field_id = ((topic.get("field") or {}).get("id"))
+            subfield_id = ((topic.get("subfield") or {}).get("id"))
+            if domain_id is not None:
+                domains.append(clean_domain(domain_id))
+            if field_id is not None:
+                fields.append(clean_field(field_id))
+            if subfield_id is not None:
+                subfields.append(clean_subfield(subfield_id))
 
         # Update article with JSON arrays
         article["domains"] = json.dumps(domains)
@@ -649,7 +672,9 @@ class OptimizedSQLCompiler:
 
         # Process references
         for reference in data["referenced_works"]:
-            reference_id = url_to_id(reference)
+            reference_id = safe_url_to_id(reference)
+            if reference_id is None:
+                continue
             self.temp_data["references"].append({
                 "cites": article_id,
                 "cited": reference_id
@@ -657,12 +682,21 @@ class OptimizedSQLCompiler:
 
         # Process authors and affiliations
         for author_data in data["authorships"]:
-            author_id = url_to_id(author_data["author"]["id"])
+            author = author_data.get("author") or {}
+            author_openalex_id = author.get("id")
+            if author_openalex_id is None:
+                print(f"Skipping authorship with missing author id for article {article_id}")
+                continue
+
+            author_id = safe_url_to_id(author_openalex_id)
+            if author_id is None:
+                print(f"Skipping authorship with invalid author id for article {article_id}")
+                continue
 
             if author_id not in self.batch_processed["authors"]:
-                author_name = author_data["author"]["display_name"]
+                author_name = author.get("display_name")
                 try:
-                    gender = gc.resolveGender(author_name, None)
+                    gender = resolve_gender(author_name)
                 except:
                     gender = None
                 if gender == "female":
@@ -673,7 +707,7 @@ class OptimizedSQLCompiler:
                 self.temp_data["authors"].append({
                     "author_id": author_id,
                     "name": author_name,
-                    "orcid": author_data["author"]["orcid"],
+                    "orcid": author.get("orcid"),
                     "gender": gender,
                 })
                 self.batch_processed["authors"].add(author_id)
@@ -681,22 +715,27 @@ class OptimizedSQLCompiler:
             self.temp_data["articles_authors"].append({
                 "author_id": author_id,
                 "article_id": article_id,
-                "position": author_data["author_position"],
+                "position": author_data.get("author_position"),
             })
 
             # Process institutions
-            for institution in author_data["institutions"]:
-                institution_id = url_to_id(institution["id"])
+            for institution in author_data.get("institutions", []):
+                institution_openalex_id = institution.get("id")
+                institution_id = safe_url_to_id(institution_openalex_id)
+                if institution_id is None:
+                    print(f"Skipping institution with missing id for article {article_id}")
+                    continue
 
                 if institution_id not in self.batch_processed["institutions"]:
                     self.temp_data["institutions"].append({
                         "institution_id": institution_id,
-                        "name": institution["display_name"],
-                        "country_code": institution["country_code"],
+                        "name": institution.get("display_name"),
+                        "country_code": institution.get("country_code"),
                         "lineage": json.dumps([
-                            url_to_id(ancestor)
-                            for ancestor in institution["lineage"]
-                            if ancestor != institution["id"]
+                            safe_url_to_id(ancestor)
+                            for ancestor in institution.get("lineage", [])
+                            if ancestor != institution_openalex_id
+                            and safe_url_to_id(ancestor) is not None
                         ]),
                     })
                     self.batch_processed["institutions"].add(institution_id)
@@ -705,24 +744,27 @@ class OptimizedSQLCompiler:
                     "article_id": article_id,
                     "author_id": author_id,
                     "institution_id": institution_id,
-                    "type": institution["type"],
+                    "type": institution.get("type"),
                 })
 
         # Process topics
         for topic in data["topics"]:
-            topic_id = url_to_id(topic["id"])
+            topic_id = safe_url_to_id(topic.get("id"))
+            if topic_id is None:
+                print(f"Skipping topic with missing id for article {article_id}")
+                continue
 
             if topic_id not in self.batch_processed["topics"]:
                 self.temp_data["topics"].append({
                     "topic_id": topic_id,
-                    "name": topic["display_name"],
+                    "name": topic.get("display_name"),
                 })
                 self.batch_processed["topics"].add(topic_id)
 
             self.temp_data["articles_topics"].append({
                 "article_id": article_id,
                 "topic_id": topic_id,
-                "score": topic["score"],
+                "score": topic.get("score"),
             })
 
         # Check if we need to flush batch

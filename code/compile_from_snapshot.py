@@ -381,6 +381,19 @@ def parse_args():
         action="append",
         help="OpenAlex primary source ID or URL. Can be repeated or comma-separated.",
     )
+    parser.add_argument(
+        "--enable-references",
+        dest="enable_references",
+        action="store_true",
+        default=True,
+        help="Store citation edges from referenced_works. Enabled by default.",
+    )
+    parser.add_argument(
+        "--disable-references",
+        dest="enable_references",
+        action="store_false",
+        help="Skip citation edge insertion.",
+    )
 
     args = parser.parse_args()
 
@@ -430,6 +443,7 @@ def main():
     filters = build_filters(args)
 
     compile_module = import_compile_module()
+    compile_module.ENABLE_REFERENCES = args.enable_references
     SnapshotSQLCompiler = make_snapshot_compiler_class(compile_module)
 
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
