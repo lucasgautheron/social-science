@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+from typing import Optional, Set
 
 
 DEFAULT_DOMAIN_IDS = ["1", "2", "3", "4"]
@@ -90,18 +91,18 @@ def record_deleted_file(path, deleted_log="deleted"):
 
 @dataclass
 class SnapshotFilters:
-    from_year: int | None
-    to_year: int | None
-    from_publication_date: object | None
-    to_publication_date: object | None
-    languages: set[str] | None
-    domain_ids: set[str] | None
-    field_ids: set[str] | None
-    subfield_ids: set[str] | None
-    topic_ids: set[str] | None
+    from_year: Optional[int]
+    to_year: Optional[int]
+    from_publication_date: Optional[object]
+    to_publication_date: Optional[object]
+    languages: Optional[Set[str]]
+    domain_ids: Optional[Set[str]]
+    field_ids: Optional[Set[str]]
+    subfield_ids: Optional[Set[str]]
+    topic_ids: Optional[Set[str]]
     require_abstract: bool
-    work_types: set[str] | None
-    source_ids: set[str] | None
+    work_types: Optional[Set[str]]
+    source_ids: Optional[Set[str]]
 
     def matches(self, work):
         if not has_required_compile_fields(work):
