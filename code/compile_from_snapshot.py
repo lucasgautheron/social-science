@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import re
+import sys
 from typing import Optional, Set
 
 
@@ -87,6 +88,27 @@ def iter_snapshot_works(path):
 def record_deleted_file(path, deleted_log="deleted"):
     with open(deleted_log, "a", encoding="utf-8") as fp:
         fp.write(f"{path}\n")
+
+
+def import_compile_module():
+    candidate_paths = [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.join(os.getcwd(), "code"),
+        os.getcwd(),
+    ]
+    for path in candidate_paths:
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
+
+    try:
+        return importlib.import_module("compile")
+    except ModuleNotFoundError as exc:
+        if exc.name != "compile":
+            raise
+        raise ModuleNotFoundError(
+            "Could not import compile.py. Run this script from the repository root, "
+            "or place compile.py in the same directory as compile_from_snapshot.py."
+        ) from exc
 
 
 @dataclass
@@ -407,7 +429,7 @@ def main():
     args = parse_args()
     filters = build_filters(args)
 
-    compile_module = importlib.import_module("compile")
+    compile_module = import_compile_module()
     SnapshotSQLCompiler = make_snapshot_compiler_class(compile_module)
 
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
