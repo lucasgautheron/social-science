@@ -91,6 +91,23 @@ WORKS_PARQUET_COLUMNS = [
     "updated_date",
 ]
 
+WORKS_PARQUET_READ_COLUMNS = [
+    "id",
+    "title",
+    "display_name",
+    "publication_date",
+    "publication_year",
+    "language",
+    "authorships",
+    "primary_topic",
+    "topics",
+    "concepts",
+    "locations",
+    "primary_location",
+    "referenced_works",
+    "abstract_inverted_index",
+]
+
 # Association tables for many-to-many relationships
 articles_authors_table = Table(
     "articles_authors",
@@ -483,7 +500,7 @@ def iter_parquet_work_records(path, batch_size):
         parquet_file = pq.ParquetFile(path)
         columns = [
             column
-            for column in WORKS_PARQUET_COLUMNS
+            for column in WORKS_PARQUET_READ_COLUMNS
             if column in parquet_file.schema_arrow.names
         ]
         if not columns:
@@ -501,7 +518,10 @@ def iter_parquet_work_records(path, batch_size):
             "Reading parquet input requires pyarrow or pandas with a parquet engine."
         ) from exc
 
-    frame = pd.read_parquet(path)
+    try:
+        frame = pd.read_parquet(path, columns=WORKS_PARQUET_READ_COLUMNS)
+    except (KeyError, ValueError):
+        frame = pd.read_parquet(path)
     for record in frame.to_dict(orient="records"):
         yield normalize_nested(record)
 
