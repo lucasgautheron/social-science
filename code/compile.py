@@ -38,6 +38,7 @@ def resolve_gender(author_name):
 Base = declarative_base()
 
 ENABLE_REFERENCES = False
+DEFAULT_PROGRESS_INTERVAL = 1000
 
 WORKS_PARQUET_COLUMNS = [
     "id",
@@ -104,9 +105,15 @@ WORKS_PARQUET_READ_COLUMNS = [
     "concepts",
     "locations",
     "primary_location",
-    "referenced_works",
     "abstract_inverted_index",
 ]
+
+
+def get_works_parquet_read_columns():
+    columns = list(WORKS_PARQUET_READ_COLUMNS)
+    if ENABLE_REFERENCES:
+        columns.append("referenced_works")
+    return columns
 
 # Association tables for many-to-many relationships
 articles_authors_table = Table(
@@ -498,9 +505,10 @@ def iter_parquet_work_records(path, batch_size):
 
     if pq is not None:
         parquet_file = pq.ParquetFile(path)
+        read_columns = get_works_parquet_read_columns()
         columns = [
             column
-            for column in WORKS_PARQUET_READ_COLUMNS
+            for column in read_columns
             if column in parquet_file.schema_arrow.names
         ]
         if not columns:
@@ -519,7 +527,7 @@ def iter_parquet_work_records(path, batch_size):
         ) from exc
 
     try:
-        frame = pd.read_parquet(path, columns=WORKS_PARQUET_READ_COLUMNS)
+        frame = pd.read_parquet(path, columns=get_works_parquet_read_columns())
     except (KeyError, ValueError):
         frame = pd.read_parquet(path)
     for record in frame.to_dict(orient="records"):
@@ -939,15 +947,16 @@ class OptimizedSQLCompiler:
         self.temp_data["articles"].append(article)
         self.batch_processed["articles"].add(article_id)
 
-        # Process references
-        for reference in ensure_list(data.get("referenced_works")):
-            reference_id = safe_url_to_id(reference)
-            if reference_id is None:
-                continue
-            self.temp_data["references"].append({
-                "cites": article_id,
-                "cited": reference_id
-            })
+        # Process references only when they will actually be inserted.
+        if ENABLE_REFERENCES:
+            for reference in ensure_list(data.get("referenced_works")):
+                reference_id = safe_url_to_id(reference)
+                if reference_id is None:
+                    continue
+                self.temp_data["references"].append({
+                    "cites": article_id,
+                    "cited": reference_id
+                })
 
         # Process authors and affiliations
         for author_data in ensure_list(data.get("authorships")):
@@ -1089,8 +1098,15 @@ class OptimizedSQLCompiler:
         else:
             self.processed = []
 
-    def compile_works(self, raw_data_location, pattern=None):
+    def compile_works(
+        self,
+        raw_data_location,
+        pattern=None,
+        progress_interval=DEFAULT_PROGRESS_INTERVAL,
+    ):
         self.load_processed()
+        total_raw_records = 0
+        start_time = now()
 
         def candidate_paths():
             if os.path.isfile(raw_data_location):
@@ -1118,10 +1134,34 @@ class OptimizedSQLCompiler:
                 continue
 
             print(f"Processing ({input_format}): {path}")
+            file_raw_records = 0
+            file_start_time = now()
             for record in iter_work_records(path, self.batch_size):
+                total_raw_records += 1
+                file_raw_records += 1
                 self.add_article(record)
 
+                if (
+                    progress_interval
+                    and total_raw_records % progress_interval == 0
+                ):
+                    elapsed = max(now() - start_time, 1e-9)
+                    print(
+                        "Progress: "
+                        f"{total_raw_records:,} raw rows "
+                        f"({total_raw_records / elapsed:.1f} rows/s), "
+                        f"{len(self.temp_data['articles']):,} buffered articles, "
+                        f"{len(self.temp_data['authors']):,} buffered authors, "
+                        f"{len(self.temp_data['references']):,} buffered references"
+                    )
+
             self.temp_data["files"].append(path)
+            file_elapsed = max(now() - file_start_time, 1e-9)
+            print(
+                f"Finished file: {path} "
+                f"({file_raw_records:,} raw rows in {file_elapsed:.1f}s, "
+                f"{file_raw_records / file_elapsed:.1f} rows/s)"
+            )
 
             # print(f"Processed articles in batch: {len(self.temp_data['articles'])}")
 
