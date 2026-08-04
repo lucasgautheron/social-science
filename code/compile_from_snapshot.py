@@ -249,6 +249,8 @@ def make_snapshot_compiler_class(compile_module):
             processed_records = 0
             raw_records = 0
             processed_files = 0
+            parquet_filter = None
+            parquet_filter_ready = False
             start_time = compile_module.now()
 
             for root, dirnames, filenames in os.walk(snapshot_root):
@@ -275,14 +277,43 @@ def make_snapshot_compiler_class(compile_module):
                     if input_format == "json_gzip":
                         work_iter = iter_snapshot_works(path)
                     else:
+                        if not parquet_filter_ready:
+                            parquet_filter = build_parquet_scalar_filter(filters)
+                            parquet_filter_ready = True
                         work_iter = compile_module.iter_work_records(
                             path,
                             batch_size=parquet_batch_size,
+                            parquet_filter=parquet_filter,
                         )
 
                     for work in work_iter:
                         raw_records += 1
                         file_raw_records += 1
+                        article_id = compile_module.safe_url_to_id(work.get("id"))
+                        if (
+                            article_id is not None
+                            and self.existing_article_ids is not None
+                            and article_id in self.existing_article_ids
+                        ):
+                            self.skipped_existing_articles += 1
+                            if (
+                                progress_interval
+                                and raw_records % progress_interval == 0
+                            ):
+                                elapsed = max(
+                                    compile_module.now() - start_time,
+                                    1e-9,
+                                )
+                                print(
+                                    "Progress: "
+                                    f"{raw_records:,} candidate snapshot rows "
+                                    f"({raw_records / elapsed:.1f} rows/s), "
+                                    f"{processed_records:,} matched, "
+                                    f"{len(self.temp_data['articles']):,} buffered articles, "
+                                    f"{self.skipped_existing_articles:,} skipped existing"
+                                )
+                            continue
+
                         if not filters.matches(work):
                             if (
                                 progress_interval
@@ -294,7 +325,7 @@ def make_snapshot_compiler_class(compile_module):
                                 )
                                 print(
                                     "Progress: "
-                                    f"{raw_records:,} raw snapshot rows "
+                                    f"{raw_records:,} candidate snapshot rows "
                                     f"({raw_records / elapsed:.1f} rows/s), "
                                     f"{processed_records:,} matched, "
                                     f"{len(self.temp_data['articles']):,} buffered articles, "
@@ -313,7 +344,7 @@ def make_snapshot_compiler_class(compile_module):
                             elapsed = max(compile_module.now() - start_time, 1e-9)
                             print(
                                 "Progress: "
-                                f"{raw_records:,} raw snapshot rows "
+                                f"{raw_records:,} candidate snapshot rows "
                                 f"({raw_records / elapsed:.1f} rows/s), "
                                 f"{processed_records:,} matched, "
                                 f"{len(self.temp_data['articles']):,} buffered articles, "
@@ -330,7 +361,7 @@ def make_snapshot_compiler_class(compile_module):
                     file_elapsed = max(compile_module.now() - file_start_time, 1e-9)
                     print(
                         f"Finished snapshot file: {path} "
-                        f"({file_raw_records:,} raw rows, "
+                        f"({file_raw_records:,} candidate rows, "
                         f"{file_processed_records:,} matched in {file_elapsed:.1f}s, "
                         f"{file_raw_records / file_elapsed:.1f} rows/s)"
                     )
@@ -368,7 +399,7 @@ def parse_args():
         "--progress-interval",
         type=int,
         default=1000,
-        help="Print progress every N raw snapshot rows. Use 0 to disable.",
+        help="Print progress every N candidate snapshot rows. Use 0 to disable.",
     )
     parser.add_argument(
         "--parquet-batch-size",
@@ -549,6 +580,50 @@ def validate_parquet_projection(compile_module, filters):
             "Parquet reader is missing columns required by active filters: "
             + ", ".join(missing_columns)
         )
+
+
+def combine_parquet_filter(expression, next_expression):
+    if expression is None:
+        return next_expression
+    return expression & next_expression
+
+
+def build_parquet_scalar_filter(filters):
+    import pyarrow.dataset as ds
+
+    expression = None
+    if filters.from_year is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("publication_year") >= filters.from_year,
+        )
+    if filters.to_year is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("publication_year") <= filters.to_year,
+        )
+    if filters.from_publication_date is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("publication_date") >= filters.from_publication_date,
+        )
+    if filters.to_publication_date is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("publication_date") <= filters.to_publication_date,
+        )
+    if filters.languages is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("language").isin(sorted(filters.languages)),
+        )
+    if filters.work_types is not None:
+        expression = combine_parquet_filter(
+            expression,
+            ds.field("type").isin(sorted(filters.work_types)),
+        )
+
+    return expression
 
 
 def print_stats(compiler):

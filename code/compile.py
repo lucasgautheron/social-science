@@ -502,23 +502,29 @@ def iter_json_work_records(path):
 def iter_parquet_work_records(
     path,
     batch_size=DEFAULT_PARQUET_BATCH_SIZE,
+    parquet_filter=None,
 ):
     try:
-        import pyarrow.parquet as pq
+        import pyarrow.dataset as ds
     except ImportError as exc:
         raise ImportError("Reading parquet input requires pyarrow.") from exc
 
-    parquet_file = pq.ParquetFile(path)
+    dataset = ds.dataset(path, format="parquet")
     read_columns = get_works_parquet_read_columns()
     columns = [
         column
         for column in read_columns
-        if column in parquet_file.schema_arrow.names
+        if column in dataset.schema.names
     ]
     if not columns:
         columns = None
 
-    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+    scanner = dataset.scanner(
+        columns=columns,
+        filter=parquet_filter,
+        batch_size=batch_size,
+    )
+    for batch in scanner.to_batches():
         for record in batch.to_pylist():
             yield record
 
@@ -534,12 +540,14 @@ def detect_work_file_format(filename):
 def iter_work_records(
     path,
     batch_size=DEFAULT_PARQUET_BATCH_SIZE,
+    parquet_filter=None,
 ):
     input_format = detect_work_file_format(path)
     if input_format == "parquet":
         yield from iter_parquet_work_records(
             path,
             batch_size=batch_size,
+            parquet_filter=parquet_filter,
         )
     elif input_format == "json_gzip":
         yield from iter_json_work_records(path)
