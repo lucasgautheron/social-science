@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date as datetime_date
 import gzip
 import importlib
 import json
@@ -35,6 +35,14 @@ def parse_date(value):
         raise argparse.ArgumentTypeError(
             f"{value!r} must be an ISO date like 2025-10-31"
         ) from exc
+
+
+def parse_work_publication_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, datetime_date):
+        return value
+    return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
 
 
 def normalize_openalex_id(value, prefix=None):
@@ -136,7 +144,7 @@ class SnapshotFilters:
         if self.to_year is not None and publication_year > self.to_year:
             return False
 
-        publication_date = datetime.strptime(work["publication_date"], "%Y-%m-%d").date()
+        publication_date = parse_work_publication_date(work["publication_date"])
         if (
             self.from_publication_date is not None
             and publication_date < self.from_publication_date
@@ -207,7 +215,7 @@ def has_required_compile_fields(work):
 
     required_values = [
         work.get("id"),
-        work.get("title"),
+        work.get("title") or work.get("display_name"),
         work.get("publication_year"),
         work.get("publication_date"),
         nested_get(primary_topic, ("domain", "id")),
@@ -217,7 +225,7 @@ def has_required_compile_fields(work):
     if any(value is None for value in required_values):
         return False
 
-    for list_field in ("locations", "topics", "referenced_works", "authorships"):
+    for list_field in ("locations", "topics", "authorships"):
         if not isinstance(work.get(list_field), list):
             return False
 
@@ -241,11 +249,14 @@ def make_snapshot_compiler_class(compile_module):
             self.load_processed()
             processed_records = 0
             raw_records = 0
+            processed_files = 0
             start_time = compile_module.now()
 
-            for root, _, filenames in os.walk(snapshot_root):
+            for root, dirnames, filenames in os.walk(snapshot_root):
+                dirnames.sort()
                 for filename in sorted(filenames):
-                    if not filename.endswith(".gz"):
+                    input_format = compile_module.detect_work_file_format(filename)
+                    if input_format is None:
                         continue
 
                     path = os.path.join(root, filename)
@@ -257,12 +268,20 @@ def make_snapshot_compiler_class(compile_module):
                         print(f"Skipping: {path}")
                         continue
 
-                    print(f"Processing snapshot file: {path}")
+                    processed_files += 1
+                    print(f"Processing snapshot file ({input_format}): {path}")
                     file_raw_records = 0
                     file_processed_records = 0
                     file_start_time = compile_module.now()
+                    if input_format == "json_gzip":
+                        work_iter = iter_snapshot_works(path)
+                    else:
+                        work_iter = compile_module.iter_work_records(
+                            path,
+                            self.batch_size,
+                        )
 
-                    for work in iter_snapshot_works(path):
+                    for work in work_iter:
                         raw_records += 1
                         file_raw_records += 1
                         if not filters.matches(work):
@@ -316,12 +335,19 @@ def make_snapshot_compiler_class(compile_module):
                         f"{file_processed_records:,} matched in {file_elapsed:.1f}s, "
                         f"{file_raw_records / file_elapsed:.1f} rows/s)"
                     )
-                    os.remove(path)
-                    record_deleted_file(path)
-                    print(f"Deleted processed snapshot file: {path}")
+                    if input_format == "json_gzip":
+                        os.remove(path)
+                        record_deleted_file(path)
+                        print(f"Deleted processed snapshot file: {path}")
+                    else:
+                        print(f"Kept processed parquet file: {path}")
 
             if any(self.temp_data.values()):
                 self.flush_batch_data()
+            if processed_files == 0:
+                print(f"No supported .gz or .parquet files found under: {snapshot_root}")
+            elif processed_records == 0:
+                print("No records matched the selected filters.")
 
     return SnapshotSQLCompiler
 
@@ -449,6 +475,8 @@ def parse_args():
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if args.progress_interval < 0:
+        parser.error("--progress-interval must be non-negative")
     if args.to_year is not None and args.to_year < args.from_year:
         parser.error("--to-year must be greater than or equal to --from-year")
     if (
