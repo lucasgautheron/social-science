@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from sqlalchemy import create_engine, text
 import pandas as pd
 import numpy as np
@@ -121,6 +122,7 @@ def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_rang
         # Fit and transform the texts
         count_matrix = vectorizer.fit_transform(texts)
         feature_names = vectorizer.get_feature_names_out()
+        count_matrix = count_matrix.tocsc()
 
         # Get counts and document presence, excluding blacklisted n-grams
         ngram_counts = {}
@@ -131,15 +133,18 @@ def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_rang
             if ngram in blacklist:
                 continue  # Skip blacklisted n-grams
 
-            count = count_matrix[:, i].sum()
+            start = count_matrix.indptr[i]
+            end = count_matrix.indptr[i + 1]
+            count = count_matrix.data[start:end].sum()
             if count > 0:
                 ngram_counts[ngram] = count
                 # Check if this n-gram appears in any document
-                if count_matrix[:, i].nnz > 0:
+                doc_indices = count_matrix.indices[start:end]
+
+                if len(doc_indices) > 0:
                     ngram_doc_presence.add(ngram)
 
                     # Track which articles contain this ngram
-                    doc_indices = count_matrix[:, i].nonzero()[0]
                     for doc_idx in doc_indices:
                         ngram_articles[ngram].add(article_ids[doc_idx])
 
