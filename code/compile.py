@@ -3,7 +3,7 @@ import gzip
 import json
 import datetime
 import re
-from datetime import datetime
+from datetime import datetime, date as datetime_date
 from sqlalchemy import (
     create_engine,
     Column,
@@ -38,6 +38,58 @@ def resolve_gender(author_name):
 Base = declarative_base()
 
 ENABLE_REFERENCES = False
+
+WORKS_PARQUET_COLUMNS = [
+    "id",
+    "doi",
+    "title",
+    "display_name",
+    "ids",
+    "indexed_in",
+    "publication_date",
+    "publication_year",
+    "language",
+    "type",
+    "authorships",
+    "authors_count",
+    "corresponding_author_ids",
+    "corresponding_institution_ids",
+    "primary_topic",
+    "topics",
+    "keywords",
+    "concepts",
+    "locations",
+    "locations_count",
+    "primary_location",
+    "best_oa_location",
+    "sustainable_development_goals",
+    "awards",
+    "funders",
+    "institutions",
+    "countries_distinct_count",
+    "institutions_distinct_count",
+    "open_access",
+    "is_paratext",
+    "is_retracted",
+    "is_xpac",
+    "biblio",
+    "referenced_works",
+    "referenced_works_count",
+    "related_works",
+    "abstract_inverted_index",
+    "cited_by_count",
+    "counts_by_year",
+    "apc_list",
+    "apc_paid",
+    "fwci",
+    "citation_normalized_percentile",
+    "cited_by_percentile_year",
+    "mesh",
+    "has_content",
+    "has_fulltext",
+    "created_date",
+    "updated_date",
+]
 
 # Association tables for many-to-many relationships
 articles_authors_table = Table(
@@ -243,33 +295,231 @@ def read_json_from_gzip(path):
     return data
 
 
+def is_missing(value):
+    if value is None:
+        return True
+    if type(value).__name__ in {"NAType", "NaTType"}:
+        return True
+    if isinstance(value, float) and value != value:
+        return True
+    return False
+
+
+def normalize_nested(value):
+    if is_missing(value):
+        return None
+    if hasattr(value, "as_py"):
+        return normalize_nested(value.as_py())
+    if isinstance(value, dict):
+        return {key: normalize_nested(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [normalize_nested(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalize_nested(item) for item in value)
+    if not isinstance(value, (str, bytes)) and hasattr(value, "tolist"):
+        try:
+            return normalize_nested(value.tolist())
+        except (AttributeError, TypeError, ValueError):
+            return value
+    return value
+
+
+def parse_json_like(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def ensure_list(value):
+    value = normalize_nested(parse_json_like(value))
+    if is_missing(value):
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def ensure_dict(value):
+    value = normalize_nested(parse_json_like(value))
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def extract_openalex_numeric_id(value, prefix=None):
+    if is_missing(value):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value:
+            return None
+        return int(value)
+
+    identifier = str(value).strip().rstrip("/")
+    if not identifier:
+        return None
+
+    identifier = identifier.rsplit("/", 1)[-1]
+    if prefix and identifier.startswith(prefix):
+        identifier = identifier[len(prefix):]
+    elif identifier and identifier[0].isalpha():
+        identifier = identifier[1:]
+
+    return int(identifier)
+
+
 def url_to_id(url):
-    return int(url.replace("https://openalex.org/", "")[1:])
+    return extract_openalex_numeric_id(url)
 
 
 def safe_url_to_id(url):
-    if url is None:
-        return None
     try:
         return url_to_id(url)
-    except (AttributeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
 def clean_domain(url):
-    return int(url.replace("https://openalex.org/domains/", ""))
+    return extract_openalex_numeric_id(url)
 
 
 def clean_field(url):
-    return int(url.replace("https://openalex.org/fields/", ""))
+    return extract_openalex_numeric_id(url)
 
 
 def clean_subfield(url):
-    return int(url.replace("https://openalex.org/subfields/", ""))
+    return extract_openalex_numeric_id(url)
 
 
 def clean_source(url):
-    return url.replace("https://openalex.org/S", "")
+    return extract_openalex_numeric_id(url, "S")
+
+
+def parse_publication_date(value):
+    if is_missing(value):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, datetime_date):
+        return value
+    if isinstance(value, str):
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    return value
+
+
+def iter_abstract_entries(inverted_index):
+    inverted_index = normalize_nested(parse_json_like(inverted_index))
+    if is_missing(inverted_index):
+        return
+
+    if isinstance(inverted_index, dict):
+        for word, positions in inverted_index.items():
+            yield word, ensure_list(positions)
+        return
+
+    for item in ensure_list(inverted_index):
+        item = normalize_nested(item)
+        if isinstance(item, tuple) and len(item) == 2:
+            yield item[0], ensure_list(item[1])
+        elif isinstance(item, dict):
+            if "key" in item and "value" in item:
+                yield item["key"], ensure_list(item["value"])
+            elif "word" in item and "positions" in item:
+                yield item["word"], ensure_list(item["positions"])
+            elif len(item) == 1:
+                word, positions = next(iter(item.items()))
+                yield word, ensure_list(positions)
+
+
+def reconstruct_abstract(inverted_index):
+    entries = []
+    for word, positions in iter_abstract_entries(inverted_index):
+        clean_positions = []
+        for position in positions:
+            if is_missing(position):
+                continue
+            clean_positions.append(int(position))
+        if clean_positions:
+            entries.append((str(word), clean_positions))
+
+    if not entries:
+        return None
+
+    max_position = max(max(positions) for _, positions in entries)
+    abstract_words = [""] * (max_position + 1)
+    for word, positions in entries:
+        for position in positions:
+            abstract_words[position] = word
+
+    return " ".join(abstract_words)
+
+
+def iter_json_work_records(path):
+    data = read_json_from_gzip(path)
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    for record in data:
+        yield normalize_nested(record)
+
+
+def iter_parquet_work_records(path, batch_size):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        pq = None
+
+    if pq is not None:
+        parquet_file = pq.ParquetFile(path)
+        columns = [
+            column
+            for column in WORKS_PARQUET_COLUMNS
+            if column in parquet_file.schema_arrow.names
+        ]
+        if not columns:
+            columns = None
+
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+            for record in batch.to_pylist():
+                yield normalize_nested(record)
+        return
+
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError(
+            "Reading parquet input requires pyarrow or pandas with a parquet engine."
+        ) from exc
+
+    frame = pd.read_parquet(path)
+    for record in frame.to_dict(orient="records"):
+        yield normalize_nested(record)
+
+
+def detect_work_file_format(filename):
+    if filename.endswith(".parquet"):
+        return "parquet"
+    if filename.endswith(".gz"):
+        return "json_gzip"
+    return None
+
+
+def iter_work_records(path, batch_size):
+    input_format = detect_work_file_format(path)
+    if input_format == "parquet":
+        yield from iter_parquet_work_records(path, batch_size)
+    elif input_format == "json_gzip":
+        yield from iter_json_work_records(path)
 
 
 def get_arxiv(url):
@@ -548,7 +798,7 @@ class OptimizedSQLCompiler:
                     articles_concepts_sql = self._get_upsert_sql(
                         'articles_concepts',
                         ['article_id', 'concept_id', "score"],
-                        ['article_id', 'concept_id', "score"]
+                        ['article_id', 'concept_id']
                     )
                     session.execute(text(articles_concepts_sql), self.temp_data["articles_concepts"])
                 print(f"Inserted {len(self.temp_data['articles_concepts'])} article-concept relationships")
@@ -574,93 +824,92 @@ class OptimizedSQLCompiler:
             self.batch_processed[key].clear()
 
     def add_article(self, data):
-        article_id = url_to_id(data["id"])
+        data = normalize_nested(data)
+        article_id = safe_url_to_id(data.get("id"))
+        if article_id is None:
+            print("Skipping work with missing or invalid id")
+            return
 
         # Skip if already processed in current batch
         if article_id in self.batch_processed["articles"]:
             return
 
-        source = data.get("primary_location", 0)
-        if source:
-            source = source.get("source", 0)
-            if source:
-                if "id" in source and source["id"] is not None:
-                    source = int(clean_source(source["id"]))
-                else:
-                    source = 0
-
-        if source is None:
-            source = 0
+        primary_location = ensure_dict(data.get("primary_location"))
+        source = ensure_dict(primary_location.get("source"))
+        source_id = safe_url_to_id(source.get("id")) or 0
 
         minimum_publication_year = getattr(self, "minimum_publication_year", early_date)
-        if minimum_publication_year is not None and not (
-            data["publication_year"] >= minimum_publication_year
-        ):
+        publication_year = data.get("publication_year")
+        if is_missing(publication_year):
+            return
+        publication_year = int(publication_year)
+
+        if minimum_publication_year is not None and publication_year < minimum_publication_year:
             return
 
         allowed_languages = getattr(self, "allowed_languages", {"en"})
+        language = data.get("language", "")
         if (
             allowed_languages is not None
-            and data.get("language", "") not in allowed_languages
+            and language not in allowed_languages
         ):
             return
 
+        primary_topic = ensure_dict(data.get("primary_topic"))
+        primary_domain = ensure_dict(primary_topic.get("domain"))
+        primary_field = ensure_dict(primary_topic.get("field"))
+        primary_subfield = ensure_dict(primary_topic.get("subfield"))
+
         article = {
             "article_id": article_id,
-            "title": data["title"],
-            "publication_year": data["publication_year"],
-            "publication_date": datetime.strptime(data["publication_date"], "%Y-%m-%d"),
-            "domain": clean_domain(data["primary_topic"]["domain"]["id"]),
-            "field": clean_field(data["primary_topic"]["field"]["id"]),
-            "subfield": clean_subfield(data["primary_topic"]["subfield"]["id"]),
+            "title": data.get("title") or data.get("display_name"),
+            "publication_year": publication_year,
+            "publication_date": parse_publication_date(data.get("publication_date")),
+            "domain": safe_url_to_id(primary_domain.get("id")),
+            "field": safe_url_to_id(primary_field.get("id")),
+            "subfield": safe_url_to_id(primary_subfield.get("id")),
             "domains": json.dumps([]),  # Convert to JSON string
             "fields": json.dumps([]),
             "subfields": json.dumps([]),
             "url": None,
-            "language": data.get("language", ""),
-            "source": int(source),
+            "language": language,
+            "source": source_id or 0,
         }
 
         domains = []
         fields = []
         subfields = []
+        topics = [ensure_dict(topic) for topic in ensure_list(data.get("topics"))]
 
-        for location in data["locations"]:
-            if location["is_oa"] and article["url"] is None:
-                article["url"] = location["landing_page_url"]
+        for location in ensure_list(data.get("locations")):
+            location = ensure_dict(location)
+            if location.get("is_oa") and article["url"] is None:
+                article["url"] = location.get("landing_page_url")
                 self.n_urls += 1
                 continue
 
         # Process abstract
-        if data["abstract_inverted_index"] is not None:
-            if len(data["abstract_inverted_index"]) > 1:
-                max_position = max(
-                    max(positions)
-                    for positions in data["abstract_inverted_index"].values()
-                    if positions
-                )
-                abstract_words = [""] * (max_position + 1)
-
-                for word in data["abstract_inverted_index"]:
-                    for pos in data["abstract_inverted_index"][word]:
-                        abstract_words[pos] = word
-
-                self.temp_data["abstracts"].append({
-                    "article_id": article_id,
-                    "abstract": " ".join(abstract_words),
-                })
+        abstract = reconstruct_abstract(data.get("abstract_inverted_index"))
+        if abstract:
+            self.temp_data["abstracts"].append({
+                "article_id": article_id,
+                "abstract": abstract,
+            })
 
         # Process topics
-        for topic in data["topics"]:
-            domain_id = ((topic.get("domain") or {}).get("id"))
-            field_id = ((topic.get("field") or {}).get("id"))
-            subfield_id = ((topic.get("subfield") or {}).get("id"))
+        for topic in topics:
+            domain_id = ensure_dict(topic.get("domain")).get("id")
+            field_id = ensure_dict(topic.get("field")).get("id")
+            subfield_id = ensure_dict(topic.get("subfield")).get("id")
+            domain_id = safe_url_to_id(domain_id)
+            field_id = safe_url_to_id(field_id)
+            subfield_id = safe_url_to_id(subfield_id)
             if domain_id is not None:
-                domains.append(clean_domain(domain_id))
+                domains.append(domain_id)
             if field_id is not None:
-                fields.append(clean_field(field_id))
+                fields.append(field_id)
             if subfield_id is not None:
-                subfields.append(clean_subfield(subfield_id))
+                subfields.append(subfield_id)
 
         # Update article with JSON arrays
         article["domains"] = json.dumps(domains)
@@ -671,7 +920,7 @@ class OptimizedSQLCompiler:
         self.batch_processed["articles"].add(article_id)
 
         # Process references
-        for reference in data["referenced_works"]:
+        for reference in ensure_list(data.get("referenced_works")):
             reference_id = safe_url_to_id(reference)
             if reference_id is None:
                 continue
@@ -681,8 +930,9 @@ class OptimizedSQLCompiler:
             })
 
         # Process authors and affiliations
-        for author_data in data["authorships"]:
-            author = author_data.get("author") or {}
+        for author_data in ensure_list(data.get("authorships")):
+            author_data = ensure_dict(author_data)
+            author = ensure_dict(author_data.get("author"))
             author_openalex_id = author.get("id")
             if author_openalex_id is None:
                 print(f"Skipping authorship with missing author id for article {article_id}")
@@ -719,7 +969,8 @@ class OptimizedSQLCompiler:
             })
 
             # Process institutions
-            for institution in author_data.get("institutions", []):
+            for institution in ensure_list(author_data.get("institutions")):
+                institution = ensure_dict(institution)
                 institution_openalex_id = institution.get("id")
                 institution_id = safe_url_to_id(institution_openalex_id)
                 if institution_id is None:
@@ -733,7 +984,7 @@ class OptimizedSQLCompiler:
                         "country_code": institution.get("country_code"),
                         "lineage": json.dumps([
                             safe_url_to_id(ancestor)
-                            for ancestor in institution.get("lineage", [])
+                            for ancestor in ensure_list(institution.get("lineage"))
                             if ancestor != institution_openalex_id
                             and safe_url_to_id(ancestor) is not None
                         ]),
@@ -748,7 +999,7 @@ class OptimizedSQLCompiler:
                 })
 
         # Process topics
-        for topic in data["topics"]:
+        for topic in topics:
             topic_id = safe_url_to_id(topic.get("id"))
             if topic_id is None:
                 print(f"Skipping topic with missing id for article {article_id}")
@@ -767,23 +1018,48 @@ class OptimizedSQLCompiler:
                 "score": topic.get("score"),
             })
 
+        # Process concepts embedded in works parquet/JSON records.
+        for concept in ensure_list(data.get("concepts")):
+            concept = ensure_dict(concept)
+            concept_id = safe_url_to_id(concept.get("id"))
+            if concept_id is None:
+                print(f"Skipping concept with missing id for article {article_id}")
+                continue
+
+            if concept_id not in self.batch_processed["concepts"]:
+                self.temp_data["concepts"].append({
+                    "concept_id": concept_id,
+                    "name": concept.get("display_name"),
+                    "level": concept.get("level"),
+                })
+                self.batch_processed["concepts"].add(concept_id)
+
+            self.temp_data["articles_concepts"].append({
+                "article_id": article_id,
+                "concept_id": concept_id,
+                "score": concept.get("score"),
+            })
+
         # Check if we need to flush batch
         if len(self.temp_data["articles"]) >= self.batch_size:
             self.flush_batch_data()
 
-            stats = compiler.get_stats()
+            stats = self.get_stats()
             print("Current database statistics:")
             for table, count in stats.items():
                 print(f"{table}: {count}")
 
     def add_concept(self, data):
-        concept_id = url_to_id(data["id"])
+        data = ensure_dict(data)
+        concept_id = safe_url_to_id(data.get("id"))
+        if concept_id is None:
+            return
 
         if concept_id not in self.batch_processed["concepts"]:
             self.temp_data["concepts"].append({
                 "concept_id": concept_id,
-                "name": data["display_name"],
-                "level": data["level"],
+                "name": data.get("display_name"),
+                "level": data.get("level"),
             })
             self.batch_processed["concepts"].add(concept_id)
 
@@ -794,39 +1070,43 @@ class OptimizedSQLCompiler:
             self.processed = []
 
     def compile_works(self, raw_data_location, pattern=None):
-        extension = "gz"
-
         self.load_processed()
 
-        for root, dirnames, filenames in os.walk(raw_data_location):
-            for filename in filenames:
-                path = os.path.join(root, filename)
+        def candidate_paths():
+            if os.path.isfile(raw_data_location):
+                yield raw_data_location
+                return
 
-                if not filename.endswith(extension):
-                    continue
+            for root, dirnames, filenames in os.walk(raw_data_location):
+                dirnames.sort()
+                for filename in sorted(filenames):
+                    yield os.path.join(root, filename)
 
-                if not os.path.exists(path):
-                    continue
+        for path in candidate_paths():
+            input_format = detect_work_file_format(path)
+            if input_format is None:
+                continue
 
-                if pattern and (not re.match(pattern, path)):
-                    continue
+            if not os.path.exists(path):
+                continue
 
-                if path in self.processed:
-                    print(f"Skipping: {path}")
-                    continue
+            if pattern and (not re.match(pattern, path)):
+                continue
 
-                print(f"Processing: {path}")
-                data = read_json_from_gzip(path)
+            if path in self.processed:
+                print(f"Skipping: {path}")
+                continue
 
-                for r in data:
-                    self.add_article(r)
+            print(f"Processing ({input_format}): {path}")
+            for record in iter_work_records(path, self.batch_size):
+                self.add_article(record)
 
-                self.temp_data["files"].append(path)
+            self.temp_data["files"].append(path)
 
-                # print(f"Processed articles in batch: {len(self.temp_data['articles'])}")
+            # print(f"Processed articles in batch: {len(self.temp_data['articles'])}")
 
         # Flush remaining data
-        if self.temp_data["articles"]:
+        if any(self.temp_data.values()):
             self.flush_batch_data()
 
     def compile_concepts(self, raw_data_location):
