@@ -236,9 +236,12 @@ def make_snapshot_compiler_class(compile_module):
             filters,
             path_pattern=None,
             limit=None,
+            progress_interval=1000,
         ):
             self.load_processed()
             processed_records = 0
+            raw_records = 0
+            start_time = compile_module.now()
 
             for root, _, filenames in os.walk(snapshot_root):
                 for filename in sorted(filenames):
@@ -255,13 +258,47 @@ def make_snapshot_compiler_class(compile_module):
                         continue
 
                     print(f"Processing snapshot file: {path}")
+                    file_raw_records = 0
+                    file_processed_records = 0
+                    file_start_time = compile_module.now()
 
                     for work in iter_snapshot_works(path):
+                        raw_records += 1
+                        file_raw_records += 1
                         if not filters.matches(work):
+                            if (
+                                progress_interval
+                                and raw_records % progress_interval == 0
+                            ):
+                                elapsed = max(
+                                    compile_module.now() - start_time,
+                                    1e-9,
+                                )
+                                print(
+                                    "Progress: "
+                                    f"{raw_records:,} raw snapshot rows "
+                                    f"({raw_records / elapsed:.1f} rows/s), "
+                                    f"{processed_records:,} matched, "
+                                    f"{len(self.temp_data['articles']):,} buffered articles"
+                                )
                             continue
 
                         self.add_article(work)
                         processed_records += 1
+                        file_processed_records += 1
+
+                        if (
+                            progress_interval
+                            and raw_records % progress_interval == 0
+                        ):
+                            elapsed = max(compile_module.now() - start_time, 1e-9)
+                            print(
+                                "Progress: "
+                                f"{raw_records:,} raw snapshot rows "
+                                f"({raw_records / elapsed:.1f} rows/s), "
+                                f"{processed_records:,} matched, "
+                                f"{len(self.temp_data['articles']):,} buffered articles"
+                            )
 
                         if limit is not None and processed_records >= limit:
                             if any(self.temp_data.values()):
@@ -272,6 +309,13 @@ def make_snapshot_compiler_class(compile_module):
                     self.temp_data["files"].append(path)
                     if any(self.temp_data.values()):
                         self.flush_batch_data()
+                    file_elapsed = max(compile_module.now() - file_start_time, 1e-9)
+                    print(
+                        f"Finished snapshot file: {path} "
+                        f"({file_raw_records:,} raw rows, "
+                        f"{file_processed_records:,} matched in {file_elapsed:.1f}s, "
+                        f"{file_raw_records / file_elapsed:.1f} rows/s)"
+                    )
                     os.remove(path)
                     record_deleted_file(path)
                     print(f"Deleted processed snapshot file: {path}")
@@ -300,6 +344,12 @@ def parse_args():
         type=int,
         default=10000,
         help="Rows per insert batch. Default: 10000",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=1000,
+        help="Print progress every N raw snapshot rows. Use 0 to disable.",
     )
     parser.add_argument(
         "--path-pattern",
@@ -385,8 +435,8 @@ def parse_args():
         "--enable-references",
         dest="enable_references",
         action="store_true",
-        default=True,
-        help="Store citation edges from referenced_works. Enabled by default.",
+        default=False,
+        help="Store citation edges from referenced_works. Disabled by default.",
     )
     parser.add_argument(
         "--disable-references",
@@ -432,10 +482,7 @@ def build_filters(args):
 
 
 def print_stats(compiler):
-    stats = compiler.get_stats()
-    print("Final database statistics:")
-    for table, count in stats.items():
-        print(f"{table}: {count}")
+    compiler.print_insert_stats()
 
 
 def main():
@@ -449,14 +496,12 @@ def main():
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
     compiler.configure_filters(filters)
 
-    # compile.py refers to a module-level compiler while printing batch stats.
-    compile_module.compiler = compiler
-
     compiler.compile_snapshot_works(
         args.snapshot_root,
         filters=filters,
         path_pattern=args.path_pattern,
         limit=args.limit,
+        progress_interval=args.progress_interval,
     )
     print_stats(compiler)
 
