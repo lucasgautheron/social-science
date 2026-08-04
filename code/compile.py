@@ -39,7 +39,7 @@ Base = declarative_base()
 
 ENABLE_REFERENCES = False
 DEFAULT_PROGRESS_INTERVAL = 1000
-DEFAULT_PARQUET_BATCH_SIZE = 1000
+DEFAULT_PARQUET_BATCH_SIZE = 10000
 
 WORKS_PARQUET_COLUMNS = [
     "id",
@@ -630,6 +630,8 @@ class OptimizedSQLCompiler:
         self.n_urls = 0
         self.existing_article_ids = None
         self.skipped_existing_articles = 0
+        self.delete_source_files = False
+        self.deleted_sources_log = "deleted"
 
     def _detect_database_type(self, database_url):
         """Detect database type from URL for optimized SQL queries."""
@@ -728,6 +730,23 @@ class OptimizedSQLCompiler:
             f"{len(self.existing_article_ids):,} total "
             f"in {elapsed:.1f}s"
         )
+
+    def delete_flushed_source_files(self, paths):
+        if not self.delete_source_files:
+            return
+
+        deleted_paths = []
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            os.remove(path)
+            deleted_paths.append(path)
+            print(f"Deleted processed source file: {path}")
+
+        if deleted_paths:
+            with open(self.deleted_sources_log, "a", encoding="utf-8") as fp:
+                for path in deleted_paths:
+                    fp.write(f"{path}\n")
 
     def flush_batch_data(self):
         """Insert accumulated data using optimized bulk operations with raw SQL."""
@@ -948,10 +967,12 @@ class OptimizedSQLCompiler:
         finally:
             session.close()
 
+        flushed_files = list(self.temp_data["files"])
         self.load_processed()
-        self.processed += self.temp_data["files"]
+        self.processed += flushed_files
         open("processed", "w+").write("\n".join(self.processed))
         self.load_processed()
+        self.delete_flushed_source_files(flushed_files)
 
         # Clear temporary data and batch tracking
         for key in self.temp_data:

@@ -93,11 +93,6 @@ def iter_snapshot_works(path):
                 raise ValueError(f"Invalid JSON in {path}:{line_number}") from exc
 
 
-def record_deleted_file(path, deleted_log="deleted"):
-    with open(deleted_log, "a", encoding="utf-8") as fp:
-        fp.write(f"{path}\n")
-
-
 def import_compile_module():
     candidate_paths = [
         os.path.dirname(os.path.abspath(__file__)),
@@ -332,8 +327,6 @@ def make_snapshot_compiler_class(compile_module):
                             return
 
                     self.temp_data["files"].append(path)
-                    if any(self.temp_data.values()):
-                        self.flush_batch_data()
                     file_elapsed = max(compile_module.now() - file_start_time, 1e-9)
                     print(
                         f"Finished snapshot file: {path} "
@@ -341,12 +334,6 @@ def make_snapshot_compiler_class(compile_module):
                         f"{file_processed_records:,} matched in {file_elapsed:.1f}s, "
                         f"{file_raw_records / file_elapsed:.1f} rows/s)"
                     )
-                    if input_format == "json_gzip":
-                        os.remove(path)
-                        record_deleted_file(path)
-                        print(f"Deleted processed snapshot file: {path}")
-                    else:
-                        print(f"Kept processed parquet file: {path}")
 
             if any(self.temp_data.values()):
                 self.flush_batch_data()
@@ -386,13 +373,18 @@ def parse_args():
     parser.add_argument(
         "--parquet-batch-size",
         type=int,
-        default=1000,
+        default=10000,
         help="Rows per pyarrow parquet read batch.",
     )
     parser.add_argument(
         "--preload-existing-articles",
         action="store_true",
         help="Load existing article IDs into memory and skip them before parsing.",
+    )
+    parser.add_argument(
+        "--delete-sources",
+        action="store_true",
+        help="Delete source .gz/.parquet files after their contents are flushed.",
     )
     parser.add_argument(
         "--path-pattern",
@@ -574,6 +566,7 @@ def main():
 
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
     compiler.configure_filters(filters)
+    compiler.delete_source_files = args.delete_sources
     if args.preload_existing_articles:
         compiler.load_existing_article_ids()
 
