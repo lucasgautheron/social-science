@@ -302,13 +302,14 @@ def make_snapshot_compiler_class(compile_module):
                                     f"{raw_records:,} raw snapshot rows "
                                     f"({raw_records / elapsed:.1f} rows/s), "
                                     f"{processed_records:,} matched, "
-                                    f"{len(self.temp_data['articles']):,} buffered articles"
+                                    f"{len(self.temp_data['articles']):,} buffered articles, "
+                                    f"{self.skipped_existing_articles:,} skipped existing"
                                 )
                             continue
 
-                        self.add_article(work)
-                        processed_records += 1
-                        file_processed_records += 1
+                        if self.add_article(work):
+                            processed_records += 1
+                            file_processed_records += 1
 
                         if (
                             progress_interval
@@ -320,7 +321,8 @@ def make_snapshot_compiler_class(compile_module):
                                 f"{raw_records:,} raw snapshot rows "
                                 f"({raw_records / elapsed:.1f} rows/s), "
                                 f"{processed_records:,} matched, "
-                                f"{len(self.temp_data['articles']):,} buffered articles"
+                                f"{len(self.temp_data['articles']):,} buffered articles, "
+                                f"{self.skipped_existing_articles:,} skipped existing"
                             )
 
                         if limit is not None and processed_records >= limit:
@@ -386,6 +388,11 @@ def parse_args():
         type=int,
         default=1000,
         help="Rows per pyarrow parquet read batch.",
+    )
+    parser.add_argument(
+        "--preload-existing-articles",
+        action="store_true",
+        help="Load existing article IDs into memory and skip them before parsing.",
     )
     parser.add_argument(
         "--path-pattern",
@@ -567,6 +574,8 @@ def main():
 
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
     compiler.configure_filters(filters)
+    if args.preload_existing_articles:
+        compiler.load_existing_article_ids()
 
     compiler.compile_snapshot_works(
         args.snapshot_root,

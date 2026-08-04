@@ -628,6 +628,8 @@ class OptimizedSQLCompiler:
 
         self.repositories = []
         self.n_urls = 0
+        self.existing_article_ids = None
+        self.skipped_existing_articles = 0
 
     def _detect_database_type(self, database_url):
         """Detect database type from URL for optimized SQL queries."""
@@ -698,6 +700,34 @@ class OptimizedSQLCompiler:
                 f"{key}: {stats['inserted']} inserted "
                 f"({stats['attempted']} attempted)"
             )
+        if self.skipped_existing_articles:
+            print(f"existing_articles_skipped: {self.skipped_existing_articles}")
+
+    def load_existing_article_ids(self, progress_interval=1000000):
+        if self.existing_article_ids is not None:
+            return
+
+        self.existing_article_ids = set()
+        start_time = now()
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text('SELECT "article_id" FROM "articles"')
+            )
+            for count, row in enumerate(result, start=1):
+                self.existing_article_ids.add(row[0])
+                if progress_interval and count % progress_interval == 0:
+                    elapsed = max(now() - start_time, 1e-9)
+                    print(
+                        "Loaded existing article IDs: "
+                        f"{count:,} ({count / elapsed:.1f} ids/s)"
+                    )
+
+        elapsed = max(now() - start_time, 1e-9)
+        print(
+            "Loaded existing article IDs: "
+            f"{len(self.existing_article_ids):,} total "
+            f"in {elapsed:.1f}s"
+        )
 
     def flush_batch_data(self):
         """Insert accumulated data using optimized bulk operations with raw SQL."""
@@ -933,11 +963,18 @@ class OptimizedSQLCompiler:
         article_id = safe_url_to_id(data.get("id"))
         if article_id is None:
             print("Skipping work with missing or invalid id")
-            return
+            return False
+
+        if (
+            self.existing_article_ids is not None
+            and article_id in self.existing_article_ids
+        ):
+            self.skipped_existing_articles += 1
+            return False
 
         # Skip if already processed in current batch
         if article_id in self.batch_processed["articles"]:
-            return
+            return False
 
         primary_location = ensure_dict(data.get("primary_location"))
         source = ensure_dict(primary_location.get("source"))
@@ -946,11 +983,11 @@ class OptimizedSQLCompiler:
         minimum_publication_year = getattr(self, "minimum_publication_year", early_date)
         publication_year = data.get("publication_year")
         if is_missing(publication_year):
-            return
+            return False
         publication_year = int(publication_year)
 
         if minimum_publication_year is not None and publication_year < minimum_publication_year:
-            return
+            return False
 
         allowed_languages = getattr(self, "allowed_languages", {"en"})
         language = data.get("language", "")
@@ -958,7 +995,7 @@ class OptimizedSQLCompiler:
             allowed_languages is not None
             and language not in allowed_languages
         ):
-            return
+            return False
 
         primary_topic = ensure_dict(data.get("primary_topic"))
         primary_domain = ensure_dict(primary_topic.get("domain"))
@@ -1031,6 +1068,8 @@ class OptimizedSQLCompiler:
 
         self.temp_data["articles"].append(article)
         self.batch_processed["articles"].add(article_id)
+        if self.existing_article_ids is not None:
+            self.existing_article_ids.add(article_id)
 
         # Process references only when they will actually be inserted.
         if ENABLE_REFERENCES:
@@ -1158,6 +1197,8 @@ class OptimizedSQLCompiler:
         if len(self.temp_data["articles"]) >= self.batch_size:
             self.flush_batch_data()
 
+        return True
+
     def add_concept(self, data):
         data = ensure_dict(data)
         concept_id = safe_url_to_id(data.get("id"))
@@ -1236,7 +1277,8 @@ class OptimizedSQLCompiler:
                         f"({total_raw_records / elapsed:.1f} rows/s), "
                         f"{len(self.temp_data['articles']):,} buffered articles, "
                         f"{len(self.temp_data['authors']):,} buffered authors, "
-                        f"{len(self.temp_data['references']):,} buffered references"
+                        f"{len(self.temp_data['references']):,} buffered references, "
+                        f"{self.skipped_existing_articles:,} skipped existing"
                     )
 
             self.temp_data["files"].append(path)
