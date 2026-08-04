@@ -40,7 +40,6 @@ Base = declarative_base()
 ENABLE_REFERENCES = False
 DEFAULT_PROGRESS_INTERVAL = 1000
 DEFAULT_PARQUET_BATCH_SIZE = 1000
-DEFAULT_PARQUET_READER = "pyarrow"
 
 WORKS_PARQUET_COLUMNS = [
     "id",
@@ -101,6 +100,7 @@ WORKS_PARQUET_READ_COLUMNS = [
     "publication_date",
     "publication_year",
     "language",
+    "type",
     "authorships",
     "primary_topic",
     "topics",
@@ -499,53 +499,28 @@ def iter_json_work_records(path):
         yield normalize_nested(record)
 
 
-def iter_pandas_parquet_work_records(path):
-    import pandas as pd
-
-    try:
-        frame = pd.read_parquet(path, columns=get_works_parquet_read_columns())
-    except (KeyError, ValueError):
-        frame = pd.read_parquet(path)
-
-    for record in frame.to_dict(orient="records"):
-        yield normalize_nested(record)
-
-
 def iter_parquet_work_records(
     path,
     batch_size=DEFAULT_PARQUET_BATCH_SIZE,
-    reader=DEFAULT_PARQUET_READER,
 ):
-    reader = reader.lower()
-
-    if reader == "pandas":
-        yield from iter_pandas_parquet_work_records(path)
-        return
-
-    if reader != "pyarrow":
-        raise ValueError("parquet reader must be 'pyarrow' or 'pandas'")
-
     try:
         import pyarrow.parquet as pq
-    except ImportError:
-        yield from iter_pandas_parquet_work_records(path)
-        return
+    except ImportError as exc:
+        raise ImportError("Reading parquet input requires pyarrow.") from exc
 
-    if pq is not None:
-        parquet_file = pq.ParquetFile(path)
-        read_columns = get_works_parquet_read_columns()
-        columns = [
-            column
-            for column in read_columns
-            if column in parquet_file.schema_arrow.names
-        ]
-        if not columns:
-            columns = None
+    parquet_file = pq.ParquetFile(path)
+    read_columns = get_works_parquet_read_columns()
+    columns = [
+        column
+        for column in read_columns
+        if column in parquet_file.schema_arrow.names
+    ]
+    if not columns:
+        columns = None
 
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
-            for record in batch.to_pylist():
-                yield record
-        return
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        for record in batch.to_pylist():
+            yield record
 
 
 def detect_work_file_format(filename):
@@ -559,14 +534,12 @@ def detect_work_file_format(filename):
 def iter_work_records(
     path,
     batch_size=DEFAULT_PARQUET_BATCH_SIZE,
-    parquet_reader=DEFAULT_PARQUET_READER,
 ):
     input_format = detect_work_file_format(path)
     if input_format == "parquet":
         yield from iter_parquet_work_records(
             path,
             batch_size=batch_size,
-            reader=parquet_reader,
         )
     elif input_format == "json_gzip":
         yield from iter_json_work_records(path)
@@ -1210,7 +1183,6 @@ class OptimizedSQLCompiler:
         raw_data_location,
         pattern=None,
         progress_interval=DEFAULT_PROGRESS_INTERVAL,
-        parquet_reader=DEFAULT_PARQUET_READER,
         parquet_batch_size=DEFAULT_PARQUET_BATCH_SIZE,
     ):
         self.load_processed()
@@ -1248,7 +1220,6 @@ class OptimizedSQLCompiler:
             for record in iter_work_records(
                 path,
                 batch_size=parquet_batch_size,
-                parquet_reader=parquet_reader,
             ):
                 total_raw_records += 1
                 file_raw_records += 1

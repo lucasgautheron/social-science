@@ -245,11 +245,9 @@ def make_snapshot_compiler_class(compile_module):
             path_pattern=None,
             limit=None,
             progress_interval=1000,
-            parquet_reader=None,
             parquet_batch_size=None,
         ):
             self.load_processed()
-            parquet_reader = parquet_reader or compile_module.DEFAULT_PARQUET_READER
             parquet_batch_size = (
                 parquet_batch_size or compile_module.DEFAULT_PARQUET_BATCH_SIZE
             )
@@ -285,7 +283,6 @@ def make_snapshot_compiler_class(compile_module):
                         work_iter = compile_module.iter_work_records(
                             path,
                             batch_size=parquet_batch_size,
-                            parquet_reader=parquet_reader,
                         )
 
                     for work in work_iter:
@@ -385,16 +382,10 @@ def parse_args():
         help="Print progress every N raw snapshot rows. Use 0 to disable.",
     )
     parser.add_argument(
-        "--parquet-reader",
-        choices=("pyarrow", "pandas"),
-        default="pyarrow",
-        help="Parquet reader backend. Use pandas to load one selected-column file at a time.",
-    )
-    parser.add_argument(
         "--parquet-batch-size",
         type=int,
         default=1000,
-        help="Rows per pyarrow parquet read batch. Ignored by --parquet-reader pandas.",
+        help="Rows per pyarrow parquet read batch.",
     )
     parser.add_argument(
         "--path-pattern",
@@ -530,6 +521,37 @@ def build_filters(args):
     )
 
 
+def required_parquet_columns_for_filters(filters):
+    columns = {
+        "id",
+        "title",
+        "display_name",
+        "publication_year",
+        "publication_date",
+        "primary_topic",
+        "topics",
+        "authorships",
+        "abstract_inverted_index",
+    }
+    if filters.languages is not None:
+        columns.add("language")
+    if filters.work_types is not None:
+        columns.add("type")
+    if filters.source_ids is not None:
+        columns.add("primary_location")
+    return columns
+
+
+def validate_parquet_projection(compile_module, filters):
+    read_columns = set(compile_module.get_works_parquet_read_columns())
+    missing_columns = sorted(required_parquet_columns_for_filters(filters) - read_columns)
+    if missing_columns:
+        raise RuntimeError(
+            "Parquet reader is missing columns required by active filters: "
+            + ", ".join(missing_columns)
+        )
+
+
 def print_stats(compiler):
     compiler.print_insert_stats()
 
@@ -540,6 +562,7 @@ def main():
 
     compile_module = import_compile_module()
     compile_module.ENABLE_REFERENCES = args.enable_references
+    validate_parquet_projection(compile_module, filters)
     SnapshotSQLCompiler = make_snapshot_compiler_class(compile_module)
 
     compiler = SnapshotSQLCompiler(args.database_url, batch_size=args.batch_size)
@@ -551,7 +574,6 @@ def main():
         path_pattern=args.path_pattern,
         limit=args.limit,
         progress_interval=args.progress_interval,
-        parquet_reader=args.parquet_reader,
         parquet_batch_size=args.parquet_batch_size,
     )
     print_stats(compiler)
