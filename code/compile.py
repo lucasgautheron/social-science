@@ -39,6 +39,8 @@ Base = declarative_base()
 
 ENABLE_REFERENCES = False
 DEFAULT_PROGRESS_INTERVAL = 1000
+DEFAULT_PARQUET_BATCH_SIZE = 1000
+DEFAULT_PARQUET_READER = "pyarrow"
 
 WORKS_PARQUET_COLUMNS = [
     "id",
@@ -103,8 +105,8 @@ WORKS_PARQUET_READ_COLUMNS = [
     "primary_topic",
     "topics",
     "concepts",
-    "locations",
     "primary_location",
+    "best_oa_location",
     "abstract_inverted_index",
 ]
 
@@ -497,11 +499,37 @@ def iter_json_work_records(path):
         yield normalize_nested(record)
 
 
-def iter_parquet_work_records(path, batch_size):
+def iter_pandas_parquet_work_records(path):
+    import pandas as pd
+
+    try:
+        frame = pd.read_parquet(path, columns=get_works_parquet_read_columns())
+    except (KeyError, ValueError):
+        frame = pd.read_parquet(path)
+
+    for record in frame.to_dict(orient="records"):
+        yield normalize_nested(record)
+
+
+def iter_parquet_work_records(
+    path,
+    batch_size=DEFAULT_PARQUET_BATCH_SIZE,
+    reader=DEFAULT_PARQUET_READER,
+):
+    reader = reader.lower()
+
+    if reader == "pandas":
+        yield from iter_pandas_parquet_work_records(path)
+        return
+
+    if reader != "pyarrow":
+        raise ValueError("parquet reader must be 'pyarrow' or 'pandas'")
+
     try:
         import pyarrow.parquet as pq
     except ImportError:
-        pq = None
+        yield from iter_pandas_parquet_work_records(path)
+        return
 
     if pq is not None:
         parquet_file = pq.ParquetFile(path)
@@ -516,22 +544,8 @@ def iter_parquet_work_records(path, batch_size):
 
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
             for record in batch.to_pylist():
-                yield normalize_nested(record)
+                yield record
         return
-
-    try:
-        import pandas as pd
-    except ImportError as exc:
-        raise ImportError(
-            "Reading parquet input requires pyarrow or pandas with a parquet engine."
-        ) from exc
-
-    try:
-        frame = pd.read_parquet(path, columns=get_works_parquet_read_columns())
-    except (KeyError, ValueError):
-        frame = pd.read_parquet(path)
-    for record in frame.to_dict(orient="records"):
-        yield normalize_nested(record)
 
 
 def detect_work_file_format(filename):
@@ -542,10 +556,18 @@ def detect_work_file_format(filename):
     return None
 
 
-def iter_work_records(path, batch_size):
+def iter_work_records(
+    path,
+    batch_size=DEFAULT_PARQUET_BATCH_SIZE,
+    parquet_reader=DEFAULT_PARQUET_READER,
+):
     input_format = detect_work_file_format(path)
     if input_format == "parquet":
-        yield from iter_parquet_work_records(path, batch_size)
+        yield from iter_parquet_work_records(
+            path,
+            batch_size=batch_size,
+            reader=parquet_reader,
+        )
     elif input_format == "json_gzip":
         yield from iter_json_work_records(path)
 
@@ -935,7 +957,6 @@ class OptimizedSQLCompiler:
             self.batch_processed[key].clear()
 
     def add_article(self, data):
-        data = normalize_nested(data)
         article_id = safe_url_to_id(data.get("id"))
         if article_id is None:
             print("Skipping work with missing or invalid id")
@@ -992,12 +1013,20 @@ class OptimizedSQLCompiler:
         subfields = []
         topics = [ensure_dict(topic) for topic in ensure_list(data.get("topics"))]
 
+        for location in [
+            primary_location,
+            ensure_dict(data.get("best_oa_location")),
+        ]:
+            if location.get("is_oa") and article["url"] is None:
+                article["url"] = location.get("landing_page_url")
+                self.n_urls += 1
+
         for location in ensure_list(data.get("locations")):
             location = ensure_dict(location)
             if location.get("is_oa") and article["url"] is None:
                 article["url"] = location.get("landing_page_url")
                 self.n_urls += 1
-                continue
+                break
 
         # Process abstract
         abstract = reconstruct_abstract(data.get("abstract_inverted_index"))
@@ -1181,6 +1210,8 @@ class OptimizedSQLCompiler:
         raw_data_location,
         pattern=None,
         progress_interval=DEFAULT_PROGRESS_INTERVAL,
+        parquet_reader=DEFAULT_PARQUET_READER,
+        parquet_batch_size=DEFAULT_PARQUET_BATCH_SIZE,
     ):
         self.load_processed()
         total_raw_records = 0
@@ -1214,7 +1245,11 @@ class OptimizedSQLCompiler:
             print(f"Processing ({input_format}): {path}")
             file_raw_records = 0
             file_start_time = now()
-            for record in iter_work_records(path, self.batch_size):
+            for record in iter_work_records(
+                path,
+                batch_size=parquet_batch_size,
+                parquet_reader=parquet_reader,
+            ):
                 total_raw_records += 1
                 file_raw_records += 1
                 self.add_article(record)

@@ -225,7 +225,7 @@ def has_required_compile_fields(work):
     if any(value is None for value in required_values):
         return False
 
-    for list_field in ("locations", "topics", "authorships"):
+    for list_field in ("topics", "authorships"):
         if not isinstance(work.get(list_field), list):
             return False
 
@@ -245,8 +245,14 @@ def make_snapshot_compiler_class(compile_module):
             path_pattern=None,
             limit=None,
             progress_interval=1000,
+            parquet_reader=None,
+            parquet_batch_size=None,
         ):
             self.load_processed()
+            parquet_reader = parquet_reader or compile_module.DEFAULT_PARQUET_READER
+            parquet_batch_size = (
+                parquet_batch_size or compile_module.DEFAULT_PARQUET_BATCH_SIZE
+            )
             processed_records = 0
             raw_records = 0
             processed_files = 0
@@ -278,7 +284,8 @@ def make_snapshot_compiler_class(compile_module):
                     else:
                         work_iter = compile_module.iter_work_records(
                             path,
-                            self.batch_size,
+                            batch_size=parquet_batch_size,
+                            parquet_reader=parquet_reader,
                         )
 
                     for work in work_iter:
@@ -376,6 +383,18 @@ def parse_args():
         type=int,
         default=1000,
         help="Print progress every N raw snapshot rows. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--parquet-reader",
+        choices=("pyarrow", "pandas"),
+        default="pyarrow",
+        help="Parquet reader backend. Use pandas to load one selected-column file at a time.",
+    )
+    parser.add_argument(
+        "--parquet-batch-size",
+        type=int,
+        default=1000,
+        help="Rows per pyarrow parquet read batch. Ignored by --parquet-reader pandas.",
     )
     parser.add_argument(
         "--path-pattern",
@@ -477,6 +496,8 @@ def parse_args():
         parser.error("--limit must be at least 1")
     if args.progress_interval < 0:
         parser.error("--progress-interval must be non-negative")
+    if args.parquet_batch_size < 1:
+        parser.error("--parquet-batch-size must be at least 1")
     if args.to_year is not None and args.to_year < args.from_year:
         parser.error("--to-year must be greater than or equal to --from-year")
     if (
@@ -530,6 +551,8 @@ def main():
         path_pattern=args.path_pattern,
         limit=args.limit,
         progress_interval=args.progress_interval,
+        parquet_reader=args.parquet_reader,
+        parquet_batch_size=args.parquet_batch_size,
     )
     print_stats(compiler)
 
