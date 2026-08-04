@@ -616,6 +616,11 @@ class OptimizedSQLCompiler:
             "articles_concepts": [],
             "files": []
         }
+        self.insert_stats = {
+            key: {"inserted": 0, "attempted": 0}
+            for key in self.temp_data
+            if key != "files"
+        }
 
         # Track processed IDs within current batch to avoid duplicates
         self.batch_processed = {
@@ -676,6 +681,29 @@ class OptimizedSQLCompiler:
                 VALUES ({values})
             """
 
+    def _record_insert_stats(self, key, label, attempted, result):
+        inserted = getattr(result, "rowcount", None)
+        if inserted is None or inserted < 0:
+            inserted = attempted
+
+        self.insert_stats[key]["inserted"] += inserted
+        self.insert_stats[key]["attempted"] += attempted
+
+        if inserted == attempted:
+            print(f"Inserted {inserted} {label}")
+        else:
+            print(f"Inserted {inserted}/{attempted} {label}")
+
+    def print_insert_stats(self):
+        print("Insertion statistics for this run:")
+        for key, stats in self.insert_stats.items():
+            if stats["attempted"] == 0:
+                continue
+            print(
+                f"{key}: {stats['inserted']} inserted "
+                f"({stats['attempted']} attempted)"
+            )
+
     def flush_batch_data(self):
         """Insert accumulated data using optimized bulk operations with raw SQL."""
         if not any(self.temp_data.values()):
@@ -694,8 +722,13 @@ class OptimizedSQLCompiler:
                      'url', 'language', 'source'],
                     ['article_id']
                 )
-                session.execute(text(article_sql), self.temp_data["articles"])
-                print(f"Inserted {len(self.temp_data['articles'])} articles")
+                result = session.execute(text(article_sql), self.temp_data["articles"])
+                self._record_insert_stats(
+                    "articles",
+                    "articles",
+                    len(self.temp_data["articles"]),
+                    result,
+                )
 
             # Bulk insert abstracts
             if self.temp_data["abstracts"]:
@@ -704,8 +737,13 @@ class OptimizedSQLCompiler:
                     ['article_id', 'abstract'],
                     ['article_id']
                 )
-                session.execute(text(abstract_sql), self.temp_data["abstracts"])
-                print(f"Inserted {len(self.temp_data['abstracts'])} abstracts")
+                result = session.execute(text(abstract_sql), self.temp_data["abstracts"])
+                self._record_insert_stats(
+                    "abstracts",
+                    "abstracts",
+                    len(self.temp_data["abstracts"]),
+                    result,
+                )
 
             # Bulk insert authors
             if self.temp_data["authors"]:
@@ -714,8 +752,13 @@ class OptimizedSQLCompiler:
                     ['author_id', 'name', 'orcid', 'gender'],
                     ['author_id']
                 )
-                session.execute(text(author_sql), self.temp_data["authors"])
-                print(f"Inserted {len(self.temp_data['authors'])} authors")
+                result = session.execute(text(author_sql), self.temp_data["authors"])
+                self._record_insert_stats(
+                    "authors",
+                    "authors",
+                    len(self.temp_data["authors"]),
+                    result,
+                )
 
             # Bulk insert institutions
             if self.temp_data["institutions"]:
@@ -724,8 +767,13 @@ class OptimizedSQLCompiler:
                     ['institution_id', 'name', 'country_code', 'lineage'],
                     ['institution_id']
                 )
-                session.execute(text(institution_sql), self.temp_data["institutions"])
-                print(f"Inserted {len(self.temp_data['institutions'])} institutions")
+                result = session.execute(text(institution_sql), self.temp_data["institutions"])
+                self._record_insert_stats(
+                    "institutions",
+                    "institutions",
+                    len(self.temp_data["institutions"]),
+                    result,
+                )
 
             # Bulk insert topics
             if self.temp_data["topics"]:
@@ -734,8 +782,13 @@ class OptimizedSQLCompiler:
                     ['topic_id', 'name'],
                     ['topic_id']
                 )
-                session.execute(text(topic_sql), self.temp_data["topics"])
-                print(f"Inserted {len(self.temp_data['topics'])} topics")
+                result = session.execute(text(topic_sql), self.temp_data["topics"])
+                self._record_insert_stats(
+                    "topics",
+                    "topics",
+                    len(self.temp_data["topics"]),
+                    result,
+                )
 
             # Bulk insert concepts
             if self.temp_data["concepts"]:
@@ -744,15 +797,20 @@ class OptimizedSQLCompiler:
                     ['concept_id', 'name', 'level'],
                     ['concept_id']
                 )
-                session.execute(text(concept_sql), self.temp_data["concepts"])
-                print(f"Inserted {len(self.temp_data['concepts'])} concepts")
+                result = session.execute(text(concept_sql), self.temp_data["concepts"])
+                self._record_insert_stats(
+                    "concepts",
+                    "concepts",
+                    len(self.temp_data["concepts"]),
+                    result,
+                )
 
             # Bulk insert references
             if self.temp_data["references"] and ENABLE_REFERENCES:
                 # For SQLite, we need to handle the reserved keyword "references" differently
                 if self.database_type == 'sqlite':
                     # Use executemany with proper SQLite syntax
-                    session.execute(
+                    result = session.execute(
                         text('INSERT OR IGNORE INTO "references" ("cites", "cited") VALUES (:cites, :cited)'),
                         self.temp_data["references"]
                     )
@@ -761,15 +819,20 @@ class OptimizedSQLCompiler:
                         'references',
                         ['cites', 'cited']
                     )
-                    session.execute(text(reference_sql), self.temp_data["references"])
-                print(f"Inserted {len(self.temp_data['references'])} references")
+                    result = session.execute(text(reference_sql), self.temp_data["references"])
+                self._record_insert_stats(
+                    "references",
+                    "references",
+                    len(self.temp_data["references"]),
+                    result,
+                )
 
             session.commit()
 
             # Bulk insert relationship tables
             if self.temp_data["articles_authors"]:
                 if self.database_type == 'sqlite':
-                    session.execute(
+                    result = session.execute(
                         text(
                             'INSERT OR IGNORE INTO "articles_authors" ("article_id", "author_id", "position") VALUES (:article_id, :author_id, :position)'),
                         self.temp_data["articles_authors"]
@@ -780,12 +843,17 @@ class OptimizedSQLCompiler:
                         ['article_id', 'author_id', 'position'],
                         ['article_id', 'author_id']
                     )
-                    session.execute(text(articles_authors_sql), self.temp_data["articles_authors"])
-                print(f"Inserted {len(self.temp_data['articles_authors'])} article-author relationships")
+                    result = session.execute(text(articles_authors_sql), self.temp_data["articles_authors"])
+                self._record_insert_stats(
+                    "articles_authors",
+                    "article-author relationships",
+                    len(self.temp_data["articles_authors"]),
+                    result,
+                )
 
             if self.temp_data["articles_affiliations"]:
                 if self.database_type == 'sqlite':
-                    session.execute(
+                    result = session.execute(
                         text(
                             'INSERT OR IGNORE INTO "articles_affiliations" ("article_id", "author_id", "institution_id", "type") VALUES (:article_id, :author_id, :institution_id, :type)'),
                         self.temp_data["articles_affiliations"]
@@ -796,12 +864,17 @@ class OptimizedSQLCompiler:
                         ['article_id', 'author_id', 'institution_id', 'type'],
                         ['article_id', 'author_id', 'institution_id']
                     )
-                    session.execute(text(articles_affiliations_sql), self.temp_data["articles_affiliations"])
-                print(f"Inserted {len(self.temp_data['articles_affiliations'])} article-affiliation relationships")
+                    result = session.execute(text(articles_affiliations_sql), self.temp_data["articles_affiliations"])
+                self._record_insert_stats(
+                    "articles_affiliations",
+                    "article-affiliation relationships",
+                    len(self.temp_data["articles_affiliations"]),
+                    result,
+                )
 
             if self.temp_data["articles_topics"]:
                 if self.database_type == 'sqlite':
-                    session.execute(
+                    result = session.execute(
                         text(
                             'INSERT OR IGNORE INTO "articles_topics" ("article_id", "topic_id", "score") VALUES (:article_id, :topic_id, :score)'),
                         self.temp_data["articles_topics"]
@@ -812,12 +885,17 @@ class OptimizedSQLCompiler:
                         ['article_id', 'topic_id', 'score'],
                         ['article_id', 'topic_id']
                     )
-                    session.execute(text(articles_topics_sql), self.temp_data["articles_topics"])
-                print(f"Inserted {len(self.temp_data['articles_topics'])} article-topic relationships")
+                    result = session.execute(text(articles_topics_sql), self.temp_data["articles_topics"])
+                self._record_insert_stats(
+                    "articles_topics",
+                    "article-topic relationships",
+                    len(self.temp_data["articles_topics"]),
+                    result,
+                )
 
             if self.temp_data["articles_concepts"]:
                 if self.database_type == 'sqlite':
-                    session.execute(
+                    result = session.execute(
                         text(
                             'INSERT OR IGNORE INTO "articles_concepts" ("article_id", "concept_id", "score") VALUES (:article_id, :concept_id, :score)'),
                         self.temp_data["articles_concepts"]
@@ -828,8 +906,13 @@ class OptimizedSQLCompiler:
                         ['article_id', 'concept_id', "score"],
                         ['article_id', 'concept_id']
                     )
-                    session.execute(text(articles_concepts_sql), self.temp_data["articles_concepts"])
-                print(f"Inserted {len(self.temp_data['articles_concepts'])} article-concept relationships")
+                    result = session.execute(text(articles_concepts_sql), self.temp_data["articles_concepts"])
+                self._record_insert_stats(
+                    "articles_concepts",
+                    "article-concept relationships",
+                    len(self.temp_data["articles_concepts"]),
+                    result,
+                )
 
             session.commit()
 
@@ -1073,11 +1156,6 @@ class OptimizedSQLCompiler:
         if len(self.temp_data["articles"]) >= self.batch_size:
             self.flush_batch_data()
 
-            stats = self.get_stats()
-            print("Current database statistics:")
-            for table, count in stats.items():
-                print(f"{table}: {count}")
-
     def add_concept(self, data):
         data = ensure_dict(data)
         concept_id = safe_url_to_id(data.get("id"))
@@ -1191,23 +1269,6 @@ class OptimizedSQLCompiler:
         if self.temp_data["concepts"]:
             self.flush_batch_data()
 
-    def get_stats(self):
-        """Get database statistics."""
-        session = self.Session()
-        try:
-            stats = {
-                "articles": session.query(Article).count(),
-                "authors": session.query(Author).count(),
-                "institutions": session.query(Institution).count(),
-                "topics": session.query(Topic).count(),
-                "concepts": session.query(Concept).count(),
-                "references": session.query(Reference).count(),
-            }
-            return stats
-        finally:
-            session.close()
-
-
 # Example usage:
 if __name__ == "__main__":
     # For PostgreSQL (recommended for best performance)
@@ -1220,8 +1281,4 @@ if __name__ == "__main__":
     compiler = OptimizedSQLCompiler(database_url, batch_size=10000)
     compiler.compile_works("output")
 
-    # Print final statistics
-    stats = compiler.get_stats()
-    print("Final database statistics:")
-    for table, count in stats.items():
-        print(f"{table}: {count}")
+    compiler.print_insert_stats()
