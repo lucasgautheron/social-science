@@ -35,6 +35,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+_BLACKLIST_WORKER_STATE = {}
+
+
+def init_blacklist_worker(existing_blacklist: Set[str], observed_years: Set,
+                          ngram_year_counts: Dict, global_ngram_counts: Dict,
+                          min_years_present: int, analyzer_data: Dict):
+    """Initialize read-only blacklist state once per worker process."""
+    global _BLACKLIST_WORKER_STATE
+    _BLACKLIST_WORKER_STATE = {
+        'existing_blacklist': existing_blacklist,
+        'observed_years': observed_years,
+        'ngram_year_counts': ngram_year_counts,
+        'global_ngram_counts': global_ngram_counts,
+        'min_years_present': min_years_present,
+        'analyzer_data': analyzer_data
+    }
+
+
 def preprocess_text(text: str) -> str:
     """Clean and preprocess text"""
     if pd.isna(text):
@@ -61,7 +79,13 @@ def extract_ngrams_for_articles(args: Tuple) -> Dict:
     year_groups = defaultdict(list)
     year_article_ids = defaultdict(list)
 
-    for article_id, year, raw_text in articles_data:
+    for article_id, year, title, abstract in articles_data:
+        title = title or ""
+        abstract = abstract or ""
+        if not ((title and is_english(title)) or (abstract and is_english(abstract))):
+            continue
+
+        raw_text = title + '. ' + abstract
         processed_text = preprocess_text(raw_text)
         if processed_text.strip():
             year_groups[year].append(processed_text)
@@ -163,10 +187,14 @@ def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tup
     return chunks
 
 
-def check_ngram_for_blacklisting(args: Tuple) -> Dict:
+def check_ngram_for_blacklisting(ngrams_chunk: List[str]) -> Dict:
     """Worker function to check if n-grams should be blacklisted"""
-    (ngrams_chunk, existing_blacklist, observed_years, ngram_year_counts,
-     global_ngram_counts, min_years_present, analyzer_data) = args
+    existing_blacklist = _BLACKLIST_WORKER_STATE['existing_blacklist']
+    observed_years = _BLACKLIST_WORKER_STATE['observed_years']
+    ngram_year_counts = _BLACKLIST_WORKER_STATE['ngram_year_counts']
+    global_ngram_counts = _BLACKLIST_WORKER_STATE['global_ngram_counts']
+    min_years_present = _BLACKLIST_WORKER_STATE['min_years_present']
+    analyzer_data = _BLACKLIST_WORKER_STATE['analyzer_data']
 
     # Unpack analyzer data needed for statistical checks
     total_docs_processed = analyzer_data['total_docs_processed']
@@ -465,20 +493,23 @@ class TemporalVariationNgramAnalyzer:
             'year_total_words': dict(self.year_total_words)  # Convert defaultdict to regular dict
         }
 
-        # Prepare arguments for worker processes
-        chunk_args = [
-            (chunk, set(self.ngram_blacklist), set(self.observed_years),
-             dict(self.ngram_year_counts), dict(self.global_ngram_counts),
-             self.min_years_present, analyzer_data)
-            for chunk in ngram_chunks
-        ]
-
         logger.info(f"Checking {len(ngrams_to_check)} n-grams for blacklisting in {len(ngram_chunks)} chunks "
                     f"using {self.n_processes} processes")
 
         # Process chunks in parallel
-        with Pool(processes=self.n_processes) as pool:
-            chunk_results = pool.map(check_ngram_for_blacklisting, chunk_args)
+        with Pool(
+            processes=self.n_processes,
+            initializer=init_blacklist_worker,
+            initargs=(
+                set(self.ngram_blacklist),
+                set(self.observed_years),
+                dict(self.ngram_year_counts),
+                dict(self.global_ngram_counts),
+                self.min_years_present,
+                analyzer_data
+            )
+        ) as pool:
+            chunk_results = pool.map(check_ngram_for_blacklisting, ngram_chunks)
 
         # Aggregate results from all chunks
         new_blacklisted = set()
@@ -599,9 +630,8 @@ class TemporalVariationNgramAnalyzer:
             df.fillna("", inplace=True)
             # Prepare articles data as list of tuples
             articles_data = [
-                (row['article_id'], row['publication_year'], row['title'] + '. ' + row['abstract'])
-                for _, row in df.iterrows()
-                if ((row['title'] and is_english(row['title'])) or (row['abstract'] and is_english(row['abstract'])))
+                (row.article_id, row.publication_year, row.title, row.abstract)
+                for row in df.itertuples(index=False)
             ]
 
             # Process articles in parallel
@@ -891,5 +921,6 @@ def main():
 
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
+    start_method = 'fork' if 'fork' in mp.get_all_start_methods() else 'spawn'
+    mp.set_start_method(start_method, force=True)
     main()
