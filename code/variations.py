@@ -6,12 +6,16 @@ from sklearn.feature_extraction.text import CountVectorizer
 from collections import defaultdict, Counter
 import re
 import gc
-from typing import Dict, List, Tuple, Optional, Set
+import hashlib
+import os
+import pickle
+import zipfile
+from typing import Collection, Dict, List, Tuple, Optional, Set
 import multiprocessing as mp
 from multiprocessing import Pool, Manager, Queue
 import logging
 import time
-from scipy import stats
+from scipy import sparse, stats
 from nltk import word_tokenize
 from nltk.stem import WordNetLemmatizer
 from fast_langdetect import detect, detect_multilingual, LangDetector, LangDetectConfig, DetectError
@@ -36,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 
 _BLACKLIST_WORKER_STATE = {}
+_ARTICLE_MAPPING_WORKER_STATE = {}
+_COOCCURRENCE_WORKER_STATE = {}
+CHECKPOINT_VERSION = 1
 
 
 def init_blacklist_worker(existing_blacklist: Set[str], observed_years: Set,
@@ -50,6 +57,25 @@ def init_blacklist_worker(existing_blacklist: Set[str], observed_years: Set,
         'global_ngram_counts': global_ngram_counts,
         'min_years_present': min_years_present,
         'analyzer_data': analyzer_data
+    }
+
+
+def init_article_mapping_worker(ngram_range: Tuple[int, int], target_ngrams: Tuple[str, ...]):
+    """Initialize read-only article mapping state once per worker process."""
+    global _ARTICLE_MAPPING_WORKER_STATE
+    _ARTICLE_MAPPING_WORKER_STATE = {
+        'ngram_range': ngram_range,
+        'target_ngrams': target_ngrams
+    }
+
+
+def init_cooccurrence_worker(ngram_range: Tuple[int, int], target_ngrams: Tuple[str, ...]):
+    """Initialize fixed vocabulary state once per co-occurrence worker."""
+    global _COOCCURRENCE_WORKER_STATE
+    _COOCCURRENCE_WORKER_STATE = {
+        'ngram_range': ngram_range,
+        'target_ngrams': target_ngrams,
+        'target_vocabulary': {ngram: idx for idx, ngram in enumerate(target_ngrams)}
     }
 
 
@@ -103,7 +129,7 @@ def extract_ngrams_for_articles(args: Tuple) -> Dict:
 
         # Extract n-grams for this year
         ngram_counts, doc_presence, ngram_articles = extract_ngrams_for_year(
-            texts, article_ids, ngram_range, blacklist
+            texts, article_ids, ngram_range, blacklist, track_articles=False
         )
 
         # Count total words for this year
@@ -127,20 +153,28 @@ def extract_ngrams_for_articles(args: Tuple) -> Dict:
 
 
 def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_range: Tuple[int, int],
-                            blacklist: Set[str]) -> Tuple[Dict[str, int], Set[str], Dict[str, set]]:
+                            blacklist: Set[str], target_ngrams: Optional[Collection[str]] = None,
+                            track_articles: bool = True) -> Tuple[Dict[str, int], Set[str], Dict[str, set]]:
     """Extract n-grams from texts for a specific year, excluding blacklisted ones"""
     if not texts or all(not text.strip() for text in texts):
         return {}, set(), {}
 
+    if target_ngrams is not None and not target_ngrams:
+        return {}, set(), {}
+
     # Use CountVectorizer for n-gram extraction
-    vectorizer = CountVectorizer(
-        ngram_range=ngram_range,
-        stop_words='english',
-        min_df=1,
-        tokenizer=LemmaTokenizer(),
-        strip_accents='unicode',
-        lowercase=True
-    )
+    vectorizer_kwargs = {
+        'ngram_range': ngram_range,
+        'stop_words': 'english',
+        'min_df': 1,
+        'tokenizer': LemmaTokenizer(),
+        'strip_accents': 'unicode',
+        'lowercase': True
+    }
+    if target_ngrams is not None:
+        vectorizer_kwargs['vocabulary'] = target_ngrams
+
+    vectorizer = CountVectorizer(**vectorizer_kwargs)
 
     try:
         # Fit and transform the texts
@@ -151,7 +185,7 @@ def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_rang
         # Get counts and document presence, excluding blacklisted n-grams
         ngram_counts = {}
         ngram_doc_presence = set()
-        ngram_articles = defaultdict(set)
+        ngram_articles = defaultdict(set) if track_articles else {}
 
         for i, ngram in enumerate(feature_names):
             if ngram in blacklist:
@@ -169,14 +203,106 @@ def extract_ngrams_for_year(texts: List[str], article_ids: List[int], ngram_rang
                     ngram_doc_presence.add(ngram)
 
                     # Track which articles contain this ngram
-                    for doc_idx in doc_indices:
-                        ngram_articles[ngram].add(article_ids[doc_idx])
+                    if track_articles:
+                        for doc_idx in doc_indices:
+                            ngram_articles[ngram].add(article_ids[doc_idx])
 
         return ngram_counts, ngram_doc_presence, dict(ngram_articles)
 
     except ValueError as e:
         logger.error(f"Error extracting n-grams: {e}")
         return {}, set(), {}
+
+
+def extract_article_mapping_for_articles(articles_data: List[Tuple]) -> Dict[str, set]:
+    """Extract article mappings for the final target n-grams only."""
+    ngram_range = _ARTICLE_MAPPING_WORKER_STATE['ngram_range']
+    target_ngrams = _ARTICLE_MAPPING_WORKER_STATE['target_ngrams']
+
+    if not articles_data or not target_ngrams:
+        return {}
+
+    texts = []
+    article_ids = []
+
+    for article_id, _year, title, abstract in articles_data:
+        title = title or ""
+        abstract = abstract or ""
+        if not ((title and is_english(title)) or (abstract and is_english(abstract))):
+            continue
+
+        processed_text = preprocess_text(title + '. ' + abstract)
+        if processed_text.strip():
+            texts.append(processed_text)
+            article_ids.append(article_id)
+
+    if not texts:
+        return {}
+
+    _ngram_counts, _doc_presence, ngram_articles = extract_ngrams_for_year(
+        texts,
+        article_ids,
+        ngram_range,
+        set(),
+        target_ngrams=target_ngrams,
+        track_articles=True
+    )
+    return ngram_articles
+
+
+def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
+    """Build chunk-level sparse co-occurrence data for a fixed target vocabulary."""
+    ngram_range = _COOCCURRENCE_WORKER_STATE['ngram_range']
+    target_ngrams = _COOCCURRENCE_WORKER_STATE['target_ngrams']
+    target_vocabulary = _COOCCURRENCE_WORKER_STATE['target_vocabulary']
+    n_terms = len(target_ngrams)
+
+    if not articles_data or not target_ngrams:
+        return {
+            'cooccurrence': sparse.csr_matrix((n_terms, n_terms), dtype=np.int64),
+            'doc_frequency': np.zeros(n_terms, dtype=np.int64),
+            'processed_docs': 0
+        }
+
+    texts = []
+    for _article_id, _year, title, abstract in articles_data:
+        title = title or ""
+        abstract = abstract or ""
+        if not ((title and is_english(title)) or (abstract and is_english(abstract))):
+            continue
+
+        processed_text = preprocess_text(title + '. ' + abstract)
+        if processed_text.strip():
+            texts.append(processed_text)
+
+    if not texts:
+        return {
+            'cooccurrence': sparse.csr_matrix((n_terms, n_terms), dtype=np.int64),
+            'doc_frequency': np.zeros(n_terms, dtype=np.int64),
+            'processed_docs': 0
+        }
+
+    vectorizer = CountVectorizer(
+        ngram_range=ngram_range,
+        stop_words='english',
+        min_df=1,
+        tokenizer=LemmaTokenizer(),
+        strip_accents='unicode',
+        lowercase=True,
+        vocabulary=target_vocabulary,
+        dtype=np.int64
+    )
+    article_term = vectorizer.fit_transform(texts).tocsr()
+    article_term.data[:] = 1
+
+    doc_frequency = np.asarray(article_term.getnnz(axis=0), dtype=np.int64).ravel()
+    cooccurrence = (article_term.T @ article_term).tocsr()
+
+    return {
+        'cooccurrence': cooccurrence,
+        'doc_frequency': doc_frequency,
+        'processed_docs': len(texts)
+    }
 
 
 def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tuple]]:
@@ -325,7 +451,10 @@ class TemporalVariationNgramAnalyzer:
                  min_total_frequency: int = 10,
                  min_years_present: int = 3,
                  n_processes: Optional[int] = None,
-                 articles_per_chunk: int = 1000):
+                 articles_per_chunk: int = 1000,
+                 checkpoint_path: str = "output/variations_checkpoint.pkl",
+                 resume_from_checkpoint: bool = True,
+                 checkpoint_every_batches: int = 1):
         """
         Initialize the temporal variation N-gram analyzer with improved parallelization
 
@@ -339,6 +468,9 @@ class TemporalVariationNgramAnalyzer:
             min_years_present: Minimum number of years n-gram must appear in
             n_processes: Number of processes to use for n-gram extraction
             articles_per_chunk: Number of articles per chunk for parallel processing
+            checkpoint_path: Path used for resumable batch checkpoints
+            resume_from_checkpoint: Whether to resume from checkpoint_path if present
+            checkpoint_every_batches: Save a checkpoint every N completed batches
         """
         self.database_url = database_url
         self.batch_size = batch_size
@@ -349,6 +481,9 @@ class TemporalVariationNgramAnalyzer:
         self.min_years_present = min_years_present
         self.n_processes = n_processes or mp.cpu_count()
         self.articles_per_chunk = articles_per_chunk
+        self.checkpoint_path = checkpoint_path
+        self.resume_from_checkpoint = resume_from_checkpoint
+        self.checkpoint_every_batches = max(1, checkpoint_every_batches)
         self.engine = create_engine(database_url)
 
         # Progressive filtering state
@@ -371,6 +506,8 @@ class TemporalVariationNgramAnalyzer:
 
         # Article tracking
         self.ngram_articles = defaultdict(set)
+        self.cooccurrence_matrix = None
+        self.cooccurrence_doc_frequency = None
 
         # Cursor-based pagination state
         self.last_random_rank = None
@@ -390,6 +527,176 @@ class TemporalVariationNgramAnalyzer:
         with self.engine.connect() as conn:
             result = pd.read_sql_query(count_query, conn)
             return result['total'].iloc[0]
+
+    @staticmethod
+    def _plain_nested_dict(mapping: Dict) -> Dict:
+        """Convert nested defaultdicts to plain dictionaries for pickling."""
+        return {key: dict(value) for key, value in mapping.items()}
+
+    @staticmethod
+    def _restore_nested_defaultdict(mapping: Dict, default_factory):
+        """Restore a nested defaultdict from plain checkpoint dictionaries."""
+        return defaultdict(
+            lambda: defaultdict(default_factory),
+            {key: defaultdict(default_factory, value) for key, value in mapping.items()}
+        )
+
+    @staticmethod
+    def _fingerprint_ngrams(ngrams: Collection[str]) -> str:
+        """Create a stable fingerprint for a target n-gram vocabulary."""
+        digest = hashlib.sha256()
+        for ngram in ngrams:
+            digest.update(ngram.encode('utf-8'))
+            digest.update(b'\0')
+        return digest.hexdigest()
+
+    def _checkpoint_config(self) -> Dict:
+        """Return run settings that must match to resume a checkpoint safely."""
+        return {
+            'database_url': self.database_url,
+            'batch_size': self.batch_size,
+            'ngram_range': tuple(self.ngram_range),
+            'min_fold_change': self.min_fold_change,
+            'confidence_level': self.confidence_level,
+            'min_total_frequency': self.min_total_frequency,
+            'min_years_present': self.min_years_present
+        }
+
+    def _validate_checkpoint_config(self, checkpoint: Dict):
+        """Ensure checkpoint state belongs to this analyzer configuration."""
+        if checkpoint.get('version') != CHECKPOINT_VERSION:
+            raise ValueError(f"Unsupported checkpoint version: {checkpoint.get('version')}")
+
+        checkpoint_config = checkpoint.get('config', {})
+        current_config = self._checkpoint_config()
+        mismatches = [
+            key for key, value in current_config.items()
+            if checkpoint_config.get(key) != value
+        ]
+        if mismatches:
+            mismatch_list = ', '.join(mismatches)
+            raise ValueError(f"Checkpoint config mismatch for: {mismatch_list}")
+
+    def _main_checkpoint_state(self) -> Dict:
+        """Serialize main analysis state using only pickleable containers."""
+        return {
+            'last_random_rank': self.last_random_rank,
+            'total_docs_processed': self.total_docs_processed,
+            'total_docs': self.total_docs,
+            'estimated_total_docs': self.estimated_total_docs,
+            'observed_years': set(self.observed_years),
+            'ngram_blacklist': set(self.ngram_blacklist),
+            'year_total_words': dict(self.year_total_words),
+            'year_ngram_normalized_freq': self._plain_nested_dict(self.year_ngram_normalized_freq),
+            'ngram_year_counts': self._plain_nested_dict(self.ngram_year_counts),
+            'year_ngram_counts': self._plain_nested_dict(self.year_ngram_counts),
+            'year_doc_counts': dict(self.year_doc_counts),
+            'year_word_counts': dict(self.year_word_counts),
+            'global_ngram_counts': dict(self.global_ngram_counts)
+        }
+
+    def _restore_main_checkpoint_state(self, state: Dict):
+        """Restore main analysis state from a checkpoint."""
+        self.last_random_rank = state.get('last_random_rank')
+        self.total_docs_processed = state.get('total_docs_processed', 0)
+        self.total_docs = state.get('total_docs', 0)
+        self.estimated_total_docs = state.get('estimated_total_docs')
+        self.observed_years = set(state.get('observed_years', set()))
+        self.ngram_blacklist = set(state.get('ngram_blacklist', set()))
+        self.year_total_words = defaultdict(int, state.get('year_total_words', {}))
+        self.year_ngram_normalized_freq = self._restore_nested_defaultdict(
+            state.get('year_ngram_normalized_freq', {}),
+            float
+        )
+        self.ngram_year_counts = self._restore_nested_defaultdict(
+            state.get('ngram_year_counts', {}),
+            int
+        )
+        self.year_ngram_counts = self._restore_nested_defaultdict(
+            state.get('year_ngram_counts', {}),
+            int
+        )
+        self.year_doc_counts = defaultdict(int, state.get('year_doc_counts', {}))
+        self.year_word_counts = defaultdict(int, state.get('year_word_counts', {}))
+        self.global_ngram_counts = defaultdict(int, state.get('global_ngram_counts', {}))
+
+    def _mapping_checkpoint_state(self, mapping_last_random_rank=None,
+                                  mapping_batch_count: int = 0,
+                                  mapping_total_seen: int = 0,
+                                  target_ngram_fingerprint: Optional[str] = None) -> Dict:
+        """Serialize second-pass article mapping state."""
+        return {
+            'mapping_last_random_rank': mapping_last_random_rank,
+            'mapping_batch_count': mapping_batch_count,
+            'mapping_total_seen': mapping_total_seen,
+            'target_ngram_fingerprint': target_ngram_fingerprint,
+            'cooccurrence_matrix': self.cooccurrence_matrix,
+            'cooccurrence_doc_frequency': self.cooccurrence_doc_frequency,
+            'ngram_articles': {ngram: set(article_ids)
+                               for ngram, article_ids in self.ngram_articles.items()}
+        }
+
+    def _restore_mapping_checkpoint_state(self, state: Dict):
+        """Restore second-pass article mapping state from a checkpoint."""
+        self.ngram_articles = defaultdict(
+            set,
+            {ngram: set(article_ids)
+             for ngram, article_ids in state.get('ngram_articles', {}).items()}
+        )
+        self.cooccurrence_matrix = state.get('cooccurrence_matrix')
+        self.cooccurrence_doc_frequency = state.get('cooccurrence_doc_frequency')
+
+    def save_checkpoint(self, phase: str, mapping_last_random_rank=None,
+                        mapping_batch_count: int = 0,
+                        mapping_total_seen: int = 0,
+                        target_ngram_fingerprint: Optional[str] = None):
+        """Atomically save a resumable checkpoint."""
+        if not self.checkpoint_path:
+            return
+
+        checkpoint = {
+            'version': CHECKPOINT_VERSION,
+            'phase': phase,
+            'created_at': time.time(),
+            'config': self._checkpoint_config(),
+            'main_state': self._main_checkpoint_state(),
+            'mapping_state': self._mapping_checkpoint_state(
+                mapping_last_random_rank=mapping_last_random_rank,
+                mapping_batch_count=mapping_batch_count,
+                mapping_total_seen=mapping_total_seen,
+                target_ngram_fingerprint=target_ngram_fingerprint
+            )
+        }
+
+        checkpoint_dir = os.path.dirname(self.checkpoint_path)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+        tmp_path = f"{self.checkpoint_path}.tmp"
+        with open(tmp_path, 'wb') as checkpoint_file:
+            pickle.dump(checkpoint, checkpoint_file, protocol=pickle.HIGHEST_PROTOCOL)
+            checkpoint_file.flush()
+            os.fsync(checkpoint_file.fileno())
+
+        os.replace(tmp_path, self.checkpoint_path)
+        logger.info(f"Saved {phase} checkpoint to {self.checkpoint_path}")
+
+    def load_checkpoint(self) -> Optional[Dict]:
+        """Load and restore a checkpoint if resume is enabled and one exists."""
+        if not self.resume_from_checkpoint or not self.checkpoint_path:
+            return None
+
+        if not os.path.exists(self.checkpoint_path):
+            return None
+
+        with open(self.checkpoint_path, 'rb') as checkpoint_file:
+            checkpoint = pickle.load(checkpoint_file)
+
+        self._validate_checkpoint_config(checkpoint)
+        self._restore_main_checkpoint_state(checkpoint.get('main_state', {}))
+        self._restore_mapping_checkpoint_state(checkpoint.get('mapping_state', {}))
+        logger.info(f"Loaded {checkpoint.get('phase')} checkpoint from {self.checkpoint_path}")
+        return checkpoint
 
     def calculate_normalized_frequency(self, count: int, total_words: int, per_k_words: int = 1000) -> float:
         """Calculate normalized frequency per K words"""
@@ -572,6 +879,292 @@ class TemporalVariationNgramAnalyzer:
 
         return chunk_results
 
+    def process_article_mapping_parallel(self, articles_data: List[Tuple],
+                                         target_ngrams: Tuple[str, ...]) -> List[Dict[str, set]]:
+        """Build article mappings for a batch using the final n-gram vocabulary."""
+        if not articles_data or not target_ngrams:
+            return []
+
+        chunks = chunk_articles(articles_data, self.articles_per_chunk)
+
+        logger.info(f"Mapping articles for {len(target_ngrams)} n-grams across "
+                    f"{len(articles_data)} articles in {len(chunks)} chunks")
+
+        with Pool(
+            processes=self.n_processes,
+            initializer=init_article_mapping_worker,
+            initargs=(self.ngram_range, target_ngrams)
+        ) as pool:
+            chunk_results = pool.map(extract_article_mapping_for_articles, chunks)
+
+        return chunk_results
+
+    def process_cooccurrence_parallel(self, articles_data: List[Tuple],
+                                      target_ngrams: Tuple[str, ...]) -> List[Dict]:
+        """Build chunk-level sparse co-occurrence matrices for a fixed vocabulary."""
+        if not articles_data or not target_ngrams:
+            return []
+
+        chunks = chunk_articles(articles_data, self.articles_per_chunk)
+
+        logger.info(f"Building co-occurrence for {len(target_ngrams)} n-grams across "
+                    f"{len(articles_data)} articles in {len(chunks)} chunks")
+
+        with Pool(
+            processes=self.n_processes,
+            initializer=init_cooccurrence_worker,
+            initargs=(self.ngram_range, target_ngrams)
+        ) as pool:
+            chunk_results = pool.map(extract_cooccurrence_for_articles, chunks)
+
+        return chunk_results
+
+    def build_cooccurrence_for_ngrams(self, target_ngrams: Set[str],
+                                      resume_state: Optional[Dict] = None) -> int:
+        """Build a sparse n-gram co-occurrence matrix in a second pass."""
+        if not target_ngrams:
+            logger.info("No target n-grams available for co-occurrence")
+            return 0
+
+        target_vocabulary = tuple(sorted(target_ngrams))
+        target_fingerprint = self._fingerprint_ngrams(target_vocabulary)
+        n_terms = len(target_vocabulary)
+
+        if resume_state:
+            checkpoint_fingerprint = resume_state.get('target_ngram_fingerprint')
+            if checkpoint_fingerprint and checkpoint_fingerprint != target_fingerprint:
+                raise ValueError("Checkpoint target n-gram fingerprint does not match current co-occurrence vocabulary")
+
+            last_random_rank = resume_state.get('mapping_last_random_rank')
+            total_seen = resume_state.get('mapping_total_seen', 0)
+            batch_count = resume_state.get('mapping_batch_count', 0)
+            logger.info(f"Resuming co-occurrence pass from rank {last_random_rank}")
+        else:
+            self.cooccurrence_matrix = None
+            self.cooccurrence_doc_frequency = np.zeros(n_terms, dtype=np.int64)
+            last_random_rank = None
+            total_seen = 0
+            batch_count = 0
+
+        if self.cooccurrence_doc_frequency is None:
+            self.cooccurrence_doc_frequency = np.zeros(n_terms, dtype=np.int64)
+
+        total_records = self.estimated_total_docs or self.get_total_records()
+
+        logger.info(f"Building sparse co-occurrence matrix for {n_terms} final n-grams")
+
+        while True:
+            if last_random_rank is None:
+                query = """
+                        SELECT a.article_id,
+                               a.publication_year,
+                               a.title,
+                               ab.abstract,
+                               ao.random_rank
+                        FROM articles a
+                                 JOIN abstracts ab ON a.article_id = ab.article_id
+                                 JOIN articles_order ao ON a.article_id = ao.article_id
+                        ORDER BY ao.random_rank LIMIT :batch_size
+                        """
+                params = {'batch_size': self.batch_size}
+            else:
+                query = """
+                        SELECT a.article_id,
+                               a.publication_year,
+                               a.title,
+                               ab.abstract,
+                               ao.random_rank
+                        FROM articles a
+                                 JOIN abstracts ab ON a.article_id = ab.article_id
+                                 JOIN articles_order ao ON a.article_id = ao.article_id
+                        WHERE ao.random_rank > :last_rank
+                        ORDER BY ao.random_rank LIMIT :batch_size
+                        """
+                params = {'last_rank': int(last_random_rank), 'batch_size': self.batch_size}
+
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query), params)
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+
+            if df.empty:
+                break
+
+            last_random_rank = df['random_rank'].iloc[-1]
+            df.fillna("", inplace=True)
+
+            articles_data = [
+                (row.article_id, row.publication_year, row.title, row.abstract)
+                for row in df.itertuples(index=False)
+            ]
+
+            chunk_results = self.process_cooccurrence_parallel(articles_data, target_vocabulary)
+            processed_docs = 0
+            for chunk_result in chunk_results:
+                chunk_cooccurrence = chunk_result['cooccurrence']
+                if chunk_cooccurrence.nnz > 0:
+                    if self.cooccurrence_matrix is None:
+                        self.cooccurrence_matrix = chunk_cooccurrence.copy()
+                    else:
+                        self.cooccurrence_matrix = (self.cooccurrence_matrix + chunk_cooccurrence).tocsr()
+
+                self.cooccurrence_doc_frequency += chunk_result['doc_frequency']
+                processed_docs += chunk_result['processed_docs']
+
+            total_seen += len(df)
+            batch_count += 1
+            nnz = self.cooccurrence_matrix.nnz if self.cooccurrence_matrix is not None else 0
+            logger.info(f"Co-occurrence batch {batch_count}: {total_seen:,}/{total_records:,} records scanned, "
+                        f"{processed_docs:,} English docs, {nnz:,} nonzero pairs")
+
+            if batch_count % self.checkpoint_every_batches == 0:
+                self.save_checkpoint(
+                    'cooccurrence',
+                    mapping_last_random_rank=last_random_rank,
+                    mapping_batch_count=batch_count,
+                    mapping_total_seen=total_seen,
+                    target_ngram_fingerprint=target_fingerprint
+                )
+
+            del df, articles_data, chunk_results
+            gc.collect()
+
+        if self.cooccurrence_matrix is None:
+            self.cooccurrence_matrix = sparse.csr_matrix((n_terms, n_terms), dtype=np.int64)
+
+        self.save_checkpoint(
+            'cooccurrence',
+            mapping_last_random_rank=last_random_rank,
+            mapping_batch_count=batch_count,
+            mapping_total_seen=total_seen,
+            target_ngram_fingerprint=target_fingerprint
+        )
+        logger.info(f"Built co-occurrence matrix with {self.cooccurrence_matrix.nnz:,} nonzero pairs")
+        return self.cooccurrence_matrix.nnz
+
+    def export_cooccurrence_matrix(self, target_ngrams: Collection[str],
+                                   filename_prefix: str = "ngram_cooccurrence") -> int:
+        """Export sparse co-occurrence matrix and vocabulary sidecars."""
+        target_vocabulary = np.array(tuple(sorted(target_ngrams)), dtype=object)
+        if self.cooccurrence_matrix is None:
+            self.cooccurrence_matrix = sparse.csr_matrix(
+                (len(target_vocabulary), len(target_vocabulary)),
+                dtype=np.int64
+            )
+        if self.cooccurrence_doc_frequency is None:
+            self.cooccurrence_doc_frequency = np.zeros(len(target_vocabulary), dtype=np.int64)
+
+        sparse.save_npz(f"output/{filename_prefix}.npz", self.cooccurrence_matrix.tocsr(), compressed=True)
+        np.save(f"output/{filename_prefix}_vocabulary.npy", target_vocabulary)
+        np.save(f"output/{filename_prefix}_doc_frequency.npy", self.cooccurrence_doc_frequency)
+
+        logger.info(f"Exported co-occurrence matrix with {self.cooccurrence_matrix.nnz:,} nonzero pairs")
+        return self.cooccurrence_matrix.nnz
+
+    def build_article_mapping_for_ngrams(self, target_ngrams: Set[str],
+                                         resume_state: Optional[Dict] = None) -> int:
+        """Build n-gram to article mapping in a second pass for final n-grams only."""
+        if not target_ngrams:
+            logger.info("No target n-grams available for article mapping")
+            return 0
+
+        target_vocabulary = tuple(sorted(target_ngrams))
+        target_fingerprint = self._fingerprint_ngrams(target_vocabulary)
+
+        if resume_state:
+            checkpoint_fingerprint = resume_state.get('target_ngram_fingerprint')
+            if checkpoint_fingerprint and checkpoint_fingerprint != target_fingerprint:
+                raise ValueError("Checkpoint target n-gram fingerprint does not match current final vocabulary")
+
+            last_random_rank = resume_state.get('mapping_last_random_rank')
+            total_seen = resume_state.get('mapping_total_seen', 0)
+            batch_count = resume_state.get('mapping_batch_count', 0)
+            logger.info(f"Resuming article mapping from rank {last_random_rank}")
+        else:
+            self.ngram_articles = defaultdict(set)
+            last_random_rank = None
+            total_seen = 0
+            batch_count = 0
+
+        total_records = self.estimated_total_docs or self.get_total_records()
+
+        logger.info(f"Building article mapping for {len(target_vocabulary)} final n-grams")
+
+        while True:
+            if last_random_rank is None:
+                query = """
+                        SELECT a.article_id,
+                               a.publication_year,
+                               a.title,
+                               ab.abstract,
+                               ao.random_rank
+                        FROM articles a
+                                 JOIN abstracts ab ON a.article_id = ab.article_id
+                                 JOIN articles_order ao ON a.article_id = ao.article_id
+                        ORDER BY ao.random_rank LIMIT :batch_size
+                        """
+                params = {'batch_size': self.batch_size}
+            else:
+                query = """
+                        SELECT a.article_id,
+                               a.publication_year,
+                               a.title,
+                               ab.abstract,
+                               ao.random_rank
+                        FROM articles a
+                                 JOIN abstracts ab ON a.article_id = ab.article_id
+                                 JOIN articles_order ao ON a.article_id = ao.article_id
+                        WHERE ao.random_rank > :last_rank
+                        ORDER BY ao.random_rank LIMIT :batch_size
+                        """
+                params = {'last_rank': int(last_random_rank), 'batch_size': self.batch_size}
+
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query), params)
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+
+            if df.empty:
+                break
+
+            last_random_rank = df['random_rank'].iloc[-1]
+            df.fillna("", inplace=True)
+
+            articles_data = [
+                (row.article_id, row.publication_year, row.title, row.abstract)
+                for row in df.itertuples(index=False)
+            ]
+
+            chunk_results = self.process_article_mapping_parallel(articles_data, target_vocabulary)
+            for chunk_mapping in chunk_results:
+                for ngram, article_set in chunk_mapping.items():
+                    self.ngram_articles[ngram].update(article_set)
+
+            total_seen += len(df)
+            batch_count += 1
+            logger.info(f"Article mapping batch {batch_count}: {total_seen:,}/{total_records:,} records scanned, "
+                        f"{len(self.ngram_articles):,} n-grams mapped")
+
+            if batch_count % self.checkpoint_every_batches == 0:
+                self.save_checkpoint(
+                    'mapping',
+                    mapping_last_random_rank=last_random_rank,
+                    mapping_batch_count=batch_count,
+                    mapping_total_seen=total_seen,
+                    target_ngram_fingerprint=target_fingerprint
+                )
+
+            del df, articles_data, chunk_results
+            gc.collect()
+
+        self.save_checkpoint(
+            'mapping',
+            mapping_last_random_rank=last_random_rank,
+            mapping_batch_count=batch_count,
+            mapping_total_seen=total_seen,
+            target_ngram_fingerprint=target_fingerprint
+        )
+        logger.info(f"Built article mapping for {len(self.ngram_articles)} n-grams")
+        return len(self.ngram_articles)
+
     def process_batch(self, batch_size: int) -> bool:
         """Process a single batch using cursor-based pagination"""
         if self.last_random_rank is None:
@@ -710,6 +1303,9 @@ class TemporalVariationNgramAnalyzer:
             batch_count += 1
             total_processed_docs = self.total_docs  # Use actual count from batches
 
+            if batch_count % self.checkpoint_every_batches == 0:
+                self.save_checkpoint('counting')
+
             # Progress reporting
             if batch_count % 1 == 0:  # Report every batch for debugging, change back to 10 later
                 elapsed = batch_end - start_time
@@ -727,6 +1323,7 @@ class TemporalVariationNgramAnalyzer:
 
         # Final blacklist update
         self.update_blacklist()
+        self.save_checkpoint('counting')
 
         end_time = time.time()
         logger.info(f"Processing completed in {end_time - start_time:.2f} seconds")
@@ -853,34 +1450,64 @@ class TemporalVariationNgramAnalyzer:
         """Export n-gram to article mapping for non-blacklisted n-grams"""
         logger.info("Exporting n-gram to article mapping...")
 
-        # Convert to numpy arrays with ngrams as keys
-        arrays_dict = {}
-        for ngram, article_set in self.ngram_articles.items():
-            if ngram not in self.ngram_blacklist:
-                arrays_dict[ngram] = np.array(list(article_set))
+        exported_count = 0
+        with zipfile.ZipFile(f"output/{filename}", mode="w",
+                             compression=zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as archive:
+            for ngram, article_set in self.ngram_articles.items():
+                if ngram in self.ngram_blacklist or ngram == 'file':
+                    continue
 
-        if 'file' in arrays_dict:
-            del arrays_dict['file']
+                article_ids = np.array(list(article_set))
+                with archive.open(f"{ngram}.npy", mode="w", force_zip64=True) as npy_file:
+                    np.lib.format.write_array(npy_file, article_ids, allow_pickle=False)
+                exported_count += 1
 
-        # Save as NPZ with ngrams as keys
-        np.savez_compressed(f"output/{filename}", **arrays_dict)
-
-        logger.info(f"Exported article mapping for {len(arrays_dict)} n-grams to {filename}")
-        return len(arrays_dict)
+        logger.info(f"Exported article mapping for {exported_count} n-grams to {filename}")
+        return exported_count
 
     def run_analysis(self, export_results: bool = True) -> Dict:
         """Run the complete temporal variation analysis"""
         logger.info(f"Starting temporal variation analysis (min {self.min_fold_change}x fold change)...")
 
-        # Process with cursor-based pagination
-        self.process_all_batches()
+        checkpoint = self.load_checkpoint()
+        checkpoint_phase = checkpoint.get('phase') if checkpoint else None
+        mapping_state = checkpoint.get('mapping_state', {}) if checkpoint else {}
+
+        if checkpoint_phase == 'complete':
+            logger.info("Checkpoint indicates analysis is already complete")
+            return self.calculate_final_statistics()
+
+        if checkpoint_phase == 'cooccurrence':
+            logger.info("Skipping temporal counting because checkpoint is already in co-occurrence phase")
+        else:
+            # Process with cursor-based pagination
+            self.process_all_batches()
 
         # Calculate final statistics
         results = self.calculate_final_statistics()
 
         if export_results:
             self.export_temporal_results(results)
-            self.export_article_mapping()
+            target_ngrams = {
+                ngram for ngram, data in results.items()
+                if data['statistically_significant']
+            }
+            logger.info(f"Selected {len(target_ngrams)} statistically significant n-grams for co-occurrence")
+            target_fingerprint = self._fingerprint_ngrams(tuple(sorted(target_ngrams)))
+            if checkpoint_phase != 'cooccurrence':
+                self.save_checkpoint(
+                    'cooccurrence',
+                    target_ngram_fingerprint=target_fingerprint
+                )
+                mapping_state = None
+
+            self.build_cooccurrence_for_ngrams(target_ngrams, resume_state=mapping_state)
+            self.export_cooccurrence_matrix(target_ngrams)
+            self.save_checkpoint(
+                'complete',
+                target_ngram_fingerprint=target_fingerprint
+            )
 
         return results
 
