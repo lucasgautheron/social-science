@@ -1522,7 +1522,7 @@ def main():
         confidence_level=0.95,
         min_total_frequency=20,
         min_years_present=1,
-        n_processes=6,
+        n_processes=32,
         articles_per_chunk=2000
     )
 
