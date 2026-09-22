@@ -18,7 +18,7 @@ import time
 from scipy import sparse, stats
 from nltk import word_tokenize
 from nltk.stem import WordNetLemmatizer
-from fast_langdetect import detect, detect_multilingual, LangDetector, LangDetectConfig, DetectError
+from fast_langdetect import detect
 
 
 def is_english(s: str):
