@@ -520,13 +520,71 @@ class TemporalVariationNgramAnalyzer:
         """Get total number of records to process"""
         count_query = """
                       SELECT COUNT(*) as total
-                      FROM articles a
-                               JOIN abstracts ab ON a.article_id = ab.article_id
+                      FROM articles_order ao
+                      WHERE EXISTS (
+                          SELECT 1
+                          FROM abstracts ab
+                          WHERE ab.article_id = ao.article_id
+                      )
                       """
 
         with self.engine.connect() as conn:
             result = pd.read_sql_query(count_query, conn)
             return result['total'].iloc[0]
+
+    def fetch_ordered_article_batch(self, last_random_rank: Optional[int], batch_size: int) -> pd.DataFrame:
+        """Fetch the next ordered article batch by limiting articles_order before joins."""
+        if last_random_rank is None:
+            query = """
+                    SELECT ordered.article_id,
+                           a.publication_year,
+                           a.title,
+                           ab.abstract,
+                           ordered.random_rank
+                    FROM (
+                             SELECT ao.article_id, ao.random_rank
+                             FROM articles_order ao
+                             WHERE EXISTS (
+                                 SELECT 1
+                                 FROM abstracts ab
+                                 WHERE ab.article_id = ao.article_id
+                             )
+                             ORDER BY ao.random_rank
+                             LIMIT :batch_size
+                         ) ordered
+                             JOIN articles a ON ordered.article_id = a.article_id
+                             JOIN abstracts ab ON ordered.article_id = ab.article_id
+                    ORDER BY ordered.random_rank
+                    """
+            params = {'batch_size': batch_size}
+        else:
+            query = """
+                    SELECT ordered.article_id,
+                           a.publication_year,
+                           a.title,
+                           ab.abstract,
+                           ordered.random_rank
+                    FROM (
+                             SELECT ao.article_id, ao.random_rank
+                             FROM articles_order ao
+                             WHERE ao.random_rank > :last_rank
+                               AND EXISTS (
+                                   SELECT 1
+                                   FROM abstracts ab
+                                   WHERE ab.article_id = ao.article_id
+                               )
+                             ORDER BY ao.random_rank
+                             LIMIT :batch_size
+                         ) ordered
+                             JOIN articles a ON ordered.article_id = a.article_id
+                             JOIN abstracts ab ON ordered.article_id = ab.article_id
+                    ORDER BY ordered.random_rank
+                    """
+            params = {'last_rank': int(last_random_rank), 'batch_size': batch_size}
+
+        with self.engine.connect() as conn:
+            result = conn.execute(text(query), params)
+            return pd.DataFrame(result.fetchall(), columns=result.keys())
 
     @staticmethod
     def _plain_nested_dict(mapping: Dict) -> Dict:
@@ -954,37 +1012,7 @@ class TemporalVariationNgramAnalyzer:
         logger.info(f"Building sparse co-occurrence matrix for {n_terms} final n-grams")
 
         while True:
-            if last_random_rank is None:
-                query = """
-                        SELECT a.article_id,
-                               a.publication_year,
-                               a.title,
-                               ab.abstract,
-                               ao.random_rank
-                        FROM articles a
-                                 JOIN abstracts ab ON a.article_id = ab.article_id
-                                 JOIN articles_order ao ON a.article_id = ao.article_id
-                        ORDER BY ao.random_rank LIMIT :batch_size
-                        """
-                params = {'batch_size': self.batch_size}
-            else:
-                query = """
-                        SELECT a.article_id,
-                               a.publication_year,
-                               a.title,
-                               ab.abstract,
-                               ao.random_rank
-                        FROM articles a
-                                 JOIN abstracts ab ON a.article_id = ab.article_id
-                                 JOIN articles_order ao ON a.article_id = ao.article_id
-                        WHERE ao.random_rank > :last_rank
-                        ORDER BY ao.random_rank LIMIT :batch_size
-                        """
-                params = {'last_rank': int(last_random_rank), 'batch_size': self.batch_size}
-
-            with self.engine.connect() as conn:
-                result = conn.execute(text(query), params)
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            df = self.fetch_ordered_article_batch(last_random_rank, self.batch_size)
 
             if df.empty:
                 break
@@ -1090,37 +1118,7 @@ class TemporalVariationNgramAnalyzer:
         logger.info(f"Building article mapping for {len(target_vocabulary)} final n-grams")
 
         while True:
-            if last_random_rank is None:
-                query = """
-                        SELECT a.article_id,
-                               a.publication_year,
-                               a.title,
-                               ab.abstract,
-                               ao.random_rank
-                        FROM articles a
-                                 JOIN abstracts ab ON a.article_id = ab.article_id
-                                 JOIN articles_order ao ON a.article_id = ao.article_id
-                        ORDER BY ao.random_rank LIMIT :batch_size
-                        """
-                params = {'batch_size': self.batch_size}
-            else:
-                query = """
-                        SELECT a.article_id,
-                               a.publication_year,
-                               a.title,
-                               ab.abstract,
-                               ao.random_rank
-                        FROM articles a
-                                 JOIN abstracts ab ON a.article_id = ab.article_id
-                                 JOIN articles_order ao ON a.article_id = ao.article_id
-                        WHERE ao.random_rank > :last_rank
-                        ORDER BY ao.random_rank LIMIT :batch_size
-                        """
-                params = {'last_rank': int(last_random_rank), 'batch_size': self.batch_size}
-
-            with self.engine.connect() as conn:
-                result = conn.execute(text(query), params)
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            df = self.fetch_ordered_article_batch(last_random_rank, self.batch_size)
 
             if df.empty:
                 break
@@ -1167,41 +1165,10 @@ class TemporalVariationNgramAnalyzer:
 
     def process_batch(self, batch_size: int) -> bool:
         """Process a single batch using cursor-based pagination"""
-        if self.last_random_rank is None:
-            query = """
-                    SELECT a.article_id,
-                           a.publication_year,
-                           a.title,
-                           ab.abstract,
-                           ao.random_rank
-                    FROM articles a
-                             JOIN abstracts ab ON a.article_id = ab.article_id
-                             JOIN articles_order ao ON a.article_id = ao.article_id
-                    ORDER BY ao.random_rank LIMIT :batch_size
-                    """
-            params = {'batch_size': batch_size}
-        else:
-            query = """
-                    SELECT a.article_id,
-                           a.publication_year,
-                           a.title,
-                           ab.abstract,
-                           ao.random_rank
-                    FROM articles a
-                             JOIN abstracts ab ON a.article_id = ab.article_id
-                             JOIN articles_order ao ON a.article_id = ao.article_id
-                    WHERE ao.random_rank > :last_rank
-                    ORDER BY ao.random_rank LIMIT :batch_size
-                    """
-
-            params = {'last_rank': int(self.last_random_rank), 'batch_size': batch_size}
-
         try:
             logger.info(f"Querying abstracts with cursor at rank {self.last_random_rank}")
 
-            with self.engine.connect() as conn:
-                result = conn.execute(text(query), params)
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            df = self.fetch_ordered_article_batch(self.last_random_rank, batch_size)
 
             # Add this in the process_batch method when df.empty is True:
             if df.empty:
@@ -1278,9 +1245,9 @@ class TemporalVariationNgramAnalyzer:
 
             return True
 
-        except Exception as e:
-            logger.error(f"Error processing batch with cursor at rank {self.last_random_rank}: {e}")
-            return False
+        except Exception:
+            logger.exception(f"Error processing batch with cursor at rank {self.last_random_rank}")
+            raise
 
     def process_all_batches(self):
         """Process all batches using cursor-based pagination"""
