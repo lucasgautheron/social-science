@@ -520,12 +520,7 @@ class TemporalVariationNgramAnalyzer:
         """Get total number of records to process"""
         count_query = """
                       SELECT COUNT(*) as total
-                      FROM articles_order ao
-                      WHERE EXISTS (
-                          SELECT 1
-                          FROM abstracts ab
-                          WHERE ab.article_id = ao.article_id
-                      )
+                      FROM articles_order
                       """
 
         with self.engine.connect() as conn:
@@ -544,11 +539,6 @@ class TemporalVariationNgramAnalyzer:
                     FROM (
                              SELECT ao.article_id, ao.random_rank
                              FROM articles_order ao
-                             WHERE EXISTS (
-                                 SELECT 1
-                                 FROM abstracts ab
-                                 WHERE ab.article_id = ao.article_id
-                             )
                              ORDER BY ao.random_rank
                              LIMIT :batch_size
                          ) ordered
@@ -568,11 +558,6 @@ class TemporalVariationNgramAnalyzer:
                              SELECT ao.article_id, ao.random_rank
                              FROM articles_order ao
                              WHERE ao.random_rank > :last_rank
-                               AND EXISTS (
-                                   SELECT 1
-                                   FROM abstracts ab
-                                   WHERE ab.article_id = ao.article_id
-                               )
                              ORDER BY ao.random_rank
                              LIMIT :batch_size
                          ) ordered

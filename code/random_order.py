@@ -21,8 +21,12 @@ def create_articles_random_order(db_path: str, seed: int = 42,
         # Drop existing table if it exists
         cursor.execute("DROP TABLE IF EXISTS articles_order")
 
-        # Get all article IDs
-        cursor.execute("SELECT article_id FROM articles")
+        # Get only article IDs that can be processed by variations.py.
+        cursor.execute("""
+                       SELECT a.article_id
+                       FROM articles a
+                                JOIN abstracts ab ON a.article_id = ab.article_id
+                       """)
         article_ids = []
         while True:
             rows = cursor.fetchmany(fetch_batch_size)
