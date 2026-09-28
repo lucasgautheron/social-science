@@ -166,6 +166,10 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("remote_version", script)
         self.assertIn('chmod a-w "$target"', script)
         self.assertIn('cd "$RUN_DIR"', script)
+        self.assertIn("python3.11", script)
+        self.assertIn("sys.version_info < (3, 11)", script)
+        self.assertIn('rm -rf "$VENV_DIR"', script)
+        self.assertIn('"$PYTHON_BIN" -m venv "$VENV_DIR"', script)
         self.assertIn("hashlib.sha256()", script)
         self.assertNotIn("shasum", script)
         self.assertIn(

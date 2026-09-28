@@ -631,6 +631,19 @@ sync_output() {{
   fi
 }}
 
+PYTHON_BIN=""
+select_python_runtime() {{
+  local candidate
+  for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}}
+
 NOTIFICATION_SENT=0
 notify_terminal_status() {{
   local terminal_status="$1"
@@ -666,25 +679,43 @@ EOF
 }}
 
 install_system_tools() {{
-  if command -v aws >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    return
+  if ! command -v aws >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+    if command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y awscli git sqlite >/tmp/aws-runner-package-install.log 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y awscli git sqlite >/tmp/aws-runner-package-install.log 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update >/tmp/aws-runner-package-install.log 2>&1 || true
+      sudo apt-get install -y awscli git sqlite3 >>/tmp/aws-runner-package-install.log 2>&1 || true
+    fi
   fi
-  if command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y awscli git python3 python3-pip sqlite >/tmp/aws-runner-package-install.log 2>&1 || true
-  elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y awscli git python3 python3-pip sqlite >/tmp/aws-runner-package-install.log 2>&1 || true
-  elif command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update >/tmp/aws-runner-package-install.log 2>&1 || true
-    sudo apt-get install -y awscli git python3 python3-pip sqlite3 >>/tmp/aws-runner-package-install.log 2>&1 || true
+
+  if ! select_python_runtime; then
+    if command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y python3.11 python3.11-pip >>/tmp/aws-runner-package-install.log 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y python3.11 python3.11-pip >>/tmp/aws-runner-package-install.log 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update >>/tmp/aws-runner-package-install.log 2>&1 || true
+      sudo apt-get install -y python3.11 python3.11-venv >>/tmp/aws-runner-package-install.log 2>&1 || true
+    fi
+    if ! select_python_runtime; then
+      echo "Python 3.11 or newer is required but could not be installed." >>"$LAUNCHER_LOG"
+      return 1
+    fi
   fi
+
   if ! command -v aws >/dev/null 2>&1; then
-    python3 -m pip install --user awscli >>/tmp/aws-runner-package-install.log 2>&1
+    "$PYTHON_BIN" -m pip install --user awscli >>/tmp/aws-runner-package-install.log 2>&1
   fi
+  "$PYTHON_BIN" --version >>"$LAUNCHER_LOG" 2>&1
 }}
 
 install_python_deps() {{
-  if [ ! -x "$VENV_DIR/bin/python" ]; then
-    python3 -m venv "$VENV_DIR"
+  if [ ! -x "$VENV_DIR/bin/python" ] \
+    || ! "$VENV_DIR/bin/python" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    rm -rf "$VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
   fi
   export PATH="$VENV_DIR/bin:$PATH"
   if [ "$INSTALL_DEPS" != "1" ]; then
