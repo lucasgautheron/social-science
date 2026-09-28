@@ -281,6 +281,7 @@ SCRATCH_DIR={q(args.scratch_dir)}
 STATUS_INTERVAL_SECONDS={q(args.status_interval_seconds)}
 PIPELINE_COMMAND={q(command)}
 INSTALL_DEPS={q("1" if not args.skip_dependency_install else "0")}
+FORCE_DB_DOWNLOAD={q("1" if args.force_db_download else "0")}
 INSTANCE_ID="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
 export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND
 
@@ -407,8 +408,28 @@ sync_repo() {{
 }}
 
 download_db() {{
-  aws s3 cp "$DB_S3_URI" "${{SCRATCH_DIR}}/articles.db" >>"$LAUNCHER_LOG" 2>&1
-  ln -sf "${{SCRATCH_DIR}}/articles.db" "${{REPO_DIR}}/articles.db"
+  local target="${{SCRATCH_DIR}}/articles.db"
+  local tmp_target="${{target}}.download"
+  local db_without_scheme="${{DB_S3_URI#s3://}}"
+  local db_bucket="${{db_without_scheme%%/*}}"
+  local db_key="${{db_without_scheme#*/}}"
+  local remote_size=""
+  local local_size=""
+
+  remote_size="$(aws s3api head-object --bucket "$db_bucket" --key "$db_key" --query ContentLength --output text 2>>"$LAUNCHER_LOG" || true)"
+  if [ -s "$target" ]; then
+    local_size="$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target" 2>/dev/null || echo "")"
+  fi
+
+  if [ "$FORCE_DB_DOWNLOAD" != "1" ] && [ -n "$remote_size" ] && [ "$local_size" = "$remote_size" ]; then
+    echo "Reusing existing SQLite database at $target ($local_size bytes)" >>"$LAUNCHER_LOG"
+  else
+    echo "Downloading SQLite database from $DB_S3_URI to $target" >>"$LAUNCHER_LOG"
+    rm -f "$tmp_target"
+    aws s3 cp --no-progress "$DB_S3_URI" "$tmp_target" >>"$LAUNCHER_LOG" 2>&1
+    mv "$tmp_target" "$target"
+  fi
+  ln -sf "$target" "${{REPO_DIR}}/articles.db"
 }}
 
 CHILD_PID=""
@@ -426,23 +447,28 @@ trap on_term INT TERM
 
 (
   write_status "running" "Installing system tools"
+  sync_artifacts
   install_system_tools
   sync_artifacts
 
   write_status "running" "Syncing repository"
+  sync_artifacts
   sync_repo
   sync_artifacts
 
   write_status "running" "Installing Python dependencies"
+  sync_artifacts
   install_python_deps
   sync_artifacts
 
   write_status "running" "Downloading SQLite database"
+  sync_artifacts
   download_db
   sync_artifacts
 
   cd "$REPO_DIR"
   write_status "running" "Executing: $PIPELINE_COMMAND"
+  sync_artifacts
   bash -lc "$PIPELINE_COMMAND" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
   CHILD_PID=$!
   echo "$CHILD_PID" > "$PID_FILE"
@@ -721,6 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--commit", default=None, help="Specific commit SHA to checkout instead of the branch head.")
     submit.add_argument("--repo-url", default=None, help="Override repo URL from state.")
     submit.add_argument("--db-s3-uri", default=None, help="Override SQLite database S3 URI from state.")
+    submit.add_argument("--force-db-download", action="store_true", help="Redownload the SQLite DB even if a complete local copy exists.")
     submit.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="Remote local scratch directory.")
     submit.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor.")
     submit.add_argument("--ssh-user", default="ec2-user", help="SSH user for --executor ssh.")
