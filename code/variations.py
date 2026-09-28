@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+import argparse
+import sys
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="Run temporal n-gram variation analysis over the SQLite article database."
+    )
+    parser.add_argument("--db-path", default="articles.db", help="SQLite database path used when --database-url is not set.")
+    parser.add_argument("--database-url", default=None, help="SQLAlchemy database URL. Overrides --db-path.")
+    parser.add_argument("--batch-size", type=int, default=100000, help="Database records to fetch per batch.")
+    parser.add_argument("--min-ngram", type=int, default=1, help="Minimum n-gram size.")
+    parser.add_argument("--max-ngram", type=int, default=1, help="Maximum n-gram size.")
+    parser.add_argument("--min-fold-change", type=float, default=3.0, help="Minimum fold change required.")
+    parser.add_argument("--confidence-level", type=float, default=0.95, help="Confidence level for statistical tests.")
+    parser.add_argument("--min-total-frequency", type=int, default=20, help="Minimum total frequency across all years.")
+    parser.add_argument("--min-years-present", type=int, default=1, help="Minimum number of years an n-gram must appear in.")
+    parser.add_argument("--n-processes", type=int, default=16, help="Worker processes to use.")
+    parser.add_argument("--articles-per-chunk", type=int, default=2000, help="Articles per worker chunk.")
+    parser.add_argument("--checkpoint-path", default="output/variations_checkpoint.pkl", help="Path for resumable checkpoints.")
+    parser.add_argument("--no-resume-from-checkpoint", action="store_true", help="Ignore any existing checkpoint.")
+    parser.add_argument("--checkpoint-every-batches", type=int, default=1, help="Save a checkpoint every N completed batches.")
+    return parser
+
+
+def parse_args():
+    return build_arg_parser().parse_args()
+
+
+if __name__ == "__main__" and any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    build_arg_parser().print_help()
+    sys.exit(0)
+
 from sqlalchemy import create_engine, text
 import pandas as pd
 import numpy as np
@@ -1466,19 +1499,23 @@ class TemporalVariationNgramAnalyzer:
 
         return results
 
-
-# Usage example
 def main():
+    args = parse_args()
+    database_url = args.database_url or f"sqlite:///{args.db_path}"
+
     analyzer = TemporalVariationNgramAnalyzer(
-        database_url="sqlite:///articles.db",
-        batch_size=100000,
-        ngram_range=(1, 1),
-        min_fold_change=3.0,
-        confidence_level=0.95,
-        min_total_frequency=20,
-        min_years_present=1,
-        n_processes=16,
-        articles_per_chunk=2000
+        database_url=database_url,
+        batch_size=args.batch_size,
+        ngram_range=(args.min_ngram, args.max_ngram),
+        min_fold_change=args.min_fold_change,
+        confidence_level=args.confidence_level,
+        min_total_frequency=args.min_total_frequency,
+        min_years_present=args.min_years_present,
+        n_processes=args.n_processes,
+        articles_per_chunk=args.articles_per_chunk,
+        checkpoint_path=args.checkpoint_path,
+        resume_from_checkpoint=not args.no_resume_from_checkpoint,
+        checkpoint_every_batches=args.checkpoint_every_batches
     )
 
     start_time = time.time()
