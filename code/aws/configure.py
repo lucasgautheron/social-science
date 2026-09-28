@@ -19,6 +19,7 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_BUCKET = "lucas-epistemic-bubbles"
 DEFAULT_REPO_URL = "git@github.com:lucasgautheron/social-science.git"
 DEFAULT_INSTANCE_TYPE = "i4i.8xlarge"
+DEFAULT_IAM_INSTANCE_PROFILE = "social-science-ec2-runner-profile"
 DEFAULT_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 DEFAULT_ROOT_VOLUME_GB = 200
 STATE_S3_KEY = "state/aws_runner_state.json"
@@ -261,6 +262,7 @@ def command_setup(args: argparse.Namespace) -> int:
         "bucket": args.bucket,
         "prefix": prefix,
         "instance_type": args.instance_type,
+        "iam_instance_profile": args.iam_instance_profile,
         "ami_id": args.ami_id or f"SSM:{DEFAULT_AMI_PARAMETER}",
         "root_volume_gb": args.root_volume_gb,
         "db_s3_uri": None if args.skip_db_upload else s3_uri(args.bucket, db_key),
@@ -409,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--repo-url", default=None, help="GitHub repository URL that the EC2 worker should clone.")
     setup.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE, help="EC2 instance type.")
     setup.add_argument("--ami-id", default=None, help="AMI ID. Defaults to latest Amazon Linux 2023 via SSM.")
-    setup.add_argument("--iam-instance-profile", default=None, help="IAM instance profile name/ARN with SSM and S3 access.")
+    setup.add_argument("--iam-instance-profile", default=DEFAULT_IAM_INSTANCE_PROFILE, help="IAM instance profile name/ARN with SSM and S3 access.")
     setup.add_argument("--key-name", default=None, help="Optional EC2 key pair name.")
     setup.add_argument("--security-group-id", default=None, help="Optional security group ID.")
     setup.add_argument("--subnet-id", default=None, help="Optional subnet ID.")

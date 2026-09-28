@@ -257,6 +257,7 @@ def build_remote_runner_script(
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 
+export HOME="${{HOME:-/root}}"
 export PATH="$HOME/.local/bin:$PATH"
 RUN_ID={q(run_id)}
 PIPELINE={q(args.pipeline)}
