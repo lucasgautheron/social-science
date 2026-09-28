@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Most frequent event keywords in the OpenAlex corpus">
+    <title>Top keywords · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app list-app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Top keywords</h1>
+          <nav aria-label="Site">
+            <a href="index.html" aria-current="page">Top keywords</a>
+            <a href="dendrogram.html">Dendrogram</a>
+          </nav>
+        </div>
+        <p class="intro">Keywords ranked by the number of processed papers in which they occur.</p>
+      </header>
+      <section class="card keyword-card">
+        <div class="summary" id="summary">Loading keyword frequencies…</div>
+        <ol id="keywords" class="keyword-list"></ol>
+      </section>
+    </main>
+    <script src="app.js" defer></script>
+  </body>
+</html>

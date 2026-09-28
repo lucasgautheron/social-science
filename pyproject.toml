@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openalex"
+version = "0.1.0"
+description = "OpenAlex corpus processing, event extraction, and static website tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+analysis = [
+  "fast-langdetect>=0.2",
+  "networkx>=3.3",
+  "nltk>=3.9",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "scipy>=1.13",
+  "sqlalchemy>=2.0",
+]
+download = ["pyalex>=0.18"]
+embeddings = [
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "sentence-transformers>=3.3",
+  "sqlalchemy>=2.0",
+  "torch>=2.3",
+  "tqdm>=4.66",
+]
+parquet = ["pandas>=2.2", "pyarrow>=17"]
+aws = ["boto3>=1.35"]
+website = ["numpy>=1.26", "scipy>=1.13"]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+
+[project.scripts]
+openalex = "openalex.cli:main"
+openalex-aws = "openalex.aws.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openalex"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/openalex/website/site" = "openalex/website/site"
+"data/alternatives.csv" = "openalex/data/alternatives.csv"
+"data/vocabulary.csv" = "openalex/data/vocabulary.csv"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["B007", "B905", "E501", "E722"]

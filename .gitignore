@@ -1,3 +1,24 @@
+# Project artifacts
+.DS_Store
+.idea/
+.tmp*/
+.aws_runner_state.json
+.aws_runner_last_run.json
+downloads/
+output/
+processed
+articles.db
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+/*.csv
+/*.png
+/*.npz
+/*.npy
+/*.pickle
+/*.gpickle
+/*.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

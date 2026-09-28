@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Complete-linkage hierarchy of OpenAlex event keywords">
+    <title>Dendrogram · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Keyword dendrogram</h1>
+          <nav aria-label="Site">
+            <a href="index.html">Top keywords</a>
+            <a href="dendrogram.html" aria-current="page">Dendrogram</a>
+          </nav>
+        </div>
+        <div class="toolbar-actions">
+          <p class="intro" id="summary">Loading hierarchy…</p>
+          <button id="reset" type="button" disabled>Reset view</button>
+        </div>
+      </header>
+      <section class="workspace card">
+        <div class="tree-panel">
+          <svg id="tree" aria-label="Keyword dendrogram"></svg>
+          <div id="tooltip" class="tooltip" hidden></div>
+          <p class="hint">Scroll to zoom · drag to pan · click a node to pin</p>
+        </div>
+        <aside id="details" class="details" aria-live="polite">
+          <div class="empty">
+            <p class="eyebrow">Keyword cluster</p>
+            <h2>Select a node</h2>
+            <p>Its yearly paper frequency and descendant keywords will appear here.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+    <script src="dendrogram.js" defer></script>
+  </body>
+</html>
