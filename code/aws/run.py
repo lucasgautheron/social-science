@@ -234,6 +234,15 @@ def pipeline_command(args: argparse.Namespace) -> str:
         command = "python3 code/random_order.py"
     elif args.pipeline == "export-parquet":
         command = "python3 code/export_parquet.py --db-path articles.db --output-dir output/article_text_ordered_parquet --resume"
+    elif args.pipeline == "compile-from-snapshot":
+        if not args.snapshot_s3_uri:
+            raise SystemExit("--snapshot-s3-uri is required when --pipeline compile-from-snapshot is used.")
+        snapshot_dir = args.snapshot_local_dir or f"{args.scratch_dir.rstrip('/')}/openalex-snapshot"
+        compile_db_path = args.compile_db_path or f"{args.scratch_dir.rstrip('/')}/compiled_articles.db"
+        command = (
+            f"python3 code/compile_from_snapshot.py {q(snapshot_dir)} "
+            f"--database-url {q('sqlite:///' + compile_db_path)}"
+        )
     else:
         raise SystemExit(f"Unsupported pipeline: {args.pipeline}")
 
@@ -256,13 +265,16 @@ def build_remote_runner_script(
     bucket = state["bucket"]
     prefix = state["prefix"]
     run_s3_prefix = run_prefix(state, run_id)
+    needs_input_db = args.pipeline != "compile-from-snapshot"
     db_s3_uri = args.db_s3_uri or state.get("db_s3_uri")
     repo_url = args.repo_url or state.get("repo_url")
-    if not db_s3_uri:
+    if needs_input_db and not db_s3_uri:
         raise SystemExit("No database S3 URI configured. Run setup with --db-path or pass --db-s3-uri.")
     if not repo_url:
         raise SystemExit("No repo URL configured. Run setup with --repo-url or pass --repo-url.")
     repo_url = normalize_repo_url(repo_url)
+    snapshot_local_dir = args.snapshot_local_dir or f"{args.scratch_dir.rstrip('/')}/openalex-snapshot"
+    compile_db_path = args.compile_db_path or f"{args.scratch_dir.rstrip('/')}/compiled_articles.db"
 
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
@@ -277,6 +289,10 @@ REPO_URL={q(repo_url)}
 BRANCH={q(args.branch)}
 COMMIT={q(args.commit or "")}
 DB_S3_URI={q(db_s3_uri)}
+NEEDS_INPUT_DB={q("1" if needs_input_db else "0")}
+SNAPSHOT_S3_URI={q(args.snapshot_s3_uri or "")}
+SNAPSHOT_LOCAL_DIR={q(snapshot_local_dir)}
+COMPILE_DB_PATH={q(compile_db_path)}
 SCRATCH_DIR={q(args.scratch_dir)}
 STATUS_INTERVAL_SECONDS={q(args.status_interval_seconds)}
 PIPELINE_COMMAND={q(command)}
@@ -356,6 +372,9 @@ sync_output() {{
   if [ -d "${{REPO_DIR}}/output" ]; then
     aws s3 sync "${{REPO_DIR}}/output" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/" >/dev/null 2>&1 || true
   fi
+  if [ "$PIPELINE" = "compile-from-snapshot" ] && [ -f "$COMPILE_DB_PATH" ]; then
+    aws s3 cp --no-progress "$COMPILE_DB_PATH" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/compiled_articles.db" >/dev/null 2>&1 || true
+  fi
 }}
 
 install_system_tools() {{
@@ -405,6 +424,14 @@ sync_repo() {{
     git checkout "$BRANCH" >>"$LAUNCHER_LOG" 2>&1 || git checkout -B "$BRANCH" "origin/$BRANCH" >>"$LAUNCHER_LOG" 2>&1
     git pull --ff-only origin "$BRANCH" >>"$LAUNCHER_LOG" 2>&1
   fi
+}}
+
+sync_snapshot() {{
+  if [ -z "$SNAPSHOT_S3_URI" ]; then
+    return
+  fi
+  mkdir -p "$SNAPSHOT_LOCAL_DIR"
+  aws s3 sync --no-progress "$SNAPSHOT_S3_URI" "$SNAPSHOT_LOCAL_DIR" >>"$LAUNCHER_LOG" 2>&1
 }}
 
 download_db() {{
@@ -461,10 +488,19 @@ trap on_term INT TERM
   install_python_deps
   sync_artifacts
 
-  write_status "running" "Downloading SQLite database"
-  sync_artifacts
-  download_db
-  sync_artifacts
+  if [ -n "$SNAPSHOT_S3_URI" ]; then
+    write_status "running" "Syncing snapshot data"
+    sync_artifacts
+    sync_snapshot
+    sync_artifacts
+  fi
+
+  if [ "$NEEDS_INPUT_DB" = "1" ]; then
+    write_status "running" "Downloading SQLite database"
+    sync_artifacts
+    download_db
+    sync_artifacts
+  fi
 
   cd "$REPO_DIR"
   write_status "running" "Executing: $PIPELINE_COMMAND"
@@ -739,7 +775,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = subparsers.add_parser("submit", help="Submit a remote pipeline run and return immediately.")
     add_common_args(submit)
-    submit.add_argument("--pipeline", choices=["variations", "random-order", "export-parquet", "custom"], default="variations")
+    submit.add_argument(
+        "--pipeline",
+        choices=["variations", "random-order", "export-parquet", "compile-from-snapshot", "custom"],
+        default="variations",
+    )
     submit.add_argument("--command", default=None, help="Command for --pipeline custom.")
     submit.add_argument("--extra-args", default="", help="Extra shell arguments appended to the selected pipeline command.")
     submit.add_argument("--run-id", default=None, help="Explicit run id. Defaults to a timestamped id.")
@@ -748,6 +788,9 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--repo-url", default=None, help="Override repo URL from state.")
     submit.add_argument("--db-s3-uri", default=None, help="Override SQLite database S3 URI from state.")
     submit.add_argument("--force-db-download", action="store_true", help="Redownload the SQLite DB even if a complete local copy exists.")
+    submit.add_argument("--snapshot-s3-uri", default=None, help="S3 URI for an OpenAlex snapshot, used by compile-from-snapshot.")
+    submit.add_argument("--snapshot-local-dir", default=None, help="Remote snapshot directory. Defaults under --scratch-dir.")
+    submit.add_argument("--compile-db-path", default=None, help="Remote SQLite output path for compile-from-snapshot.")
     submit.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="Remote local scratch directory.")
     submit.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor.")
     submit.add_argument("--ssh-user", default="ec2-user", help="SSH user for --executor ssh.")
