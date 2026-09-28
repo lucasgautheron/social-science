@@ -76,8 +76,6 @@ def warm_language_detector():
     """Load fast-langdetect once before forking worker processes."""
     detect("This is an English sentence.")
 
-    _LANGDETECT_MODEL_READY = True
-
 
 _BLACKLIST_WORKER_STATE = {}
 _ARTICLE_MAPPING_WORKER_STATE = {}
