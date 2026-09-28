@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -257,6 +258,105 @@ def delete_s3_prefix(s3, bucket: str, prefix: str) -> None:
             s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
 
+def notification_topic_name(state: Dict[str, Any]) -> str:
+    """Return an SNS-compatible topic name for this project."""
+    project = str(state.get("project") or "openalex")
+    normalized = re.sub(r"[^A-Za-z0-9_-]+", "-", project).strip("-")
+    return f"{normalized or 'openalex'}-run-notifications"[:256]
+
+
+def find_email_subscription(sns, topic_arn: str, email: str) -> Optional[Dict[str, Any]]:
+    """Find an existing SNS email subscription, including pending subscriptions."""
+    next_token: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"TopicArn": topic_arn}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = sns.list_subscriptions_by_topic(**kwargs)
+        for subscription in response.get("Subscriptions", []):
+            if (
+                subscription.get("Protocol") == "email"
+                and subscription.get("Endpoint", "").casefold() == email.casefold()
+            ):
+                return subscription
+        next_token = response.get("NextToken")
+        if not next_token:
+            return None
+
+
+def grant_notification_publish(iam, instance_profile: str, topic_arn: str) -> str:
+    """Allow the worker role attached through an instance profile to publish."""
+    profile_name = instance_profile.rsplit("/", 1)[-1]
+    response = iam.get_instance_profile(InstanceProfileName=profile_name)
+    roles = response.get("InstanceProfile", {}).get("Roles", [])
+    if not roles:
+        raise SystemExit(f"Instance profile {profile_name!r} has no IAM role.")
+    role_name = roles[0]["RoleName"]
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "PublishOpenAlexRunNotifications",
+                "Effect": "Allow",
+                "Action": "sns:Publish",
+                "Resource": topic_arn,
+            }
+        ],
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName="OpenAlexRunNotifications",
+        PolicyDocument=json.dumps(policy),
+    )
+    return role_name
+
+
+def command_notifications(args: argparse.Namespace) -> int:
+    state_path = Path(args.state_path)
+    state = load_local_state(state_path)
+    args.region = args.region or state["region"]
+    session = boto3_session(args)
+    sns = session.client("sns")
+    iam = session.client("iam")
+    s3 = session.client("s3")
+
+    topic_arn = sns.create_topic(Name=notification_topic_name(state))["TopicArn"]
+    subscription = find_email_subscription(sns, topic_arn, args.email)
+    if subscription is None:
+        response = sns.subscribe(
+            TopicArn=topic_arn,
+            Protocol="email",
+            Endpoint=args.email,
+            ReturnSubscriptionArn=True,
+        )
+        subscription_arn = response.get("SubscriptionArn", "PendingConfirmation")
+        print(f"Created SNS email subscription: {subscription_arn}")
+    else:
+        subscription_arn = subscription.get("SubscriptionArn", "PendingConfirmation")
+        print(f"Reusing SNS email subscription: {subscription_arn}")
+
+    instance_profile = state.get("iam_instance_profile")
+    if not instance_profile:
+        raise SystemExit("No IAM instance profile is configured for the worker.")
+    role_name = grant_notification_publish(iam, str(instance_profile), topic_arn)
+
+    state.update(
+        {
+            "notification_email": args.email,
+            "notification_topic_arn": topic_arn,
+            "updated_at": utc_now(),
+        }
+    )
+    write_json(state_path, state)
+    upload_state(s3, state["bucket"], state["prefix"], state)
+    print(f"Worker role {role_name!r} can publish run notifications.")
+    if subscription_arn == "PendingConfirmation":
+        print(f"Confirm the subscription using the email AWS sent to {args.email}.")
+    else:
+        print(f"Run notifications are enabled for {args.email}.")
+    return 0
+
+
 def command_setup(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
     prefix = normalize_prefix(args.prefix)
@@ -438,6 +538,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(pause)
     pause.add_argument("--wait", action="store_true", help="Wait until the instance reaches stopped state.")
     pause.set_defaults(func=command_pause)
+
+    notifications = subparsers.add_parser(
+        "notifications",
+        help="Email run completion and failure notifications through AWS SNS.",
+    )
+    add_common_args(notifications)
+    notifications.add_argument("--email", required=True, help="Email address to notify.")
+    notifications.set_defaults(func=command_notifications)
 
     destroy = subparsers.add_parser("destroy", help="Terminate EC2 resources and optionally delete S3 artifacts.")
     add_common_args(destroy)

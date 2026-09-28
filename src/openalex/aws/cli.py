@@ -8,7 +8,7 @@ from collections.abc import Sequence
 
 from . import configure, runner
 
-LIFECYCLE_COMMANDS = {"setup", "start", "pause", "destroy"}
+LIFECYCLE_COMMANDS = {"setup", "start", "pause", "notifications", "destroy"}
 RUN_COMMANDS = {"submit", "status", "logs", "artifacts", "download", "cancel"}
 
 

@@ -515,6 +515,8 @@ def build_remote_runner_script(
 ) -> str:
     bucket = state["bucket"]
     run_s3_prefix = run_prefix(state, run_id)
+    region = args.region or state.get("region") or ""
+    notification_topic_arn = state.get("notification_topic_arn") or ""
     needs_input_db = not args.no_database
     db_s3_uri = args.db_s3_uri or state.get("db_s3_uri")
     repo_url = args.repo_url or state.get("repo_url")
@@ -537,6 +539,8 @@ RUN_ID={q(run_id)}
 PIPELINE={q(command_name)}
 BUCKET={q(bucket)}
 RUN_S3_PREFIX={q(run_s3_prefix)}
+AWS_REGION={q(region)}
+NOTIFICATION_TOPIC_ARN={q(notification_topic_arn)}
 REPO_URL={q(repo_url)}
 BRANCH={q(args.branch)}
 COMMIT={q(args.commit or "")}
@@ -627,6 +631,40 @@ sync_output() {{
   fi
 }}
 
+NOTIFICATION_SENT=0
+notify_terminal_status() {{
+  local terminal_status="$1"
+  local message_text="$2"
+  local exit_code="$3"
+  if [ -z "$NOTIFICATION_TOPIC_ARN" ] || [ "$NOTIFICATION_SENT" = "1" ]; then
+    return
+  fi
+  NOTIFICATION_SENT=1
+  local subject="OpenAlex run $terminal_status: $RUN_ID"
+  local body
+  body="$(cat <<EOF
+OpenAlex run: $RUN_ID
+Status: $terminal_status
+Message: $message_text
+Exit code: $exit_code
+Command: $PIPELINE_COMMAND
+
+Status: s3://$BUCKET/$RUN_S3_PREFIX/status.json
+Stdout: s3://$BUCKET/$RUN_S3_PREFIX/stdout.log
+Stderr: s3://$BUCKET/$RUN_S3_PREFIX/stderr.log
+Launcher: s3://$BUCKET/$RUN_S3_PREFIX/launcher.log
+Output: s3://$BUCKET/$RUN_S3_PREFIX/output/
+EOF
+)"
+  if ! aws sns publish \
+    --region "$AWS_REGION" \
+    --topic-arn "$NOTIFICATION_TOPIC_ARN" \
+    --subject "$subject" \
+    --message "$body" >>"$LAUNCHER_LOG" 2>&1; then
+    printf 'Failed to publish run notification to %s\\n' "$NOTIFICATION_TOPIC_ARN" >>"$LAUNCHER_LOG"
+  fi
+}}
+
 install_system_tools() {{
   if command -v aws >/dev/null 2>&1 && command -v git >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     return
@@ -653,7 +691,24 @@ install_python_deps() {{
     return
   fi
   local fingerprint
-  fingerprint="$(cd "$REPO_DIR" && {{ git rev-parse HEAD; shasum -a 256 pyproject.toml; }} | shasum -a 256 | awk '{{print $1}}')"
+  fingerprint="$(python3 - "$REPO_DIR" <<'PY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+repo = pathlib.Path(sys.argv[1])
+revision = subprocess.check_output(
+    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+    text=True,
+).strip()
+digest = hashlib.sha256()
+digest.update(revision.encode())
+digest.update(b"\\0")
+digest.update((repo / "pyproject.toml").read_bytes())
+print(digest.hexdigest())
+PY
+)"
   if [ -f "$VENV_DIR/.openalex-install" ] && [ "$(cat "$VENV_DIR/.openalex-install")" = "$fingerprint" ]; then
     echo "Reusing installed OpenAlex package at revision $fingerprint" >>"$LAUNCHER_LOG"
     return
@@ -750,6 +805,7 @@ PY
 }}
 
 CHILD_PID=""
+CURRENT_STEP="initializing runner"
 on_term() {{
   if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
     kill "$CHILD_PID" 2>/dev/null || true
@@ -762,23 +818,41 @@ on_term() {{
 }}
 trap on_term INT TERM
 
+on_error() {{
+  local exit_code="$?"
+  trap - ERR
+  local failure_message="Runner failed during $CURRENT_STEP with exit code $exit_code"
+  write_status "failed" "$failure_message" "$exit_code"
+  sync_output
+  sync_artifacts
+  notify_terminal_status "failed" "$failure_message" "$exit_code"
+  sync_artifacts
+  exit "$exit_code"
+}}
+
 (
+  set +E
+  trap on_error ERR
+  CURRENT_STEP="installing system tools"
   write_status "running" "Installing system tools"
   sync_artifacts
   install_system_tools
   sync_artifacts
 
+  CURRENT_STEP="syncing repository"
   write_status "running" "Syncing repository"
   sync_artifacts
   sync_repo
   sync_artifacts
 
+  CURRENT_STEP="installing Python dependencies"
   write_status "running" "Installing Python dependencies"
   sync_artifacts
   install_python_deps
   sync_artifacts
 
   if [ -n "$SNAPSHOT_S3_URI" ]; then
+    CURRENT_STEP="syncing snapshot data"
     write_status "running" "Syncing snapshot data"
     sync_artifacts
     sync_snapshot
@@ -786,6 +860,7 @@ trap on_term INT TERM
   fi
 
   if [ "$NEEDS_INPUT_DB" = "1" ]; then
+    CURRENT_STEP="downloading SQLite database"
     write_status "running" "Downloading SQLite database"
     sync_artifacts
     download_db
@@ -794,6 +869,7 @@ trap on_term INT TERM
 
   export PATH="$VENV_DIR/bin:$PATH"
   cd "$RUN_DIR"
+  CURRENT_STEP="executing pipeline command"
   write_status "running" "Executing: $PIPELINE_COMMAND"
   sync_artifacts
   bash -lc "$PIPELINE_COMMAND" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
@@ -817,12 +893,18 @@ trap on_term INT TERM
   set -e
   sync_output
   if [ "$exit_code" -eq 0 ]; then
-    write_status "success" "Pipeline completed successfully" "$exit_code"
+    terminal_status="success"
+    terminal_message="Pipeline completed successfully"
   else
-    write_status "failed" "Pipeline failed with exit code $exit_code" "$exit_code"
+    terminal_status="failed"
+    terminal_message="Pipeline failed with exit code $exit_code"
   fi
+  write_status "$terminal_status" "$terminal_message" "$exit_code"
   sync_artifacts
   sync_output
+  notify_terminal_status "$terminal_status" "$terminal_message" "$exit_code"
+  sync_artifacts
+  trap - ERR
   exit "$exit_code"
 ) >>"$LAUNCHER_LOG" 2>&1
 """

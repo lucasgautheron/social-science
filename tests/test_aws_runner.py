@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from openalex.aws import configure as aws_configure
 from openalex.aws import runner as aws_run
 
 
@@ -46,6 +48,22 @@ class FakeSSM:
 
     def get_command_invocation(self, **_kwargs):
         return next(self.statuses)
+
+
+class FakeIAM:
+    def __init__(self):
+        self.policy = None
+
+    def get_instance_profile(self, InstanceProfileName):
+        return {
+            "InstanceProfile": {
+                "InstanceProfileName": InstanceProfileName,
+                "Roles": [{"RoleName": "worker-role"}],
+            }
+        }
+
+    def put_role_policy(self, **kwargs):
+        self.policy = kwargs
 
 
 class ArtifactTests(unittest.TestCase):
@@ -134,6 +152,8 @@ class ArtifactTests(unittest.TestCase):
             **self.state,
             "repo_url": "https://example.test/repo.git",
             "db_s3_uri": "s3://bucket/input/articles.db",
+            "region": "us-east-1",
+            "notification_topic_arn": "arn:aws:sns:us-east-1:123:openalex-runs",
         }
         script = aws_run.build_remote_runner_script(
             state=state,
@@ -146,6 +166,35 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("remote_version", script)
         self.assertIn('chmod a-w "$target"', script)
         self.assertIn('cd "$RUN_DIR"', script)
+        self.assertIn("hashlib.sha256()", script)
+        self.assertNotIn("shasum", script)
+        self.assertIn(
+            "NOTIFICATION_TOPIC_ARN=arn:aws:sns:us-east-1:123:openalex-runs",
+            script,
+        )
+        self.assertIn("aws sns publish", script)
+        self.assertIn('notify_terminal_status "$terminal_status"', script)
+        self.assertIn('trap on_error ERR', script)
+
+    def test_notification_topic_name_is_sns_compatible(self):
+        name = aws_configure.notification_topic_name({"project": "OpenAlex / social science"})
+
+        self.assertEqual(name, "OpenAlex-social-science-run-notifications")
+
+    def test_grant_notification_publish_targets_worker_role_and_topic(self):
+        iam = FakeIAM()
+        topic_arn = "arn:aws:sns:us-east-1:123:openalex-runs"
+
+        role_name = aws_configure.grant_notification_publish(
+            iam,
+            "arn:aws:iam::123:instance-profile/openalex-worker",
+            topic_arn,
+        )
+
+        self.assertEqual(role_name, "worker-role")
+        self.assertEqual(iam.policy["RoleName"], "worker-role")
+        policy = json.loads(iam.policy["PolicyDocument"])
+        self.assertEqual(policy["Statement"][0]["Resource"], topic_arn)
 
     def test_wait_for_ssm_command_returns_success(self):
         ssm = FakeSSM(

@@ -107,6 +107,17 @@ cache, and recent launcher/stdout/stderr lines:
 openalex-aws status --live --lines 30
 ```
 
+Enable email notifications for successful and failed runs once:
+
+```bash
+openalex-aws notifications --email lucas.gautheron@gmail.com
+```
+
+AWS sends a subscription confirmation email that must be accepted before
+notifications are delivered. Messages include the run ID, command, exit code,
+and S3 links for status, logs, and output. Bootstrap failures are also reported
+and no longer leave the durable status incorrectly marked as running.
+
 To upgrade a completed pre-refactor run without repeating its temporal
 counting pass, keep the original instance running and point the new command at
 its legacy checkpoint:
