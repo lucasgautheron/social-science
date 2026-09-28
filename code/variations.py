@@ -72,6 +72,12 @@ class LemmaTokenizer(object):
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def warm_language_detector():
+    """Load fast-langdetect once before forking worker processes."""
+    detect("This is an English sentence.")
+
+    _LANGDETECT_MODEL_READY = True
+
 
 _BLACKLIST_WORKER_STATE = {}
 _ARTICLE_MAPPING_WORKER_STATE = {}
@@ -954,6 +960,7 @@ class TemporalVariationNgramAnalyzer:
                     f"using {self.n_processes} processes")
 
         # Use fixed number of processes regardless of data size
+        warm_language_detector()
         with Pool(processes=self.n_processes) as pool:
             chunk_results = pool.map(extract_ngrams_for_articles, chunk_args)
 
@@ -970,6 +977,7 @@ class TemporalVariationNgramAnalyzer:
         logger.info(f"Mapping articles for {len(target_ngrams)} n-grams across "
                     f"{len(articles_data)} articles in {len(chunks)} chunks")
 
+        warm_language_detector()
         with Pool(
             processes=self.n_processes,
             initializer=init_article_mapping_worker,
@@ -990,6 +998,7 @@ class TemporalVariationNgramAnalyzer:
         logger.info(f"Building co-occurrence for {len(target_ngrams)} n-grams across "
                     f"{len(articles_data)} articles in {len(chunks)} chunks")
 
+        warm_language_detector()
         with Pool(
             processes=self.n_processes,
             initializer=init_cooccurrence_worker,
