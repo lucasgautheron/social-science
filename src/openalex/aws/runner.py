@@ -22,6 +22,7 @@ DEFAULT_STATUS_INTERVAL_SECONDS = 4 * 60 * 60
 DEFAULT_SSM_READY_TIMEOUT_SECONDS = 600
 DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS = 600
 DEFAULT_LIVE_STATUS_TIMEOUT_SECONDS = 60
+DEFAULT_LIVE_LOG_BYTES = 5_000
 DEFAULT_DOWNLOAD_ROOT = "downloads"
 CHECKPOINT_FILENAME = "events_checkpoint.pkl"
 
@@ -357,6 +358,7 @@ RUN_DIR={q(run_dir)}
 PID_FILE={q(pid_file)}
 DATABASE_PATH={q(database_path)}
 LINES={lines}
+MAX_LOG_BYTES={DEFAULT_LIVE_LOG_BYTES}
 
 printf 'checked_at: %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'host: %s\\n' "$(hostname)"
@@ -390,9 +392,9 @@ show_log() {{
   if [ ! -f "$path" ]; then
     printf 'not available: %s\\n' "$path"
   elif [ "$LINES" -eq 0 ]; then
-    cat "$path"
+    tail -c "$MAX_LOG_BYTES" "$path" | tr '\\r' '\\n'
   else
-    tail -n "$LINES" "$path"
+    tail -c "$MAX_LOG_BYTES" "$path" | tr '\\r' '\\n' | tail -n "$LINES"
   fi
 }}
 
@@ -941,11 +943,85 @@ on_error() {{
 """
 
 
+def build_instance_store_setup_script(scratch_dir: str) -> str:
+    """Build a launcher prelude that mounts EC2 instance-store NVMe at scratch."""
+    scratch_dir = scratch_dir.rstrip("/")
+    if not scratch_dir or scratch_dir == "/":
+        raise ValueError("Scratch directory must not be the filesystem root")
+
+    return f"""SCRATCH_DIR={q(scratch_dir)}
+if ! mountpoint -q "$SCRATCH_DIR" 2>/dev/null; then
+  shopt -s nullglob
+  for pid_file in "$SCRATCH_DIR"/runs/*/pid; do
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+      && [ -r "/proc/$pid/cmdline" ] \
+      && tr '\\0' ' ' <"/proc/$pid/cmdline" | grep -Fq "$SCRATCH_DIR"; then
+      echo "Refusing to mount instance storage while pipeline pid $pid is active." >&2
+      exit 1
+    fi
+  done
+  shopt -u nullglob
+
+  devices=()
+  for model_file in /sys/block/nvme*n1/device/model; do
+    [ -f "$model_file" ] || continue
+    if grep -qi "Instance Storage" "$model_file"; then
+      device_name="$(basename "$(dirname "$(dirname "$model_file")")")"
+      devices+=("/dev/$device_name")
+    fi
+  done
+  if [ "${{#devices[@]}}" -eq 0 ]; then
+    echo "No EC2 NVMe instance-store devices were found; refusing to use root EBS for scratch." >&2
+    exit 1
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y mdadm xfsprogs >/tmp/openalex-storage-install.log 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y mdadm xfsprogs >/tmp/openalex-storage-install.log 2>&1
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update >/tmp/openalex-storage-install.log 2>&1
+    sudo apt-get install -y mdadm xfsprogs >>/tmp/openalex-storage-install.log 2>&1
+  fi
+
+  if [ "${{#devices[@]}}" -eq 1 ]; then
+    storage_device="${{devices[0]}}"
+  else
+    storage_device="/dev/md/openalex"
+    if [ ! -e "$storage_device" ]; then
+      sudo mkdir -p /dev/md
+      sudo mdadm --create "$storage_device" \
+        --name=openalex \
+        --level=0 \
+        --raid-devices="${{#devices[@]}}" \
+        --force \
+        --run \
+        "${{devices[@]}}"
+    fi
+  fi
+
+  if ! sudo blkid "$storage_device" >/dev/null 2>&1; then
+    sudo mkfs.xfs -f "$storage_device"
+  fi
+
+  sudo rm -rf "$SCRATCH_DIR"
+  sudo mkdir -p "$SCRATCH_DIR"
+  sudo mount -o noatime,nodiratime "$storage_device" "$SCRATCH_DIR"
+  sudo chown "$(id -u):$(id -g)" "$SCRATCH_DIR"
+  printf '%s\\n' "$storage_device" >"$SCRATCH_DIR/.openalex-instance-store"
+  df -h "$SCRATCH_DIR"
+fi
+"""
+
+
 def build_launcher_script(remote_script: str, args: argparse.Namespace, run_id: str) -> str:
     work_dir = f"{args.scratch_dir.rstrip('/')}/runs/{run_id}"
     run_script = f"{work_dir}/remote_runner.sh"
     scratch_dir = args.scratch_dir.rstrip("/")
+    storage_setup = build_instance_store_setup_script(scratch_dir)
     return f"""set -Eeuo pipefail
+{storage_setup}
 if ! mkdir -p {q(work_dir)} 2>/dev/null; then
   sudo mkdir -p {q(work_dir)}
   sudo chown -R "$(id -u):$(id -g)" {q(scratch_dir)}

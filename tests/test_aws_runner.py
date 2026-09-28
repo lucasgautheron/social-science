@@ -180,6 +180,23 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('notify_terminal_status "$terminal_status"', script)
         self.assertIn('trap on_error ERR', script)
 
+    def test_launcher_mounts_instance_store_before_creating_run_directory(self):
+        args = aws_run.build_parser().parse_args(
+            ["submit", "--", "openalex", "events"]
+        )
+        script = aws_run.build_launcher_script("# remote runner", args, self.run_id)
+
+        self.assertIn('grep -qi "Instance Storage"', script)
+        self.assertIn("No EC2 NVMe instance-store devices were found", script)
+        self.assertIn('mdadm --create "$storage_device"', script)
+        self.assertIn('mkfs.xfs -f "$storage_device"', script)
+        self.assertIn('mount -o noatime,nodiratime "$storage_device"', script)
+        self.assertIn("Refusing to mount instance storage while pipeline pid", script)
+        self.assertLess(
+            script.index('mount -o noatime,nodiratime "$storage_device"'),
+            script.index("cat > /mnt/aws-runner/runs/run-1/remote_runner.sh"),
+        )
+
     def test_notification_topic_name_is_sns_compatible(self):
         name = aws_configure.notification_topic_name({"project": "OpenAlex / social science"})
 
@@ -233,6 +250,9 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("WORK_DIR=/scratch/runs/run-1", script)
         self.assertIn("DATABASE_PATH=/scratch/cache/articles.db", script)
         self.assertIn("LINES=12", script)
+        self.assertIn(f"MAX_LOG_BYTES={aws_run.DEFAULT_LIVE_LOG_BYTES}", script)
+        self.assertIn('tail -c "$MAX_LOG_BYTES"', script)
+        self.assertIn("tr '\\r' '\\n'", script)
         self.assertIn('ps -p "$pid"', script)
         self.assertIn("show_log launcher.log", script)
         self.assertIn("show_log stdout.log", script)

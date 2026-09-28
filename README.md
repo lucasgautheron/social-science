@@ -107,6 +107,9 @@ cache, and recent launcher/stdout/stderr lines:
 openalex-aws status --live --lines 30
 ```
 
+Live output normalizes carriage-return progress displays and byte-caps each
+log so the SSM response still includes the current stderr tail.
+
 Enable email notifications for successful and failed runs once:
 
 ```bash
@@ -136,12 +139,15 @@ NVMe copy no longer exists and the counting pass cannot be recovered.
 
 Use `--no-database` before `--` for commands that need no corpus. The worker
 caches the S3 database under `/mnt/aws-runner` on the instance's fast local
-NVMe storage and validates the cached URI, size, ETag, and VersionId before
-reuse. Downloads are atomic and `--force-db-download` explicitly refreshes the
-cache. The cache is reused across calls while the instance remains running,
-but EC2 instance-store data is lost on stop or termination and is then
-repopulated from S3. Normal runs receive a read-only symlink to the cached
-database and write only to an isolated per-run `output/` directory.
+NVMe storage. Before launching a run, the worker discovers the EC2
+instance-store devices, stripes multiple devices as RAID 0, mounts the result
+at `/mnt/aws-runner`, and refuses to fall back to root EBS. It validates the
+cached URI, size, ETag, and VersionId before reuse. Downloads are atomic and
+`--force-db-download` explicitly refreshes the cache. The cache is reused
+across calls while the instance remains running, but EC2 instance-store data
+is lost on stop or termination and is then repopulated from S3. Normal runs
+receive a read-only symlink to the cached database and write only to an
+isolated per-run `output/` directory.
 
 ## Development
 
