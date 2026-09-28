@@ -528,47 +528,50 @@ class TemporalVariationNgramAnalyzer:
             return result['total'].iloc[0]
 
     def fetch_ordered_article_batch(self, last_random_rank: Optional[int], batch_size: int) -> pd.DataFrame:
-        """Fetch the next ordered article batch by limiting articles_order before joins."""
+        """Fetch the next ordered article batch by materializing articles_order first."""
         if last_random_rank is None:
-            query = """
-                    SELECT ordered.article_id,
-                           a.publication_year,
-                           a.title,
-                           ab.abstract,
-                           ordered.random_rank
-                    FROM (
-                             SELECT ao.article_id, ao.random_rank
-                             FROM articles_order ao
-                             ORDER BY ao.random_rank
-                             LIMIT :batch_size
-                         ) ordered
-                             JOIN articles a ON ordered.article_id = a.article_id
-                             JOIN abstracts ab ON ordered.article_id = ab.article_id
-                    ORDER BY ordered.random_rank
+            insert_query = """
+                    INSERT INTO temp_batch_order (article_id, random_rank)
+                    SELECT ao.article_id, ao.random_rank
+                    FROM articles_order ao
+                    ORDER BY ao.random_rank
+                    LIMIT :batch_size
                     """
             params = {'batch_size': batch_size}
         else:
-            query = """
-                    SELECT ordered.article_id,
-                           a.publication_year,
-                           a.title,
-                           ab.abstract,
-                           ordered.random_rank
-                    FROM (
-                             SELECT ao.article_id, ao.random_rank
-                             FROM articles_order ao
-                             WHERE ao.random_rank > :last_rank
-                             ORDER BY ao.random_rank
-                             LIMIT :batch_size
-                         ) ordered
-                             JOIN articles a ON ordered.article_id = a.article_id
-                             JOIN abstracts ab ON ordered.article_id = ab.article_id
-                    ORDER BY ordered.random_rank
+            insert_query = """
+                    INSERT INTO temp_batch_order (article_id, random_rank)
+                    SELECT ao.article_id, ao.random_rank
+                    FROM articles_order ao
+                    WHERE ao.random_rank > :last_rank
+                    ORDER BY ao.random_rank
+                    LIMIT :batch_size
                     """
             params = {'last_rank': int(last_random_rank), 'batch_size': batch_size}
 
-        with self.engine.connect() as conn:
-            result = conn.execute(text(query), params)
+        fetch_query = """
+                      SELECT batch.article_id,
+                             a.publication_year,
+                             a.title,
+                             ab.abstract,
+                             batch.random_rank
+                      FROM temp_batch_order batch
+                               JOIN articles a ON batch.article_id = a.article_id
+                               LEFT JOIN abstracts ab ON batch.article_id = ab.article_id
+                      ORDER BY batch.random_rank
+                      """
+
+        with self.engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS temp_batch_order"))
+            conn.execute(text("""
+                              CREATE TEMP TABLE temp_batch_order
+                              (
+                                  article_id  INTEGER PRIMARY KEY,
+                                  random_rank INTEGER NOT NULL
+                              )
+                              """))
+            conn.execute(text(insert_query), params)
+            result = conn.execute(text(fetch_query))
             return pd.DataFrame(result.fetchall(), columns=result.keys())
 
     @staticmethod
