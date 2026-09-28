@@ -1,6 +1,8 @@
 import hashlib
 import sqlite3
 
+import pytest
+
 from openalex import events
 from openalex.events import EventExtractor
 
@@ -54,6 +56,17 @@ def test_checkpoint_configuration_is_bound_to_output_directory(tmp_path):
     )
     try:
         assert first._checkpoint_config()["output_dir"] != second._checkpoint_config()["output_dir"]
+        legacy_config = first._checkpoint_config()
+        legacy_config.pop("output_dir")
+        second._validate_checkpoint_config({"version": 1, "config": legacy_config})
+        with pytest.raises(ValueError, match="output_dir"):
+            second._validate_checkpoint_config(
+                {"version": events.CHECKPOINT_VERSION, "config": first._checkpoint_config()}
+            )
+        second.allow_output_dir_change = True
+        second._validate_checkpoint_config(
+            {"version": events.CHECKPOINT_VERSION, "config": first._checkpoint_config()}
+        )
     finally:
         first.engine.dispose()
         second.engine.dispose()

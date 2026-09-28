@@ -99,6 +99,14 @@ openalex-aws artifacts
 openalex-aws download
 ```
 
+`status` reads the durable run state from S3. Add `--live` to query the worker
+directly through SSM and display the process state, fast-storage usage, database
+cache, and recent launcher/stdout/stderr lines:
+
+```bash
+openalex-aws status --live --lines 30
+```
+
 To upgrade a completed pre-refactor run without repeating its temporal
 counting pass, keep the original instance running and point the new command at
 its legacy checkpoint:

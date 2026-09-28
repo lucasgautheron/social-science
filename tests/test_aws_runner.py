@@ -38,6 +38,11 @@ class FakeS3:
 class FakeSSM:
     def __init__(self, statuses):
         self.statuses = iter(statuses)
+        self.commands = []
+
+    def send_command(self, **kwargs):
+        self.commands.append(kwargs)
+        return {"Command": {"CommandId": "command-1"}}
 
     def get_command_invocation(self, **_kwargs):
         return next(self.statuses)
@@ -165,6 +170,46 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "remote sync failed"):
             aws_run.wait_for_ssm_command(ssm, "command", "i-123", timeout=10)
 
+    def test_live_status_script_reads_process_storage_and_logs(self):
+        script = aws_run.build_live_status_script(
+            {"scratch_dir": "/scratch"},
+            self.run_id,
+            lines=12,
+        )
+
+        self.assertIn("WORK_DIR=/scratch/runs/run-1", script)
+        self.assertIn("DATABASE_PATH=/scratch/cache/articles.db", script)
+        self.assertIn("LINES=12", script)
+        self.assertIn('ps -p "$pid"', script)
+        self.assertIn("show_log launcher.log", script)
+        self.assertIn("show_log stdout.log", script)
+        self.assertIn("show_log stderr.log", script)
+
+    def test_fetch_live_status_uses_ssm_and_returns_console_output(self):
+        ssm = FakeSSM(
+            [
+                {
+                    "Status": "Success",
+                    "StandardOutputContent": "process: running\nlatest event batch",
+                },
+            ]
+        )
+        session = mock.Mock()
+        session.client.return_value = ssm
+
+        output = aws_run.fetch_live_status(
+            session,
+            self.state,
+            {"instance_id": "i-runner", "scratch_dir": "/scratch"},
+            self.run_id,
+            lines=8,
+            timeout=30,
+        )
+
+        self.assertIn("process: running", output)
+        self.assertEqual(ssm.commands[0]["InstanceIds"], ["i-runner"])
+        self.assertIn("LINES=8", ssm.commands[0]["Parameters"]["commands"][0])
+
     def test_download_preserves_structure(self):
         artifact = {
             "key": "project/runs/run-1/output/nested/results.csv",
@@ -191,6 +236,16 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(
             args.refresh_timeout_seconds,
             aws_run.DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS,
+        )
+
+    def test_live_status_cli_defaults(self):
+        args = aws_run.build_parser().parse_args(["status", "--live"])
+
+        self.assertTrue(args.live)
+        self.assertEqual(args.lines, 20)
+        self.assertEqual(
+            args.live_timeout_seconds,
+            aws_run.DEFAULT_LIVE_STATUS_TIMEOUT_SECONDS,
         )
 
 

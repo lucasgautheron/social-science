@@ -21,6 +21,7 @@ DEFAULT_BRANCH = "bubbles"
 DEFAULT_STATUS_INTERVAL_SECONDS = 4 * 60 * 60
 DEFAULT_SSM_READY_TIMEOUT_SECONDS = 600
 DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS = 600
+DEFAULT_LIVE_STATUS_TIMEOUT_SECONDS = 60
 DEFAULT_DOWNLOAD_ROOT = "downloads"
 CHECKPOINT_FILENAME = "events_checkpoint.pkl"
 
@@ -266,7 +267,13 @@ fi
 """
 
 
-def wait_for_ssm_command(ssm, command_id: str, instance_id: str, timeout: int) -> Dict[str, Any]:
+def wait_for_ssm_command(
+    ssm,
+    command_id: str,
+    instance_id: str,
+    timeout: int,
+    operation: str = "SSM command",
+) -> Dict[str, Any]:
     deadline = time.time() + timeout
     pending_statuses = {"Pending", "InProgress", "Delayed"}
     while time.time() < deadline:
@@ -288,9 +295,9 @@ def wait_for_ssm_command(ssm, command_id: str, instance_id: str, timeout: int) -
         if status == "Success":
             return invocation
         details = invocation.get("StandardErrorContent") or invocation.get("StatusDetails") or status
-        raise SystemExit(f"Artifact refresh failed via SSM ({status}): {details}")
+        raise SystemExit(f"{operation} failed via SSM ({status}): {details}")
 
-    raise SystemExit(f"Timed out after {timeout}s waiting for artifact refresh command {command_id}")
+    raise SystemExit(f"Timed out after {timeout}s waiting for {operation.lower()} {command_id}")
 
 
 def refresh_run_artifacts(
@@ -321,10 +328,115 @@ def refresh_run_artifacts(
     )
     command_id = response["Command"]["CommandId"]
     print(f"Refreshing artifacts from {instance_id} via SSM ({command_id})...")
-    invocation = wait_for_ssm_command(ssm, command_id, instance_id, timeout)
+    invocation = wait_for_ssm_command(
+        ssm,
+        command_id,
+        instance_id,
+        timeout,
+        operation="Artifact refresh",
+    )
     output = (invocation.get("StandardOutputContent") or "").strip()
     if output:
         print(output)
+
+
+def build_live_status_script(status: Dict[str, Any], run_id: str, lines: int) -> str:
+    """Build a read-only worker diagnostic script for a pipeline run."""
+    if lines < 0:
+        raise ValueError("lines must be non-negative")
+
+    scratch_dir = str(status.get("scratch_dir") or DEFAULT_SCRATCH_DIR).rstrip("/")
+    work_dir = f"{scratch_dir}/runs/{run_id}"
+    run_dir = f"{work_dir}/work"
+    pid_file = f"{work_dir}/pid"
+    database_path = f"{scratch_dir}/cache/articles.db"
+
+    return f"""set -u
+WORK_DIR={q(work_dir)}
+RUN_DIR={q(run_dir)}
+PID_FILE={q(pid_file)}
+DATABASE_PATH={q(database_path)}
+LINES={lines}
+
+printf 'checked_at: %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'host: %s\\n' "$(hostname)"
+if [ -f "$PID_FILE" ]; then
+  pid="$(cat "$PID_FILE")"
+  printf 'pid: %s\\n' "$pid"
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'process: running\\n'
+    ps -p "$pid" -o pid=,etime=,%cpu=,%mem=,stat=,command= 2>/dev/null || true
+  else
+    printf 'process: not running\\n'
+  fi
+else
+  printf 'pid: unavailable\\n'
+  printf 'process: not started or PID file unavailable\\n'
+fi
+
+printf '\\nfilesystem:\\n'
+df -h {q(scratch_dir)} 2>/dev/null || true
+if [ -f "$DATABASE_PATH" ]; then
+  printf 'database: '
+  ls -lh "$DATABASE_PATH" 2>/dev/null || true
+else
+  printf 'database: not present at %s\\n' "$DATABASE_PATH"
+fi
+
+show_log() {{
+  name="$1"
+  path="$WORK_DIR/$name"
+  printf '\\n==> %s <==\\n' "$name"
+  if [ ! -f "$path" ]; then
+    printf 'not available: %s\\n' "$path"
+  elif [ "$LINES" -eq 0 ]; then
+    cat "$path"
+  else
+    tail -n "$LINES" "$path"
+  fi
+}}
+
+show_log launcher.log
+show_log stdout.log
+show_log stderr.log
+"""
+
+
+def fetch_live_status(
+    session,
+    state: Dict[str, Any],
+    status: Dict[str, Any],
+    run_id: str,
+    lines: int,
+    timeout: int,
+) -> str:
+    """Fetch process and console information directly from the worker through SSM."""
+    instance_id = status.get("instance_id") or state.get("instance_id")
+    if not instance_id:
+        raise SystemExit("No instance_id is configured; cannot query live worker status.")
+
+    script = build_live_status_script(status, run_id, lines)
+    ssm = session.client("ssm")
+    response = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Comment=f"inspect openalex pipeline run {run_id}",
+        Parameters={"commands": [script]},
+        TimeoutSeconds=timeout,
+    )
+    command_id = response["Command"]["CommandId"]
+    invocation = wait_for_ssm_command(
+        ssm,
+        command_id,
+        instance_id,
+        timeout,
+        operation="Live status query",
+    )
+    output = (invocation.get("StandardOutputContent") or "").rstrip()
+    error = (invocation.get("StandardErrorContent") or "").rstrip()
+    if error:
+        output = f"{output}\n\n==> diagnostic stderr <==\n{error}".lstrip()
+    return output
 
 
 def instance_state(ec2, instance_id: str) -> str:
@@ -856,6 +968,11 @@ def print_status(status: Dict[str, Any]) -> None:
 
 
 def command_status(args: argparse.Namespace) -> int:
+    if args.live and args.lines < 0:
+        raise SystemExit("--lines must be zero or greater.")
+    if args.live and args.live_timeout_seconds <= 0:
+        raise SystemExit("--live-timeout-seconds must be greater than zero.")
+
     boto3, client_error = require_boto3()
     state = load_state(args.state_path)
     session = boto3_session(args, state)
@@ -869,6 +986,17 @@ def command_status(args: argparse.Namespace) -> int:
         print(json.dumps(status, indent=2, sort_keys=True))
     else:
         print_status(status)
+        if args.live:
+            print("\n==> live worker status <==")
+            live_output = fetch_live_status(
+                session,
+                state,
+                status,
+                run_id,
+                lines=args.lines,
+                timeout=args.live_timeout_seconds,
+            )
+            print(live_output or "Worker returned no diagnostic output.")
     return 0
 
 
@@ -1084,10 +1212,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.set_defaults(func=command_submit)
 
-    status = subparsers.add_parser("status", help="Print the latest S3 status for a run.")
+    status = subparsers.add_parser("status", help="Print S3 status and optionally query the worker live.")
     add_common_args(status)
     status.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
-    status.add_argument("--json", action="store_true", help="Print raw status JSON.")
+    status_output = status.add_mutually_exclusive_group()
+    status_output.add_argument("--json", action="store_true", help="Print raw S3 status JSON.")
+    status_output.add_argument(
+        "--live",
+        action="store_true",
+        help="Query the worker via SSM for its process, storage, and recent console output.",
+    )
+    status.add_argument(
+        "--lines",
+        type=int,
+        default=20,
+        help="With --live, show this many trailing lines from each worker log. Use 0 for all.",
+    )
+    status.add_argument(
+        "--live-timeout-seconds",
+        type=int,
+        default=DEFAULT_LIVE_STATUS_TIMEOUT_SECONDS,
+        help="Maximum time to wait for a live SSM status query.",
+    )
     status.set_defaults(func=command_status)
 
     logs = subparsers.add_parser("logs", help="Print the latest synced run logs from S3.")
