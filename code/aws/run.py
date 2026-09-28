@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, Tuple
 DEFAULT_STATE_PATH = ".aws_runner_state.json"
 DEFAULT_LAST_RUN_PATH = ".aws_runner_last_run.json"
 DEFAULT_SCRATCH_DIR = "/mnt/aws-runner"
+DEFAULT_BRANCH = "bubbles"
 DEFAULT_STATUS_INTERVAL_SECONDS = 4 * 60 * 60
 DEFAULT_SSM_READY_TIMEOUT_SECONDS = 600
 
@@ -716,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--command", default=None, help="Command for --pipeline custom.")
     submit.add_argument("--extra-args", default="", help="Extra shell arguments appended to the selected pipeline command.")
     submit.add_argument("--run-id", default=None, help="Explicit run id. Defaults to a timestamped id.")
-    submit.add_argument("--branch", default="main", help="Git branch to checkout before running.")
+    submit.add_argument("--branch", default=DEFAULT_BRANCH, help="Git branch to checkout before running.")
     submit.add_argument("--commit", default=None, help="Specific commit SHA to checkout instead of the branch head.")
     submit.add_argument("--repo-url", default=None, help="Override repo URL from state.")
     submit.add_argument("--db-s3-uri", default=None, help="Override SQLite database S3 URI from state.")

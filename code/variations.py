@@ -5,7 +5,8 @@ import sys
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Run temporal n-gram variation analysis over the SQLite article database."
+        description="Run temporal n-gram variation analysis over the SQLite article database.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--db-path", default="articles.db", help="SQLite database path used when --database-url is not set.")
     parser.add_argument("--database-url", default=None, help="SQLAlchemy database URL. Overrides --db-path.")
