@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from typing import Any, Dict, Iterable, Optional
 DEFAULT_STATE_PATH = ".aws_runner_state.json"
 DEFAULT_PREFIX = "social-science"
 DEFAULT_REGION = "us-east-1"
+DEFAULT_BUCKET = "lucas-epistemic-bubbles"
+DEFAULT_REPO_URL = "git@github.com:lucasgautheron/social-science.git"
 DEFAULT_INSTANCE_TYPE = "i4i.8xlarge"
 DEFAULT_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 DEFAULT_ROOT_VOLUME_GB = 200
@@ -55,6 +58,24 @@ def load_json(path: Path) -> Dict[str, Any]:
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def default_repo_url() -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        detected = result.stdout.strip()
+        if detected:
+            return detected
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return DEFAULT_REPO_URL
 
 
 def boto3_session(args: argparse.Namespace):
@@ -233,6 +254,7 @@ def command_setup(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
     prefix = normalize_prefix(args.prefix)
     db_key = args.db_s3_key or prefixed_key(prefix, "input/articles.db")
+    repo_url = args.repo_url or default_repo_url()
 
     summary = {
         "region": args.region,
@@ -242,7 +264,7 @@ def command_setup(args: argparse.Namespace) -> int:
         "ami_id": args.ami_id or f"SSM:{DEFAULT_AMI_PARAMETER}",
         "root_volume_gb": args.root_volume_gb,
         "db_s3_uri": None if args.skip_db_upload else s3_uri(args.bucket, db_key),
-        "repo_url": args.repo_url,
+        "repo_url": repo_url,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     if args.dry_run:
@@ -287,7 +309,7 @@ def command_setup(args: argparse.Namespace) -> int:
         "iam_instance_profile": args.iam_instance_profile,
         "ami_id": args.ami_id,
         "root_volume_gb": args.root_volume_gb,
-        "repo_url": args.repo_url,
+        "repo_url": repo_url,
         "db_s3_uri": db_s3_uri or prior_state.get("db_s3_uri"),
         "state_s3_uri": s3_uri(args.bucket, prefixed_key(prefix, STATE_S3_KEY)),
         "updated_at": utc_now(),
@@ -377,14 +399,14 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("setup", help="Create/verify S3 resources, upload DB, and launch/reuse EC2.")
     add_common_args(setup)
     setup.set_defaults(region=DEFAULT_REGION)
-    setup.add_argument("--bucket", required=True, help="S3 bucket for inputs, state, logs, and outputs.")
+    setup.add_argument("--bucket", default=DEFAULT_BUCKET, help="S3 bucket for inputs, state, logs, and outputs.")
     setup.add_argument("--prefix", default=DEFAULT_PREFIX, help="S3 key prefix for this project.")
     setup.add_argument("--project", default="social-science", help="Tag/name prefix for AWS resources.")
     setup.add_argument("--db-path", default="articles.db", help="Local SQLite database path to upload.")
     setup.add_argument("--db-s3-key", default=None, help="Explicit S3 key for the SQLite database.")
     setup.add_argument("--skip-db-upload", action="store_true", help="Do not upload the SQLite database during setup.")
     setup.add_argument("--overwrite-db", action="store_true", help="Replace an existing uploaded SQLite database.")
-    setup.add_argument("--repo-url", required=True, help="GitHub repository URL that the EC2 worker should clone.")
+    setup.add_argument("--repo-url", default=None, help="GitHub repository URL that the EC2 worker should clone.")
     setup.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE, help="EC2 instance type.")
     setup.add_argument("--ami-id", default=None, help="AMI ID. Defaults to latest Amazon Linux 2023 via SSM.")
     setup.add_argument("--iam-instance-profile", default=None, help="IAM instance profile name/ARN with SSM and S3 access.")
