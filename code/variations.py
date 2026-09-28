@@ -57,7 +57,11 @@ from fast_langdetect import detect
 
 def is_english(s: str):
     lng = detect(s)
-    return lng["lang"] == "en"
+    if isinstance(lng, list):
+        if not lng:
+            return False
+        lng = lng[0]
+    return lng.get("lang") == "en"
 
 
 class LemmaTokenizer(object):
