@@ -5,6 +5,7 @@ from scipy import sparse
 
 from openalex.website.build import (
     aggregate_node_years,
+    build_graph_payload,
     build_website,
     cluster_keywords,
     load_event_artifacts,
@@ -54,6 +55,31 @@ def write_event_fixture(root):
     )
 
 
+def write_cluster_fixture(root):
+    root.mkdir()
+    np.save(
+        root / "keywords.npy",
+        np.array(["alpha", "beta", "gamma"], dtype=np.str_),
+        allow_pickle=False,
+    )
+    np.save(
+        root / "groups_by_level.npy",
+        np.array([[0, 0, 1], [0, 0, 0]], dtype=np.int32),
+        allow_pickle=False,
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "method": "nested-degree-corrected-sbm",
+                "keywords": "keywords.npy",
+                "groups_by_level": "groups_by_level.npy",
+                "coarse_level": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_complete_linkage_and_coarse_matrix_preserve_counts(tmp_path):
     event_dir = tmp_path / "events"
     write_event_fixture(event_dir)
@@ -74,7 +100,7 @@ def test_complete_linkage_and_coarse_matrix_preserve_counts(tmp_path):
     assert result["coarse"].sum() == result["matrix"].sum()
 
 
-def test_website_has_two_pages_and_exact_paper_unions(tmp_path):
+def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
     event_dir = tmp_path / "events"
     site_dir = tmp_path / "site"
     write_event_fixture(event_dir)
@@ -90,14 +116,78 @@ def test_website_has_two_pages_and_exact_paper_unions(tmp_path):
     assert summary["dendrogram_keywords"] == 3
     assert (site_dir / "index.html").is_file()
     assert (site_dir / "dendrogram.html").is_file()
+    assert (site_dir / "graph.html").is_file()
     assert not (site_dir / "progress.html").exists()
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    assert payload["graph"] is None
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta", "gamma"}
     assert root["yearly"] == [
         {"year": 2020, "papers": 2, "share": 1.0},
         {"year": 2021, "papers": 2, "share": 1.0},
     ]
+
+
+def test_graph_modes_colors_sizes_edges_and_barycenters(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    site_dir = tmp_path / "site"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    artifacts = load_event_artifacts(event_dir)
+    graph = build_graph_payload(
+        artifacts,
+        clusters_dir,
+        max_keywords=3,
+        max_edges=1,
+    )
+
+    assert graph["counts"] == {
+        "original_keywords": 3,
+        "displayed_keywords": 3,
+        "original_edges": 2,
+        "displayed_edges": 1,
+        "displayed_clusters": 2,
+        "displayed_cluster_edges": 0,
+    }
+    assert graph["keyword"]["edges"] == [{"source": 0, "target": 1, "weight": 1}]
+    keyword_nodes = graph["keyword"]["nodes"]
+    cluster_nodes = graph["cluster"]["nodes"]
+    assert keyword_nodes[0]["color"] == keyword_nodes[1]["color"] == cluster_nodes[0]["color"]
+    assert keyword_nodes[2]["color"] == cluster_nodes[1]["color"]
+    assert cluster_nodes[0]["papers"] == 4
+    assert cluster_nodes[0]["keywords"] == ["alpha", "beta"]
+    assert cluster_nodes[0]["yearly"] == [
+        {"year": 2020, "papers": 2, "share": 1.0},
+        {"year": 2021, "papers": 1, "share": 0.5},
+    ]
+    expected_x = (keyword_nodes[0]["x"] + keyword_nodes[1]["x"]) / 2
+    expected_y = (keyword_nodes[0]["y"] + keyword_nodes[1]["y"]) / 2
+    assert cluster_nodes[0]["x"] == expected_x
+    assert cluster_nodes[0]["y"] == expected_y
+
+    limited = build_graph_payload(
+        artifacts,
+        clusters_dir,
+        max_keywords=2,
+        max_edges=1,
+    )
+    assert [node["keyword"] for node in limited["keyword"]["nodes"]] == ["alpha", "beta"]
+    assert limited["counts"]["displayed_keywords"] == 2
+
+    summary = build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        output_dir=site_dir,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+        max_graph_keywords=3,
+        max_graph_edges=1,
+    )
+    assert summary["graph_keywords"] == 3
+    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    assert payload["graph"]["counts"]["displayed_edges"] == 1
+    assert "canvas" in (site_dir / "graph.html").read_text(encoding="utf-8")
 
 
 def test_large_cluster_union_does_not_overflow(tmp_path):

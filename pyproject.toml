@@ -13,7 +13,6 @@ dependencies = []
 [project.optional-dependencies]
 analysis = [
   "fast-langdetect>=0.2",
-  "networkx>=3.3",
   "nltk>=3.9",
   "numpy>=1.26",
   "pandas>=2.2",

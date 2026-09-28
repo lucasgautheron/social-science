@@ -24,10 +24,21 @@ SITE="$TEMP_ROOT/site"
 PUBLISH="$TEMP_ROOT/gh-pages"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 
+BUILD_ARGS=(
+  --events-dir "$EVENTS_DIR"
+  --output-dir "$SITE"
+)
+if [[ -n "${OPENALEX_CLUSTERS_DIR:-}" ]]; then
+  if [[ ! -f "$OPENALEX_CLUSTERS_DIR/manifest.json" ]]; then
+    echo "Cluster manifest not found: $OPENALEX_CLUSTERS_DIR/manifest.json" >&2
+    exit 2
+  fi
+  BUILD_ARGS+=(--clusters-dir "$OPENALEX_CLUSTERS_DIR")
+fi
+
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   "${PYTHON:-python}" -m openalex.website.build \
-  --events-dir "$EVENTS_DIR" \
-  --output-dir "$SITE"
+  "${BUILD_ARGS[@]}"
 
 git init --initial-branch=gh-pages "$PUBLISH" >/dev/null
 if name="$(git -C "$ROOT" config user.name 2>/dev/null)" && [[ -n "$name" ]]; then

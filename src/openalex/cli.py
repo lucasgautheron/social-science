@@ -10,6 +10,7 @@ from collections.abc import Sequence
 COMMANDS = {
     "build-reference-index": "openalex.db.build_reference_index",
     "build-website": "openalex.website.build",
+    "cluster-events": "openalex.analysis.cluster_events",
     "compile": "openalex.db.compile",
     "compile-snapshot": "openalex.db.compile_from_snapshot",
     "download": "openalex.imports.download",

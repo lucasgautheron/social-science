@@ -1,4 +1,4 @@
-"""Build the two-page event-keyword website."""
+"""Build the event-keyword website."""
 
 from __future__ import annotations
 
@@ -13,13 +13,25 @@ from typing import Any
 import numpy as np
 from scipy import sparse
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
+from scipy.sparse.csgraph import connected_components, laplacian
+from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import squareform
 
 DEFAULT_CLUSTER_SIMILARITY = 0.5
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 10
 DEFAULT_TOP_KEYWORDS = 100
 DEFAULT_MAX_DENDROGRAM_KEYWORDS = 500
-SITE_ASSETS = ("index.html", "dendrogram.html", "app.js", "dendrogram.js", "style.css")
+DEFAULT_MAX_GRAPH_KEYWORDS = 5_000
+DEFAULT_MAX_GRAPH_EDGES = 10_000
+SITE_ASSETS = (
+    "index.html",
+    "dendrogram.html",
+    "graph.html",
+    "app.js",
+    "dendrogram.js",
+    "graph.js",
+    "style.css",
+)
 
 
 def load_event_artifacts(events_dir: str | Path) -> dict[str, Any]:
@@ -242,6 +254,268 @@ def _sparse_payload(matrix) -> dict[str, Any]:
     }
 
 
+def load_cluster_artifacts(
+    clusters_dir: str | Path,
+    event_artifacts: dict[str, Any],
+) -> dict[str, Any]:
+    """Load blockmodel output and align its keywords to the event vocabulary."""
+    root = Path(clusters_dir).expanduser().resolve()
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    keywords = np.load(root / manifest["keywords"], allow_pickle=False).astype(str)
+    groups = np.load(root / manifest["groups_by_level"], allow_pickle=False)
+    if groups.ndim != 2 or groups.shape[1] != len(keywords):
+        raise ValueError("Cluster groups do not align with the cluster keyword vocabulary")
+    level = int(manifest.get("coarse_level", 0))
+    if level < 0 or level >= groups.shape[0]:
+        raise ValueError("Cluster manifest coarse_level is outside groups_by_level")
+    vocabulary = event_artifacts["vocabulary"]
+    vocabulary_index = {str(keyword): index for index, keyword in enumerate(vocabulary)}
+    if len(vocabulary_index) != len(vocabulary):
+        raise ValueError("Event vocabulary contains duplicate keywords")
+    missing = [keyword for keyword in keywords if keyword not in vocabulary_index]
+    if missing:
+        preview = ", ".join(str(keyword) for keyword in missing[:3])
+        raise ValueError(f"Cluster keywords are absent from the event vocabulary: {preview}")
+    return {
+        "root": root,
+        "manifest": manifest,
+        "keywords": keywords,
+        "groups": groups.astype(np.int32, copy=False),
+        "level": level,
+        "event_indices": np.asarray(
+            [vocabulary_index[str(keyword)] for keyword in keywords],
+            dtype=np.int64,
+        ),
+    }
+
+
+def build_graph_payload(
+    artifacts: dict[str, Any],
+    clusters_dir: str | Path,
+    *,
+    max_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
+    max_edges: int = DEFAULT_MAX_GRAPH_EDGES,
+) -> dict[str, Any]:
+    """Build keyword and cluster graph views from blockmodel artifacts."""
+    if max_keywords < 1:
+        raise ValueError("max_keywords must be positive")
+    if max_edges < 1:
+        raise ValueError("max_edges must be positive")
+    clustered = load_cluster_artifacts(clusters_dir, artifacts)
+    all_indices = clustered["event_indices"]
+    all_frequencies = artifacts["frequencies"][all_indices]
+    order = np.argsort(-all_frequencies, kind="stable")[:max_keywords]
+    event_indices = all_indices[order]
+    keywords = clustered["keywords"][order]
+    frequencies = all_frequencies[order].astype(np.int64, copy=False)
+    groups = clustered["groups"][clustered["level"], order]
+
+    all_matrix = artifacts["matrix"][all_indices][:, all_indices].tocsr()
+    all_matrix.setdiag(0)
+    all_matrix.eliminate_zeros()
+    original_edges = int(sparse.triu(all_matrix, k=1).nnz)
+
+    matrix = artifacts["matrix"][event_indices][:, event_indices].tocsr()
+    matrix.setdiag(0)
+    matrix.eliminate_zeros()
+    difference = (matrix - matrix.T).tocsr()
+    difference.eliminate_zeros()
+    if difference.nnz:
+        raise ValueError("Event co-occurrence matrix must be symmetric")
+    upper = sparse.triu(matrix, k=1, format="coo")
+    edge_order = np.lexsort((upper.col, upper.row, -upper.data))
+    edge_order = edge_order[:max_edges]
+    rows = upper.row[edge_order].astype(np.int32, copy=False)
+    columns = upper.col[edge_order].astype(np.int32, copy=False)
+    weights = upper.data[edge_order].astype(np.int64, copy=False)
+    retained = sparse.coo_matrix(
+        (
+            np.concatenate((weights, weights)),
+            (np.concatenate((rows, columns)), np.concatenate((columns, rows))),
+        ),
+        shape=matrix.shape,
+        dtype=np.int64,
+    ).tocsr()
+    coordinates = _spectral_layout(retained)
+
+    group_ids = sorted(set(int(group) for group in groups))
+    group_to_position = {group: position for position, group in enumerate(group_ids)}
+    member_positions = [np.flatnonzero(groups == group) for group in group_ids]
+    descendants = [[position] for position in range(len(keywords))]
+    descendants.extend(positions.tolist() for positions in member_positions)
+    yearly_counts = aggregate_node_years(artifacts, event_indices, descendants)
+    papers_by_year = {
+        int(year): int(count)
+        for year, count in artifacts["manifest"].get("papers_by_year", {}).items()
+    }
+
+    keyword_nodes = []
+    for position, keyword in enumerate(keywords):
+        group = int(groups[position])
+        keyword_nodes.append(
+            {
+                "id": f"keyword-{position}",
+                "kind": "keyword",
+                "keyword": str(keyword),
+                "keywords": [str(keyword)],
+                "group": group,
+                "color": _cluster_color(group),
+                "papers": int(frequencies[position]),
+                "x": float(coordinates[position, 0]),
+                "y": float(coordinates[position, 1]),
+                "yearly": _yearly_payload(
+                    yearly_counts.get(position, {}),
+                    papers_by_year,
+                ),
+            }
+        )
+
+    cluster_nodes = []
+    for cluster_position, (group, positions) in enumerate(
+        zip(group_ids, member_positions, strict=True)
+    ):
+        member_frequencies = frequencies[positions].astype(np.float64)
+        total_frequency = float(member_frequencies.sum())
+        if total_frequency:
+            center = np.average(coordinates[positions], axis=0, weights=member_frequencies)
+        else:
+            center = coordinates[positions].mean(axis=0)
+        members = [str(keywords[position]) for position in positions]
+        cluster_nodes.append(
+            {
+                "id": f"cluster-{group}",
+                "kind": "cluster",
+                "group": group,
+                "color": _cluster_color(group),
+                "papers": int(total_frequency),
+                "keyword_count": len(members),
+                "keywords": members,
+                "x": float(center[0]),
+                "y": float(center[1]),
+                "yearly": _yearly_payload(
+                    yearly_counts.get(len(keywords) + cluster_position, {}),
+                    papers_by_year,
+                ),
+            }
+        )
+
+    membership = sparse.csr_matrix(
+        (
+            np.ones(len(groups), dtype=np.int64),
+            (
+                np.arange(len(groups), dtype=np.int64),
+                np.asarray([group_to_position[int(group)] for group in groups]),
+            ),
+        ),
+        shape=(len(groups), len(group_ids)),
+    )
+    cluster_matrix = (membership.T @ retained @ membership).tocsr()
+    cluster_upper = sparse.triu(cluster_matrix, k=1, format="coo")
+    cluster_edges = [
+        {
+            "source": int(row),
+            "target": int(column),
+            "weight": int(weight),
+        }
+        for row, column, weight in zip(
+            cluster_upper.row,
+            cluster_upper.col,
+            cluster_upper.data,
+            strict=True,
+        )
+    ]
+    keyword_edges = [
+        {"source": int(row), "target": int(column), "weight": int(weight)}
+        for row, column, weight in zip(rows, columns, weights, strict=True)
+    ]
+    return {
+        "level": int(clustered["level"]),
+        "keyword": {"nodes": keyword_nodes, "edges": keyword_edges},
+        "cluster": {"nodes": cluster_nodes, "edges": cluster_edges},
+        "limits": {"keywords": int(max_keywords), "edges": int(max_edges)},
+        "counts": {
+            "original_keywords": int(len(all_indices)),
+            "displayed_keywords": int(len(keywords)),
+            "original_edges": original_edges,
+            "displayed_edges": int(len(keyword_edges)),
+            "displayed_clusters": int(len(cluster_nodes)),
+            "displayed_cluster_edges": int(len(cluster_edges)),
+        },
+    }
+
+
+def _yearly_payload(
+    counts: dict[int, int],
+    papers_by_year: dict[int, int],
+) -> list[dict[str, int | float]]:
+    return [
+        {
+            "year": int(year),
+            "papers": int(papers),
+            "share": papers / papers_by_year.get(year, 0)
+            if papers_by_year.get(year, 0)
+            else 0.0,
+        }
+        for year, papers in sorted(counts.items())
+    ]
+
+
+def _cluster_color(group: int) -> str:
+    hue = (float(group) * 137.508) % 360.0
+    return f"hsl({hue:.1f} 62% 43%)"
+
+
+def _spectral_layout(matrix: sparse.csr_matrix) -> np.ndarray:
+    """Lay out sparse connected components deterministically and pack them."""
+    count = matrix.shape[0]
+    if count == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    component_count, labels = connected_components(matrix, directed=False)
+    coordinates = np.zeros((count, 2), dtype=np.float64)
+    columns = max(1, math.ceil(math.sqrt(component_count)))
+    for component in range(component_count):
+        positions = np.flatnonzero(labels == component)
+        local = _component_layout(matrix[positions][:, positions])
+        row, column = divmod(component, columns)
+        coordinates[positions] = local + np.array([3.0 * column, 3.0 * row])
+    coordinates -= coordinates.mean(axis=0)
+    scale = float(np.max(np.abs(coordinates)))
+    if scale:
+        coordinates /= scale
+    return coordinates
+
+
+def _component_layout(matrix: sparse.csr_matrix) -> np.ndarray:
+    count = matrix.shape[0]
+    if count == 1:
+        return np.zeros((1, 2), dtype=np.float64)
+    if count == 2:
+        return np.array([[-1.0, 0.0], [1.0, 0.0]])
+    normalized = laplacian(matrix.astype(np.float64), normed=True)
+    if count <= 32:
+        _values, vectors = np.linalg.eigh(normalized.toarray())
+        coordinates = vectors[:, 1:3]
+    else:
+        start = np.linspace(1.0, 2.0, count, dtype=np.float64)
+        values, vectors = eigsh(
+            normalized,
+            k=3,
+            which="SM",
+            v0=start / np.linalg.norm(start),
+        )
+        vectors = vectors[:, np.argsort(values)]
+        coordinates = vectors[:, 1:3]
+    if coordinates.shape[1] == 1:
+        coordinates = np.column_stack((coordinates[:, 0], np.zeros(count)))
+    for axis in range(2):
+        pivot = int(np.argmax(np.abs(coordinates[:, axis])))
+        if coordinates[pivot, axis] < 0:
+            coordinates[:, axis] *= -1
+    coordinates -= coordinates.mean(axis=0)
+    scale = float(np.max(np.abs(coordinates)))
+    return coordinates / scale if scale else coordinates
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -252,10 +526,13 @@ def write_text(path: Path, content: str) -> None:
 def build_website(
     events_dir: str | Path = "output/events",
     *,
+    clusters_dir: str | Path | None = None,
     output_dir: str | Path = "output/website",
     top_keywords: int = DEFAULT_TOP_KEYWORDS,
     min_document_frequency: int = DEFAULT_MIN_DOCUMENT_FREQUENCY,
     max_dendrogram_keywords: int = DEFAULT_MAX_DENDROGRAM_KEYWORDS,
+    max_graph_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
+    max_graph_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
@@ -316,10 +593,20 @@ def build_website(
         ],
         "dendrogram": {"nodes": nodes},
         "coarse_matrix": _sparse_payload(clustered["coarse"]),
+        "graph": (
+            build_graph_payload(
+                artifacts,
+                clusters_dir,
+                max_keywords=max_graph_keywords,
+                max_edges=max_graph_edges,
+            )
+            if clusters_dir is not None
+            else None
+        ),
     }
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    expected_html = {"index.html", "dendrogram.html"}
+    expected_html = {"index.html", "dendrogram.html", "graph.html"}
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
             stale_html.unlink()
@@ -336,12 +623,21 @@ def build_website(
         "keywords": len(payload["top_keywords"]),
         "dendrogram_keywords": len(selected),
         "clusters": payload["meta"]["clusters"],
+        "graph_keywords": (
+            payload["graph"]["counts"]["displayed_keywords"] if payload["graph"] else 0
+        ),
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the static event-keyword website.")
     parser.add_argument("--events-dir", type=Path, default=Path("output/events"))
+    parser.add_argument(
+        "--clusters-dir",
+        type=Path,
+        default=None,
+        help="Optional nested blockmodel output used by graph.html.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
     parser.add_argument("--top-keywords", type=int, default=DEFAULT_TOP_KEYWORDS)
     parser.add_argument(
@@ -359,6 +655,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CLUSTER_SIMILARITY,
     )
+    parser.add_argument(
+        "--max-graph-keywords",
+        type=int,
+        default=DEFAULT_MAX_GRAPH_KEYWORDS,
+    )
+    parser.add_argument(
+        "--max-graph-edges",
+        type=int,
+        default=DEFAULT_MAX_GRAPH_EDGES,
+    )
     return parser
 
 
@@ -370,12 +676,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--min-document-frequency must be positive")
     if args.max_dendrogram_keywords < 1:
         raise SystemExit("--max-dendrogram-keywords must be positive")
+    if args.max_graph_keywords < 1:
+        raise SystemExit("--max-graph-keywords must be positive")
+    if args.max_graph_edges < 1:
+        raise SystemExit("--max-graph-edges must be positive")
     summary = build_website(
         args.events_dir,
+        clusters_dir=args.clusters_dir,
         output_dir=args.output_dir,
         top_keywords=args.top_keywords,
         min_document_frequency=args.min_document_frequency,
         max_dendrogram_keywords=args.max_dendrogram_keywords,
+        max_graph_keywords=args.max_graph_keywords,
+        max_graph_edges=args.max_graph_edges,
         cluster_similarity=args.cluster_similarity,
     )
     print(json.dumps(summary, indent=2))

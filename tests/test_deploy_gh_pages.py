@@ -25,6 +25,7 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     root = tmp_path / "source"
     remote = tmp_path / "remote.git"
     events = tmp_path / "events"
+    clusters = tmp_path / "clusters"
     fake_python = tmp_path / "python"
     git(tmp_path, "init", "--bare", str(remote))
     git(tmp_path, "init", "--initial-branch=main", str(root))
@@ -36,6 +37,8 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     git(root, "remote", "add", "origin", str(remote))
     events.mkdir()
     (events / "manifest.json").write_text("{}\n", encoding="utf-8")
+    clusters.mkdir()
+    (clusters / "manifest.json").write_text("{}\n", encoding="utf-8")
     fake_python.write_text(
         """#!/usr/bin/env python3
 import os
@@ -46,6 +49,7 @@ output.mkdir(parents=True)
 counter = Path(os.environ["SITE_COUNTER"])
 value = int(counter.read_text() if counter.exists() else "0") + 1
 counter.write_text(str(value), encoding="utf-8")
+Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="utf-8")
 (output / "index.html").write_text(f"site {value}\\n", encoding="utf-8")
 (output / "dendrogram.html").write_text("tree\\n", encoding="utf-8")
 """,
@@ -58,6 +62,8 @@ counter.write_text(str(value), encoding="utf-8")
             "OPENALEX_ROOT": str(root),
             "PYTHON": str(fake_python),
             "SITE_COUNTER": str(tmp_path / "counter"),
+            "BUILD_ARGS_PATH": str(tmp_path / "build-args"),
+            "OPENALEX_CLUSTERS_DIR": str(clusters),
             "GIT_AUTHOR_NAME": "Test",
             "GIT_AUTHOR_EMAIL": "test@example.com",
             "GIT_COMMITTER_NAME": "Test",
@@ -70,3 +76,5 @@ counter.write_text(str(value), encoding="utf-8")
     second = git(remote, "rev-parse", "gh-pages").stdout.strip()
     assert first != second
     assert git(remote, "rev-list", "--count", "gh-pages").stdout.strip() == "1"
+    arguments = (tmp_path / "build-args").read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--clusters-dir") + 1] == str(clusters)

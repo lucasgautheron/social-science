@@ -54,31 +54,64 @@ The output contains:
 Incidence is retained so a cluster frequency counts a paper once even when the
 paper contains multiple keywords in that cluster.
 
+## Cluster events
+
+Cluster those keywords with a nested degree-corrected stochastic block model.
+`graph-tool` is installed from conda-forge, separately from the pip extras:
+
+```bash
+conda install -c conda-forge graph-tool
+openalex cluster-events \
+  --events-dir output/events \
+  --output-dir output/event_clusters
+```
+
+The fit treats each off-diagonal co-occurrence count as an undirected edge
+multiplicity and keeps the shortest description length across `--restarts`.
+Level 0 is the finest partition; coarser cuts of the same hierarchy are written
+too. A paper that contains several keywords from one cluster contributes once
+to that cluster's yearly count.
+
+The default vocabulary is the keywords listed in `events.csv`. `--keywords all`
+clusters every keyword in the co-occurrence vocabulary. `--level` selects which
+hierarchy depth is reported as `group` in `keyword_groups.csv`.
+
 ## Website
 
-Build the two-page site:
+Build the three-page site:
 
 ```bash
 openalex build-website \
   --events-dir output/events \
+  --clusters-dir output/event_clusters \
   --output-dir output/website
 python -m http.server --directory output/website 8000
 ```
 
 `index.html` ranks keywords by document frequency. `dendrogram.html` shows the
 complete-linkage keyword hierarchy and a sidebar with exact yearly paper
-frequency plus cluster membership.
+frequency plus cluster membership. `graph.html` switches between the keyword
+co-occurrence network and its blockmodel clusters. Nodes share cluster colors
+and have area proportional to keyword document frequency (summed for cluster
+nodes). Cluster coordinates are the document-frequency-weighted barycenters of
+their displayed keywords.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,
 and cuts complete linkage at `--cluster-similarity 0.5`. If `H` is the cut
 membership matrix, it also exports `H.T @ M @ H` and verifies that the total
-count is preserved.
+count is preserved. The graph page keeps the 5,000 most frequent blockmodel
+keywords and their 10,000 strongest co-occurrence edges by default; use
+`--max-graph-keywords` and `--max-graph-edges` to change those limits.
+
+Omitting `--clusters-dir` still builds the site, but the graph page displays
+instructions instead of a network.
 
 Publish a fresh orphan `gh-pages` commit with:
 
 ```bash
-scripts/deploy-gh-pages.sh output/events
+OPENALEX_CLUSTERS_DIR=output/event_clusters \
+  scripts/deploy-gh-pages.sh output/events
 ```
 
 ## AWS
