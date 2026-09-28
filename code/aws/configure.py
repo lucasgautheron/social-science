@@ -17,7 +17,7 @@ DEFAULT_STATE_PATH = ".aws_runner_state.json"
 DEFAULT_PREFIX = "social-science"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_BUCKET = "lucas-epistemic-bubbles"
-DEFAULT_REPO_URL = "git@github.com:lucasgautheron/social-science.git"
+DEFAULT_REPO_URL = "https://github.com/lucasgautheron/social-science.git"
 DEFAULT_INSTANCE_TYPE = "i4i.8xlarge"
 DEFAULT_IAM_INSTANCE_PROFILE = "social-science-ec2-runner-profile"
 DEFAULT_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
@@ -61,6 +61,14 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def normalize_repo_url(repo_url: str) -> str:
+    """Use HTTPS for public GitHub repos so EC2 does not need SSH keys."""
+    if repo_url.startswith("git@github.com:"):
+        repo_path = repo_url.removeprefix("git@github.com:")
+        return f"https://github.com/{repo_path}"
+    return repo_url
+
+
 def default_repo_url() -> str:
     repo_root = Path(__file__).resolve().parents[2]
     try:
@@ -73,10 +81,10 @@ def default_repo_url() -> str:
         )
         detected = result.stdout.strip()
         if detected:
-            return detected
+            return normalize_repo_url(detected)
     except (OSError, subprocess.CalledProcessError):
         pass
-    return DEFAULT_REPO_URL
+    return normalize_repo_url(DEFAULT_REPO_URL)
 
 
 def boto3_session(args: argparse.Namespace):
@@ -255,7 +263,7 @@ def command_setup(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
     prefix = normalize_prefix(args.prefix)
     db_key = args.db_s3_key or prefixed_key(prefix, "input/articles.db")
-    repo_url = args.repo_url or default_repo_url()
+    repo_url = normalize_repo_url(args.repo_url or default_repo_url())
 
     summary = {
         "region": args.region,

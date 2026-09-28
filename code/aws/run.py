@@ -83,6 +83,14 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def normalize_repo_url(repo_url: str) -> str:
+    """Use HTTPS for public GitHub repos so EC2 does not need SSH keys."""
+    if repo_url.startswith("git@github.com:"):
+        repo_path = repo_url.removeprefix("git@github.com:")
+        return f"https://github.com/{repo_path}"
+    return repo_url
+
+
 def load_state(path: str) -> Dict[str, Any]:
     state_path = Path(path)
     if not state_path.exists():
@@ -253,6 +261,7 @@ def build_remote_runner_script(
         raise SystemExit("No database S3 URI configured. Run setup with --db-path or pass --db-s3-uri.")
     if not repo_url:
         raise SystemExit("No repo URL configured. Run setup with --repo-url or pass --repo-url.")
+    repo_url = normalize_repo_url(repo_url)
 
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
