@@ -11,8 +11,8 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_STATE_PATH = ".aws_runner_state.json"
@@ -21,6 +21,9 @@ DEFAULT_SCRATCH_DIR = "/mnt/aws-runner"
 DEFAULT_BRANCH = "bubbles"
 DEFAULT_STATUS_INTERVAL_SECONDS = 4 * 60 * 60
 DEFAULT_SSM_READY_TIMEOUT_SECONDS = 600
+DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS = 600
+DEFAULT_DOWNLOAD_ROOT = "downloads"
+CHECKPOINT_FILENAME = "variations_checkpoint.pkl"
 
 
 def utc_now() -> str:
@@ -170,6 +173,166 @@ def resolve_run_id(args: argparse.Namespace, s3=None, state: Optional[Dict[str, 
     raise SystemExit("No run id supplied and no previous run was found.")
 
 
+def artifact_output_prefix(state: Dict[str, Any], run_id: str) -> str:
+    return f"{run_prefix(state, run_id)}/output/"
+
+
+def list_run_artifacts(
+    s3,
+    state: Dict[str, Any],
+    run_id: str,
+    include_checkpoint: bool = False,
+) -> List[Dict[str, Any]]:
+    """List downloadable run artifacts, including legacy compiled database locations."""
+    bucket = state["bucket"]
+    output_prefix = artifact_output_prefix(state, run_id)
+    artifacts: Dict[str, Dict[str, Any]] = {}
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=output_prefix):
+        for item in page.get("Contents", []):
+            key = item["Key"]
+            relative_path = key.removeprefix(output_prefix)
+            if not relative_path or relative_path.endswith("/"):
+                continue
+            if not include_checkpoint and PurePosixPath(relative_path).name == CHECKPOINT_FILENAME:
+                continue
+            artifacts[relative_path] = {
+                "key": key,
+                "relative_path": relative_path,
+                "size": item.get("Size", 0),
+                "last_modified": item.get("LastModified"),
+            }
+
+    # compile-from-snapshot runs created before artifact normalization stored
+    # the database at the run root rather than beneath output/.
+    legacy_key = f"{run_prefix(state, run_id)}/compiled_articles.db"
+    for page in paginator.paginate(Bucket=bucket, Prefix=legacy_key):
+        for item in page.get("Contents", []):
+            if item["Key"] != legacy_key:
+                continue
+            artifacts.setdefault(
+                "compiled_articles.db",
+                {
+                    "key": legacy_key,
+                    "relative_path": "compiled_articles.db",
+                    "size": item.get("Size", 0),
+                    "last_modified": item.get("LastModified"),
+                },
+            )
+
+    return [artifacts[name] for name in sorted(artifacts)]
+
+
+def safe_artifact_destination(root: Path, relative_path: str) -> Path:
+    """Map an S3 artifact name beneath root without allowing path traversal."""
+    posix_path = PurePosixPath(relative_path)
+    if posix_path.is_absolute() or ".." in posix_path.parts:
+        raise ValueError(f"Unsafe artifact path: {relative_path!r}")
+    return root.joinpath(*posix_path.parts)
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def build_artifact_refresh_script(
+    state: Dict[str, Any],
+    status: Dict[str, Any],
+    run_id: str,
+    include_checkpoint: bool = False,
+) -> str:
+    """Build a remote script that publishes current and legacy artifacts."""
+    scratch_dir = str(status.get("scratch_dir") or DEFAULT_SCRATCH_DIR).rstrip("/")
+    repo_dir = f"{scratch_dir}/repo"
+    destination = s3_uri(state["bucket"], artifact_output_prefix(state, run_id))
+    checkpoint_option = "" if include_checkpoint else f" --exclude {q(CHECKPOINT_FILENAME)}"
+    compiled_db = f"{scratch_dir}/compiled_articles.db"
+
+    return f"""set -Eeuo pipefail
+REPO_DIR={q(repo_dir)}
+DESTINATION={q(destination)}
+COMPILED_DB={q(compiled_db)}
+if [ -d "$REPO_DIR/output" ]; then
+  aws s3 sync --no-progress "$REPO_DIR/output" "$DESTINATION"{checkpoint_option}
+fi
+for artifact in "$REPO_DIR"/temporal_ngrams_*.csv; do
+  if [ -f "$artifact" ]; then
+    aws s3 cp --no-progress "$artifact" "$DESTINATION$(basename "$artifact")"
+  fi
+done
+if [ -f "$COMPILED_DB" ]; then
+  aws s3 cp --no-progress "$COMPILED_DB" "${{DESTINATION}}compiled_articles.db"
+fi
+"""
+
+
+def wait_for_ssm_command(ssm, command_id: str, instance_id: str, timeout: int) -> Dict[str, Any]:
+    deadline = time.time() + timeout
+    pending_statuses = {"Pending", "InProgress", "Delayed"}
+    while time.time() < deadline:
+        try:
+            invocation = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+        except Exception as exc:
+            if client_error_code(exc) == "InvocationDoesNotExist":
+                time.sleep(2)
+                continue
+            raise
+
+        status = invocation.get("Status")
+        if status in pending_statuses:
+            time.sleep(2)
+            continue
+        if status == "Success":
+            return invocation
+        details = invocation.get("StandardErrorContent") or invocation.get("StatusDetails") or status
+        raise SystemExit(f"Artifact refresh failed via SSM ({status}): {details}")
+
+    raise SystemExit(f"Timed out after {timeout}s waiting for artifact refresh command {command_id}")
+
+
+def refresh_run_artifacts(
+    session,
+    state: Dict[str, Any],
+    status: Dict[str, Any],
+    run_id: str,
+    include_checkpoint: bool,
+    timeout: int,
+) -> None:
+    instance_id = state.get("instance_id")
+    if not instance_id:
+        raise SystemExit("No instance_id is configured; cannot refresh remote artifacts.")
+
+    script = build_artifact_refresh_script(
+        state,
+        status,
+        run_id,
+        include_checkpoint=include_checkpoint,
+    )
+    ssm = session.client("ssm")
+    response = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Comment=f"refresh social-science artifacts for {run_id}",
+        Parameters={"commands": [script]},
+        TimeoutSeconds=timeout,
+    )
+    command_id = response["Command"]["CommandId"]
+    print(f"Refreshing artifacts from {instance_id} via SSM ({command_id})...")
+    invocation = wait_for_ssm_command(ssm, command_id, instance_id, timeout)
+    output = (invocation.get("StandardOutputContent") or "").strip()
+    if output:
+        print(output)
+
+
 def instance_state(ec2, instance_id: str) -> str:
     response = ec2.describe_instances(InstanceIds=[instance_id])
     for reservation in response.get("Reservations", []):
@@ -231,16 +394,16 @@ def pipeline_command(args: argparse.Namespace) -> str:
     elif args.pipeline == "variations":
         command = "python3 code/variations.py"
     elif args.pipeline == "random-order":
-        command = "python3 code/random_order.py"
+        command = "python3 code/db/random_order.py"
     elif args.pipeline == "export-parquet":
-        command = "python3 code/export_parquet.py --db-path articles.db --output-dir output/article_text_ordered_parquet --resume"
+        command = "python3 code/db/export_parquet.py --db-path articles.db --output-dir output/article_text_ordered_parquet --resume"
     elif args.pipeline == "compile-from-snapshot":
         if not args.snapshot_s3_uri:
             raise SystemExit("--snapshot-s3-uri is required when --pipeline compile-from-snapshot is used.")
         snapshot_dir = args.snapshot_local_dir or f"{args.scratch_dir.rstrip('/')}/openalex-snapshot"
         compile_db_path = args.compile_db_path or f"{args.scratch_dir.rstrip('/')}/compiled_articles.db"
         command = (
-            f"python3 code/compile_from_snapshot.py {q(snapshot_dir)} "
+            f"python3 code/db/compile_from_snapshot.py {q(snapshot_dir)} "
             f"--database-url {q('sqlite:///' + compile_db_path)}"
         )
     else:
@@ -373,7 +536,7 @@ sync_output() {{
     aws s3 sync "${{REPO_DIR}}/output" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/" >/dev/null 2>&1 || true
   fi
   if [ "$PIPELINE" = "compile-from-snapshot" ] && [ -f "$COMPILE_DB_PATH" ]; then
-    aws s3 cp --no-progress "$COMPILE_DB_PATH" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/compiled_articles.db" >/dev/null 2>&1 || true
+    aws s3 cp --no-progress "$COMPILE_DB_PATH" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/compiled_articles.db" >/dev/null 2>&1 || true
   fi
 }}
 
@@ -722,6 +885,83 @@ def command_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def artifact_command_context(args: argparse.Namespace):
+    state = load_state(args.state_path)
+    session = boto3_session(args, state)
+    s3 = session.client("s3")
+    run_id = resolve_run_id(args, s3=s3, state=state)
+    status_key = f"{run_prefix(state, run_id)}/status.json"
+    status = get_s3_json(s3, state["bucket"], status_key, require_boto3()[1]) or {}
+
+    if args.refresh:
+        refresh_run_artifacts(
+            session,
+            state,
+            status,
+            run_id,
+            include_checkpoint=args.include_checkpoint,
+            timeout=args.refresh_timeout_seconds,
+        )
+
+    artifacts = list_run_artifacts(
+        s3,
+        state,
+        run_id,
+        include_checkpoint=args.include_checkpoint,
+    )
+    return state, s3, run_id, status, artifacts
+
+
+def command_artifacts(args: argparse.Namespace) -> int:
+    state, _s3, run_id, status, artifacts = artifact_command_context(args)
+    print(f"run_id: {run_id}")
+    if status.get("status"):
+        print(f"status: {status['status']}")
+    print(f"source: {s3_uri(state['bucket'], artifact_output_prefix(state, run_id))}")
+
+    if not artifacts:
+        print("No downloadable artifacts found.")
+        if not args.refresh:
+            print("Use --refresh to publish current files from the worker.")
+        return 0
+
+    total_size = 0
+    for artifact in artifacts:
+        total_size += artifact["size"]
+        print(f"{format_bytes(artifact['size']):>10}  {artifact['relative_path']}")
+    print(f"{len(artifacts)} artifact(s), {format_bytes(total_size)} total")
+    if not args.include_checkpoint:
+        print(f"Checkpoint excluded; pass --include-checkpoint to include {CHECKPOINT_FILENAME}.")
+    return 0
+
+
+def command_download(args: argparse.Namespace) -> int:
+    state, s3, run_id, status, artifacts = artifact_command_context(args)
+    if not artifacts:
+        raise SystemExit(
+            "No downloadable artifacts found. If the worker still has the files, retry with --refresh."
+        )
+
+    destination = Path(args.output_dir) if args.output_dir else Path(DEFAULT_DOWNLOAD_ROOT) / run_id
+    destination.mkdir(parents=True, exist_ok=True)
+    total_size = 0
+    print(
+        f"Downloading {len(artifacts)} artifact(s) for {run_id}"
+        f" ({status.get('status', 'unknown')}) to {destination}..."
+    )
+    for artifact in artifacts:
+        local_path = safe_artifact_destination(destination, artifact["relative_path"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  {artifact['relative_path']} ({format_bytes(artifact['size'])})")
+        s3.download_file(state["bucket"], artifact["key"], str(local_path))
+        total_size += artifact["size"]
+
+    print(f"Downloaded {format_bytes(total_size)} to {destination}")
+    if not args.include_checkpoint:
+        print(f"Checkpoint excluded; pass --include-checkpoint to download {CHECKPOINT_FILENAME}.")
+    return 0
+
+
 def command_cancel(args: argparse.Namespace) -> int:
     state = load_state(args.state_path)
     session = boto3_session(args, state)
@@ -767,6 +1007,27 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--last-run-path", default=DEFAULT_LAST_RUN_PATH, help="Local file storing the latest run id.")
     parser.add_argument("--profile", default=None, help="AWS profile name.")
     parser.add_argument("--region", default=None, help="AWS region. Defaults to the configured state region.")
+
+
+def add_artifact_args(parser: argparse.ArgumentParser) -> None:
+    add_common_args(parser)
+    parser.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Publish current worker artifacts to S3 before listing or downloading.",
+    )
+    parser.add_argument(
+        "--include-checkpoint",
+        action="store_true",
+        help=f"Include the potentially large {CHECKPOINT_FILENAME} file.",
+    )
+    parser.add_argument(
+        "--refresh-timeout-seconds",
+        type=int,
+        default=DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS,
+        help="Maximum time to wait for an SSM artifact refresh.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -817,6 +1078,19 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--launcher", action="store_true", help="Show launcher/bootstrap log instead of stdout.log.")
     logs.add_argument("--all", action="store_true", help="Show launcher, stdout, and stderr logs.")
     logs.set_defaults(func=command_logs)
+
+    artifacts = subparsers.add_parser("artifacts", help="List result artifacts stored for a run.")
+    add_artifact_args(artifacts)
+    artifacts.set_defaults(func=command_artifacts)
+
+    download = subparsers.add_parser("download", help="Download result artifacts for a run.")
+    add_artifact_args(download)
+    download.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"Local destination. Defaults to {DEFAULT_DOWNLOAD_ROOT}/<run-id>.",
+    )
+    download.set_defaults(func=command_download)
 
     cancel = subparsers.add_parser("cancel", help="Request cancellation of a running remote pipeline.")
     add_common_args(cancel)

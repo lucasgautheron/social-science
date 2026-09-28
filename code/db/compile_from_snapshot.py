@@ -96,7 +96,7 @@ def iter_snapshot_works(path):
 def import_compile_module():
     candidate_paths = [
         os.path.dirname(os.path.abspath(__file__)),
-        os.path.join(os.getcwd(), "code"),
+        os.path.join(os.getcwd(), "code", "db"),
         os.getcwd(),
     ]
     for path in candidate_paths:
@@ -109,7 +109,7 @@ def import_compile_module():
         if exc.name != "compile":
             raise
         raise ModuleNotFoundError(
-            "Could not import compile.py. Run this script from the repository root, "
+            "Could not import code/db/compile.py. Run this script from the repository root, "
             "or place compile.py in the same directory as compile_from_snapshot.py."
         ) from exc
 

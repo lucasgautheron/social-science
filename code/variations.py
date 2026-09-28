@@ -1400,9 +1400,12 @@ class TemporalVariationNgramAnalyzer:
 
         return results
 
-    def export_temporal_results(self, results: Dict, filename_prefix: str = "temporal_ngrams"):
+    def export_temporal_results(self, results: Dict, filename_prefix: str = "output/temporal_ngrams"):
         """Export temporal variation results"""
         logger.info("Exporting temporal variation results...")
+        output_dir = os.path.dirname(filename_prefix)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
         # Summary of significant n-grams
         significant_data = []
