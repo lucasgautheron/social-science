@@ -77,6 +77,14 @@ def build_arg_parser():
         default=1,
         help="Save a checkpoint every N completed batches.",
     )
+    parser.add_argument(
+        "--rebuild-artifacts",
+        action="store_true",
+        help=(
+            "Reuse checkpointed counting state but rebuild co-occurrence and "
+            "paper/year incidence artifacts from the corpus."
+        ),
+    )
     return parser
 
 
@@ -536,7 +544,8 @@ class EventExtractor:
                  checkpoint_path: str = "output/events/events_checkpoint.pkl",
                  output_dir: str | Path = "output/events",
                  resume_from_checkpoint: bool = True,
-                 checkpoint_every_batches: int = 1):
+                 checkpoint_every_batches: int = 1,
+                 allow_output_dir_change: bool = False):
         """
         Initialize the temporal variation N-gram analyzer with improved parallelization
 
@@ -567,6 +576,7 @@ class EventExtractor:
         self.output_dir = Path(output_dir)
         self.resume_from_checkpoint = resume_from_checkpoint
         self.checkpoint_every_batches = max(1, checkpoint_every_batches)
+        self.allow_output_dir_change = allow_output_dir_change
         self.engine = create_engine(database_url)
         if self.engine.dialect.name == "sqlite":
             @sqlalchemy_event.listens_for(self.engine, "connect")
@@ -678,14 +688,19 @@ class EventExtractor:
 
     def _validate_checkpoint_config(self, checkpoint: Dict):
         """Ensure checkpoint state belongs to this analyzer configuration."""
-        if checkpoint.get('version') != CHECKPOINT_VERSION:
+        version = checkpoint.get('version')
+        if version not in {1, CHECKPOINT_VERSION}:
             raise ValueError(f"Unsupported checkpoint version: {checkpoint.get('version')}")
 
         checkpoint_config = checkpoint.get('config', {})
         current_config = self._checkpoint_config()
         mismatches = [
             key for key, value in current_config.items()
-            if checkpoint_config.get(key) != value
+            if not (
+                key == 'output_dir'
+                and (version == 1 or self.allow_output_dir_change)
+            )
+            and checkpoint_config.get(key) != value
         ]
         if mismatches:
             mismatch_list = ', '.join(mismatches)
@@ -1562,7 +1577,7 @@ class EventExtractor:
         logger.info(f"Exported article mapping for {exported_count} n-grams to {filename}")
         return exported_count
 
-    def run(self, export_results: bool = True) -> Dict:
+    def run(self, export_results: bool = True, rebuild_artifacts: bool = False) -> Dict:
         """Run event extraction and produce website-ready artifacts."""
         logger.info(f"Starting event extraction (min {self.min_fold_change}x fold change)...")
 
@@ -1570,12 +1585,14 @@ class EventExtractor:
         checkpoint_phase = checkpoint.get('phase') if checkpoint else None
         mapping_state = checkpoint.get('mapping_state', {}) if checkpoint else {}
 
-        if checkpoint_phase == 'complete':
+        if checkpoint_phase == 'complete' and not rebuild_artifacts:
             logger.info("Checkpoint indicates analysis is already complete")
             return self.calculate_final_statistics()
 
-        if checkpoint_phase == 'cooccurrence':
-            logger.info("Skipping temporal counting because checkpoint is already in co-occurrence phase")
+        if checkpoint_phase in {'cooccurrence', 'complete'}:
+            logger.info(
+                "Reusing checkpointed event counts; skipping the temporal counting pass"
+            )
         else:
             # Process with cursor-based pagination
             self.process_all_batches()
@@ -1591,7 +1608,10 @@ class EventExtractor:
             }
             logger.info(f"Selected {len(target_ngrams)} event keywords for co-occurrence")
             target_fingerprint = self._fingerprint_ngrams(tuple(sorted(target_ngrams)))
-            if checkpoint_phase != 'cooccurrence':
+            if checkpoint_phase != 'cooccurrence' or rebuild_artifacts:
+                if rebuild_artifacts:
+                    self.cooccurrence_matrix = None
+                    self.cooccurrence_doc_frequency = None
                 self.save_checkpoint(
                     'cooccurrence',
                     target_ngram_fingerprint=target_fingerprint
@@ -1625,11 +1645,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_path=str(checkpoint_path),
         output_dir=args.output_dir,
         resume_from_checkpoint=not args.no_resume_from_checkpoint,
-        checkpoint_every_batches=args.checkpoint_every_batches
+        checkpoint_every_batches=args.checkpoint_every_batches,
+        allow_output_dir_change=args.rebuild_artifacts,
     )
 
     start_time = time.time()
-    results = extractor.run()
+    results = extractor.run(rebuild_artifacts=args.rebuild_artifacts)
     end_time = time.time()
 
     logger.info(f"Event extraction completed in {end_time - start_time:.2f} seconds")

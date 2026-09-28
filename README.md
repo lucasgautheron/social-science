@@ -99,6 +99,22 @@ openalex-aws artifacts
 openalex-aws download
 ```
 
+To upgrade a completed pre-refactor run without repeating its temporal
+counting pass, keep the original instance running and point the new command at
+its legacy checkpoint:
+
+```bash
+openalex-aws submit -- openalex events \
+  --checkpoint-path /mnt/aws-runner/repo/output/variations_checkpoint.pkl \
+  --output-dir output/events \
+  --rebuild-artifacts
+```
+
+This reuses the version-1 event counts and reruns only the corpus pass needed
+to produce co-occurrence plus exact paper/year incidence. If the instance was
+stopped and the excluded checkpoint was not separately downloaded, its local
+NVMe copy no longer exists and the counting pass cannot be recovered.
+
 Use `--no-database` before `--` for commands that need no corpus. The worker
 caches the S3 database under `/mnt/aws-runner` on the instance's fast local
 NVMe storage and validates the cached URI, size, ETag, and VersionId before
