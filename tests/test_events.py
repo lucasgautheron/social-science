@@ -90,6 +90,14 @@ def test_cooccurrence_counts_do_not_overflow_int8(monkeypatch):
     assert result["cooccurrence"][0, 1] == 256
 
 
+def test_article_chunks_cover_every_process():
+    assert events.article_chunk_size(100000, 2000, 64) == 781
+    assert len(events.chunk_articles([object()] * 100000, 781)) == 129
+    assert events.article_chunk_size(100000, 2000, 16) == 2000
+    with pytest.raises(ValueError, match="articles-per-chunk"):
+        events.article_chunk_size(10, 0, 1)
+
+
 def test_incidence_chunks_are_filtered_and_combined_per_batch(tmp_path):
     extractor = EventExtractor(
         f"sqlite:///{tmp_path / 'missing.db'}",

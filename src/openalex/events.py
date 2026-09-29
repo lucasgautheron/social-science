@@ -60,7 +60,15 @@ def build_arg_parser():
     parser.add_argument("--min-total-frequency", type=int, default=20, help="Minimum total frequency across all years.")
     parser.add_argument("--min-years-present", type=int, default=1, help="Minimum number of years an n-gram must appear in.")
     parser.add_argument("--n-processes", type=int, default=64, help="Worker processes to use.")
-    parser.add_argument("--articles-per-chunk", type=int, default=2000, help="Articles per worker chunk.")
+    parser.add_argument(
+        "--articles-per-chunk",
+        type=int,
+        default=2000,
+        help=(
+            "Maximum articles per worker chunk. Each batch is split further "
+            "until it has about two chunks per process."
+        ),
+    )
     parser.add_argument(
         "--checkpoint-path",
         default=None,
@@ -393,6 +401,22 @@ def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
         'years': np.asarray(years, dtype=np.int32),
         'processed_docs': len(texts),
     }
+
+
+def article_chunk_size(article_count: int, articles_per_chunk: int, n_processes: int) -> int:
+    """Return a chunk size that keeps every process busy.
+
+    ``articles_per_chunk`` remains the maximum. A batch is divided into about
+    two chunks per process so uneven documents do not leave workers idle.
+    """
+    if articles_per_chunk < 1:
+        raise ValueError("--articles-per-chunk must be >= 1")
+    if n_processes < 1:
+        raise ValueError("--n-processes must be >= 1")
+    if article_count < 1:
+        return articles_per_chunk
+    balanced = max(1, article_count // (n_processes * 2))
+    return min(articles_per_chunk, balanced)
 
 
 def chunk_articles(articles_data: List[Tuple], chunk_size: int) -> List[List[Tuple]]:
@@ -994,7 +1018,7 @@ class EventExtractor:
             return []
 
         # Split articles into chunks for parallel processing
-        chunks = chunk_articles(articles_data, self.articles_per_chunk)
+        chunks = chunk_articles(articles_data, article_chunk_size(len(articles_data), self.articles_per_chunk, self.n_processes))
 
         # Prepare arguments for worker processes
         chunk_args = [(chunk, self.ngram_range, self.ngram_blacklist) for chunk in chunks]
@@ -1015,7 +1039,7 @@ class EventExtractor:
         if not articles_data or not target_ngrams:
             return []
 
-        chunks = chunk_articles(articles_data, self.articles_per_chunk)
+        chunks = chunk_articles(articles_data, article_chunk_size(len(articles_data), self.articles_per_chunk, self.n_processes))
 
         logger.info(f"Mapping articles for {len(target_ngrams)} n-grams across "
                     f"{len(articles_data)} articles in {len(chunks)} chunks")
@@ -1036,7 +1060,7 @@ class EventExtractor:
         if not articles_data or not target_ngrams:
             return []
 
-        chunks = chunk_articles(articles_data, self.articles_per_chunk)
+        chunks = chunk_articles(articles_data, article_chunk_size(len(articles_data), self.articles_per_chunk, self.n_processes))
 
         logger.info(f"Building co-occurrence for {len(target_ngrams)} n-grams across "
                     f"{len(articles_data)} articles in {len(chunks)} chunks")
