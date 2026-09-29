@@ -322,21 +322,27 @@ def build_graph_payload(
     difference.eliminate_zeros()
     if difference.nnz:
         raise ValueError("Event co-occurrence matrix must be symmetric")
-    upper = sparse.triu(matrix, k=1, format="coo")
-    edge_order = np.lexsort((upper.col, upper.row, -upper.data))
+    processed = int(artifacts["manifest"].get("processed_papers") or 0)
+    positive_rows, positive_columns, positive_weights = _positive_npmi_edges(
+        matrix,
+        frequencies,
+        processed,
+    )
+    layout_matrix = _symmetric_edge_matrix(
+        len(keywords),
+        positive_rows,
+        positive_columns,
+        positive_weights,
+    )
+    coordinates = _spectral_layout(layout_matrix)
+
+    edge_order = np.lexsort(
+        (positive_columns, positive_rows, -positive_weights)
+    )
     edge_order = edge_order[:max_edges]
-    rows = upper.row[edge_order].astype(np.int32, copy=False)
-    columns = upper.col[edge_order].astype(np.int32, copy=False)
-    weights = upper.data[edge_order].astype(np.int64, copy=False)
-    retained = sparse.coo_matrix(
-        (
-            np.concatenate((weights, weights)),
-            (np.concatenate((rows, columns)), np.concatenate((columns, rows))),
-        ),
-        shape=matrix.shape,
-        dtype=np.int64,
-    ).tocsr()
-    coordinates = _spectral_layout(retained)
+    rows = positive_rows[edge_order]
+    columns = positive_columns[edge_order]
+    weights = positive_weights[edge_order]
 
     group_ids = sorted(set(int(group) for group in groups))
     group_to_position = {group: position for position, group in enumerate(group_ids)}
@@ -409,27 +415,46 @@ def build_graph_payload(
         ),
         shape=(len(groups), len(group_ids)),
     )
-    cluster_matrix = (membership.T @ retained @ membership).tocsr()
-    cluster_upper = sparse.triu(cluster_matrix, k=1, format="coo")
+    cluster_frequencies, cluster_matrix = _cluster_incidence_statistics(
+        artifacts,
+        event_indices,
+        membership,
+    )
+    cluster_rows, cluster_columns, cluster_weights = _positive_npmi_edges(
+        cluster_matrix,
+        cluster_frequencies,
+        processed,
+    )
+    positive_cluster_edge_count = len(cluster_weights)
+    cluster_order = np.lexsort(
+        (cluster_columns, cluster_rows, -cluster_weights)
+    )[:max_edges]
+    cluster_rows = cluster_rows[cluster_order]
+    cluster_columns = cluster_columns[cluster_order]
+    cluster_weights = cluster_weights[cluster_order]
+    for position, frequency in enumerate(cluster_frequencies):
+        cluster_nodes[position]["document_frequency"] = int(frequency)
     cluster_edges = [
         {
             "source": int(row),
             "target": int(column),
-            "weight": int(weight),
+            "weight": float(weight),
         }
         for row, column, weight in zip(
-            cluster_upper.row,
-            cluster_upper.col,
-            cluster_upper.data,
+            cluster_rows,
+            cluster_columns,
+            cluster_weights,
             strict=True,
         )
     ]
     keyword_edges = [
-        {"source": int(row), "target": int(column), "weight": int(weight)}
+        {"source": int(row), "target": int(column), "weight": float(weight)}
         for row, column, weight in zip(rows, columns, weights, strict=True)
     ]
     return {
         "level": int(clustered["level"]),
+        "edge_weight": "positive NPMI",
+        "layout_edges": "all positive-NPMI keyword edges before the display cap",
         "keyword": {"nodes": keyword_nodes, "edges": keyword_edges},
         "cluster": {"nodes": cluster_nodes, "edges": cluster_edges},
         "limits": {"keywords": int(max_keywords), "edges": int(max_edges)},
@@ -437,11 +462,104 @@ def build_graph_payload(
             "original_keywords": int(len(all_indices)),
             "displayed_keywords": int(len(keywords)),
             "original_edges": original_edges,
+            "positive_edges": int(len(positive_weights)),
             "displayed_edges": int(len(keyword_edges)),
             "displayed_clusters": int(len(cluster_nodes)),
+            "positive_cluster_edges": int(positive_cluster_edge_count),
             "displayed_cluster_edges": int(len(cluster_edges)),
         },
     }
+
+
+def _positive_npmi_edges(
+    matrix: sparse.csr_matrix,
+    frequencies: np.ndarray,
+    processed_papers: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return upper-triangle edges whose normalized PMI is strictly positive."""
+    if processed_papers < 1:
+        raise ValueError("processed_papers must be positive to compute NPMI")
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    if frequencies.shape != (matrix.shape[0],):
+        raise ValueError("Frequencies must align with the co-occurrence matrix")
+    if np.any(frequencies < 0) or np.any(frequencies > processed_papers):
+        raise ValueError("Document frequencies must be between zero and processed_papers")
+    upper = sparse.triu(matrix, k=1, format="coo")
+    counts = upper.data.astype(np.float64, copy=False)
+    if np.any(counts < 0) or np.any(counts > processed_papers):
+        raise ValueError("Co-occurrence counts must be between zero and processed_papers")
+    endpoint_limits = np.minimum(frequencies[upper.row], frequencies[upper.col])
+    if np.any(counts > endpoint_limits):
+        raise ValueError("Co-occurrence counts cannot exceed endpoint document frequencies")
+    if not len(counts):
+        return (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.float64),
+        )
+    joint = counts / float(processed_papers)
+    expected = (
+        frequencies[upper.row]
+        * frequencies[upper.col]
+        / float(processed_papers * processed_papers)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pmi = np.log(joint / expected)
+        denominator = -np.log(joint)
+        npmi = np.divide(
+            pmi,
+            denominator,
+            out=np.zeros_like(pmi),
+            where=denominator > 0,
+        )
+    npmi = np.clip(npmi, -1.0, 1.0)
+    keep = np.isfinite(npmi) & (npmi > 0)
+    return (
+        upper.row[keep].astype(np.int32, copy=False),
+        upper.col[keep].astype(np.int32, copy=False),
+        npmi[keep],
+    )
+
+
+def _symmetric_edge_matrix(
+    count: int,
+    rows: np.ndarray,
+    columns: np.ndarray,
+    weights: np.ndarray,
+) -> sparse.csr_matrix:
+    return sparse.coo_matrix(
+        (
+            np.concatenate((weights, weights)),
+            (np.concatenate((rows, columns)), np.concatenate((columns, rows))),
+        ),
+        shape=(count, count),
+        dtype=np.float64,
+    ).tocsr()
+
+
+def _cluster_incidence_statistics(
+    artifacts: dict[str, Any],
+    selected_indices: np.ndarray,
+    membership: sparse.csr_matrix,
+) -> tuple[np.ndarray, sparse.csr_matrix]:
+    """Return exact cluster document frequencies and paper co-occurrences."""
+    cluster_count = membership.shape[1]
+    frequencies = np.zeros(cluster_count, dtype=np.int64)
+    cooccurrence = sparse.csr_matrix((cluster_count, cluster_count), dtype=np.int64)
+    root = artifacts["root"]
+    manifest = artifacts["manifest"]
+    incidence_dir = root / manifest["incidence_dir"]
+    for relative in manifest.get("incidence_parts", []):
+        article_terms = sparse.load_npz(incidence_dir / relative).tocsr()
+        if article_terms.shape[1] != len(artifacts["vocabulary"]):
+            raise ValueError(f"Incidence width does not match the vocabulary for {relative}")
+        presence = (
+            article_terms[:, selected_indices].astype(np.int64) @ membership
+        ).tocsr()
+        presence.data[:] = 1
+        frequencies += np.asarray(presence.getnnz(axis=0), dtype=np.int64)
+        cooccurrence = (cooccurrence + presence.T @ presence).tocsr()
+    return frequencies, cooccurrence
 
 
 def _yearly_payload(

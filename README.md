@@ -94,15 +94,19 @@ frequency plus cluster membership. `graph.html` switches between the keyword
 co-occurrence network and its blockmodel clusters. Nodes share cluster colors
 and have area proportional to keyword document frequency (summed for cluster
 nodes). Cluster coordinates are the document-frequency-weighted barycenters of
-their displayed keywords.
+their displayed keywords. Graph edges use normalized pointwise mutual
+information (NPMI); zero and negative values are omitted. Cluster NPMI is
+computed from exact paper-level cluster incidence, counting a paper once even
+when it contains several keywords from the cluster.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,
 and cuts complete linkage at `--cluster-similarity 0.5`. If `H` is the cut
 membership matrix, it also exports `H.T @ M @ H` and verifies that the total
 count is preserved. The graph page keeps the 5,000 most frequent blockmodel
-keywords and their 10,000 strongest co-occurrence edges by default; use
-`--max-graph-keywords` and `--max-graph-edges` to change those limits.
+keywords by default. Spatialization uses every positive-NPMI edge among those
+keywords, while rendering is limited to the 10,000 strongest edges. Use
+`--max-graph-keywords` and `--max-graph-edges` to change the display limits.
 
 Omitting `--clusters-dir` still builds the site, but the graph page displays
 instructions instead of a network.

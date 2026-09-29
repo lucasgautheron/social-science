@@ -1051,29 +1051,43 @@ class EventExtractor:
 
         return chunk_results
 
-    def _write_incidence_part(
+    def _write_incidence_batch(
         self,
         batch_number: int,
-        chunk_number: int,
-        article_term,
-        years: np.ndarray,
-    ) -> None:
-        """Atomically persist one sparse paper-keyword chunk and its years."""
-        if article_term.shape[0] == 0:
-            return
+        chunk_results: Sequence[Dict],
+    ) -> int:
+        """Persist one filtered paper-keyword shard for a database batch."""
+        article_terms = []
+        years_by_chunk = []
+        for chunk_result in chunk_results:
+            article_term = chunk_result['article_term'].tocsr()
+            years = np.asarray(chunk_result['years'], dtype=np.int32)
+            if article_term.shape[0] != len(years):
+                raise ValueError("Incidence rows and years do not match")
+            keep = np.asarray(article_term.getnnz(axis=1)).ravel() > 0
+            if np.any(keep):
+                article_terms.append(article_term[keep])
+                years_by_chunk.append(years[keep])
+
+        if not article_terms:
+            return 0
+
+        article_term = sparse.vstack(article_terms, format="csr")
+        years = np.concatenate(years_by_chunk)
         incidence_dir = self.output_dir / "incidence"
         incidence_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"part_{batch_number:06d}_{chunk_number:03d}"
+        stem = f"part_{batch_number:06d}"
         matrix_path = incidence_dir / f"{stem}.npz"
         years_path = incidence_dir / f"{stem}_years.npy"
         matrix_tmp = incidence_dir / f".{stem}.npz.tmp"
         years_tmp = incidence_dir / f".{stem}_years.npy.tmp"
         with matrix_tmp.open("wb") as handle:
-            sparse.save_npz(handle, article_term.tocsr(), compressed=True)
+            sparse.save_npz(handle, article_term, compressed=True)
         with years_tmp.open("wb") as handle:
             np.save(handle, years, allow_pickle=False)
         matrix_tmp.replace(matrix_path)
         years_tmp.replace(years_path)
+        return article_term.shape[0]
 
     def build_cooccurrence_for_ngrams(self, target_ngrams: Set[str],
                                       resume_state: Optional[Dict] = None) -> int:
@@ -1130,7 +1144,7 @@ class EventExtractor:
             chunk_results = self.process_cooccurrence_parallel(articles_data, target_vocabulary)
             processed_docs = 0
             next_batch_number = batch_count + 1
-            for chunk_number, chunk_result in enumerate(chunk_results):
+            for chunk_result in chunk_results:
                 chunk_cooccurrence = chunk_result['cooccurrence']
                 if chunk_cooccurrence.nnz > 0:
                     if self.cooccurrence_matrix is None:
@@ -1140,18 +1154,14 @@ class EventExtractor:
 
                 self.cooccurrence_doc_frequency += chunk_result['doc_frequency']
                 processed_docs += chunk_result['processed_docs']
-                self._write_incidence_part(
-                    next_batch_number,
-                    chunk_number,
-                    chunk_result['article_term'],
-                    chunk_result['years'],
-                )
+            incidence_docs = self._write_incidence_batch(next_batch_number, chunk_results)
 
             total_seen += len(df)
             batch_count += 1
             nnz = self.cooccurrence_matrix.nnz if self.cooccurrence_matrix is not None else 0
             logger.info(f"Co-occurrence batch {batch_count}: {total_seen:,}/{total_records:,} records scanned, "
-                        f"{processed_docs:,} English docs, {nnz:,} nonzero pairs")
+                        f"{processed_docs:,} English docs, {incidence_docs:,} incidence docs, "
+                        f"{nnz:,} nonzero pairs")
 
             if batch_count % self.checkpoint_every_batches == 0:
                 self.save_checkpoint(

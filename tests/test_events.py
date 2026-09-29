@@ -1,7 +1,9 @@
 import hashlib
 import sqlite3
 
+import numpy as np
 import pytest
+from scipy import sparse
 
 from openalex import events
 from openalex.events import EventExtractor
@@ -86,3 +88,47 @@ def test_cooccurrence_counts_do_not_overflow_int8(monkeypatch):
     ]
     result = events.extract_cooccurrence_for_articles(articles)
     assert result["cooccurrence"][0, 1] == 256
+
+
+def test_incidence_chunks_are_filtered_and_combined_per_batch(tmp_path):
+    extractor = EventExtractor(
+        f"sqlite:///{tmp_path / 'missing.db'}",
+        output_dir=tmp_path / "events",
+        checkpoint_path=None,
+        n_processes=1,
+    )
+    chunk_results = [
+        {
+            "article_term": sparse.csr_matrix([[1, 0], [0, 0]], dtype=np.int8),
+            "years": np.array([2020, 2021], dtype=np.int32),
+        },
+        {
+            "article_term": sparse.csr_matrix([[0, 0], [0, 1]], dtype=np.int8),
+            "years": np.array([2022, 2023], dtype=np.int32),
+        },
+    ]
+
+    try:
+        assert extractor._write_incidence_batch(1, chunk_results) == 2
+        assert extractor._write_incidence_batch(
+            2,
+            [
+                {
+                    "article_term": sparse.csr_matrix((2, 2), dtype=np.int8),
+                    "years": np.array([2024, 2025], dtype=np.int32),
+                }
+            ],
+        ) == 0
+    finally:
+        extractor.engine.dispose()
+
+    incidence_dir = tmp_path / "events" / "incidence"
+    assert sorted(path.name for path in incidence_dir.iterdir()) == [
+        "part_000001.npz",
+        "part_000001_years.npy",
+    ]
+    assert sparse.load_npz(incidence_dir / "part_000001.npz").toarray().tolist() == [
+        [1, 0],
+        [0, 1],
+    ]
+    assert np.load(incidence_dir / "part_000001_years.npy").tolist() == [2020, 2023]

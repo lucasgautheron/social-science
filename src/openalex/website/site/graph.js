@@ -232,7 +232,7 @@
     frequency.className = "detail-stat";
     frequency.textContent = node.kind === "keyword"
       ? `${Number(node.papers).toLocaleString()} papers`
-      : `${Number(node.papers).toLocaleString()} summed keyword frequency`;
+      : `${Number(node.papers).toLocaleString()} summed keyword frequency · ${Number(node.document_frequency).toLocaleString()} distinct papers`;
     const chartTitle = document.createElement("h3");
     chartTitle.textContent = "Papers by year";
     const wordTitle = document.createElement("h3");
@@ -265,9 +265,9 @@
   function updateSummary() {
     const counts = state.graph.counts;
     if (state.mode === "keyword") {
-      summary.textContent = `${counts.displayed_keywords.toLocaleString()} of ${counts.original_keywords.toLocaleString()} keywords · ${counts.displayed_edges.toLocaleString()} of ${counts.original_edges.toLocaleString()} edges`;
+      summary.textContent = `${counts.displayed_keywords.toLocaleString()} of ${counts.original_keywords.toLocaleString()} keywords · ${counts.displayed_edges.toLocaleString()} of ${counts.positive_edges.toLocaleString()} positive-NPMI edges`;
     } else {
-      summary.textContent = `${counts.displayed_clusters.toLocaleString()} clusters · ${counts.displayed_cluster_edges.toLocaleString()} inter-cluster edges · hierarchy level ${state.graph.level}`;
+      summary.textContent = `${counts.displayed_clusters.toLocaleString()} clusters · ${counts.displayed_cluster_edges.toLocaleString()} of ${counts.positive_cluster_edges.toLocaleString()} positive-NPMI edges · hierarchy level ${state.graph.level}`;
     }
   }
 
