@@ -59,7 +59,7 @@ def build_arg_parser():
     parser.add_argument("--confidence-level", type=float, default=0.95, help="Confidence level for statistical tests.")
     parser.add_argument("--min-total-frequency", type=int, default=20, help="Minimum total frequency across all years.")
     parser.add_argument("--min-years-present", type=int, default=1, help="Minimum number of years an n-gram must appear in.")
-    parser.add_argument("--n-processes", type=int, default=16, help="Worker processes to use.")
+    parser.add_argument("--n-processes", type=int, default=64, help="Worker processes to use.")
     parser.add_argument("--articles-per-chunk", type=int, default=2000, help="Articles per worker chunk.")
     parser.add_argument(
         "--checkpoint-path",
