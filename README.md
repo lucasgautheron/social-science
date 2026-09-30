@@ -208,6 +208,7 @@ Publish a fresh orphan `gh-pages` commit with:
 
 ```bash
 OPENALEX_CLUSTERS_DIR=output/event_clusters \
+OPENALEX_NEW_LINK_VISUALIZATIONS_DIR=output/new_link_visualizations \
 OPENALEX_DB_PATH=/path/to/articles.db \
   scripts/deploy-gh-pages.sh output/events
 ```

@@ -42,6 +42,15 @@ if [[ -n "${OPENALEX_DB_PATH:-}" ]]; then
   fi
   BUILD_ARGS+=(--db-path "$OPENALEX_DB_PATH")
 fi
+if [[ -n "${OPENALEX_NEW_LINK_VISUALIZATIONS_DIR:-}" ]]; then
+  if [[ ! -f "$OPENALEX_NEW_LINK_VISUALIZATIONS_DIR/cluster_link_distance_summary.csv" ]]; then
+    echo "New-link summary not found: $OPENALEX_NEW_LINK_VISUALIZATIONS_DIR/cluster_link_distance_summary.csv" >&2
+    exit 2
+  fi
+  BUILD_ARGS+=(
+    --new-link-visualizations-dir "$OPENALEX_NEW_LINK_VISUALIZATIONS_DIR"
+  )
+fi
 
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   "${PYTHON:-python}" -m openalex.website.build \

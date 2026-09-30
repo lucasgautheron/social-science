@@ -26,6 +26,7 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     remote = tmp_path / "remote.git"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
+    visualizations = tmp_path / "new_link_visualizations"
     fake_python = tmp_path / "python"
     git(tmp_path, "init", "--bare", str(remote))
     git(tmp_path, "init", "--initial-branch=main", str(root))
@@ -39,6 +40,11 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     (events / "manifest.json").write_text("{}\n", encoding="utf-8")
     clusters.mkdir()
     (clusters / "manifest.json").write_text("{}\n", encoding="utf-8")
+    visualizations.mkdir()
+    (visualizations / "cluster_link_distance_summary.csv").write_text(
+        "cluster_id\n",
+        encoding="utf-8",
+    )
     database = tmp_path / "articles.db"
     database.write_text("", encoding="utf-8")
     fake_python.write_text(
@@ -67,6 +73,7 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
             "BUILD_ARGS_PATH": str(tmp_path / "build-args"),
             "OPENALEX_CLUSTERS_DIR": str(clusters),
             "OPENALEX_DB_PATH": str(database),
+            "OPENALEX_NEW_LINK_VISUALIZATIONS_DIR": str(visualizations),
             "GIT_AUTHOR_NAME": "Test",
             "GIT_AUTHOR_EMAIL": "test@example.com",
             "GIT_COMMITTER_NAME": "Test",
@@ -82,3 +89,7 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
     arguments = (tmp_path / "build-args").read_text(encoding="utf-8").splitlines()
     assert arguments[arguments.index("--clusters-dir") + 1] == str(clusters)
     assert arguments[arguments.index("--db-path") + 1] == str(database)
+    assert (
+        arguments[arguments.index("--new-link-visualizations-dir") + 1]
+        == str(visualizations)
+    )
