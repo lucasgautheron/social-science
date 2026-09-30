@@ -26,6 +26,7 @@ class FakeS3:
     def __init__(self, objects):
         self.objects = objects
         self.downloads = []
+        self.uploads = []
 
     def get_paginator(self, name):
         if name != "list_objects_v2":
@@ -35,6 +36,18 @@ class FakeS3:
     def download_file(self, bucket, key, filename):
         self.downloads.append((bucket, key, filename))
         Path(filename).write_text(key, encoding="utf-8")
+
+    def head_object(self, Bucket, Key):
+        del Bucket
+        if Key not in self.objects:
+            error = RuntimeError("not found")
+            error.response = {"Error": {"Code": "404"}}
+            raise error
+        return {"ContentLength": self.objects[Key]}
+
+    def upload_file(self, filename, bucket, key):
+        self.uploads.append((filename, bucket, key))
+        self.objects[key] = Path(filename).stat().st_size
 
 
 class FakeSSM:
@@ -113,6 +126,57 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             aws_run.safe_artifact_destination(root, "../secrets")
 
+    def test_publish_input_artifact_is_content_addressed_and_manifest_last(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "output" / "events"
+            artifact.mkdir(parents=True)
+            (artifact / "data.npy").write_bytes(b"data")
+            (artifact / "manifest.json").write_text('{"version": 1}\n', encoding="utf-8")
+            s3 = FakeS3({})
+
+            published = aws_run.publish_input_artifacts(
+                s3,
+                self.state,
+                ["output/events"],
+                base_dir=root,
+            )
+
+            digest = published[0]["manifest_sha256"]
+            prefix = f"project/artifacts/{digest}"
+            self.assertEqual(published[0]["path"], "output/events")
+            self.assertEqual(published[0]["s3_uri"], f"s3://bucket/{prefix}/")
+            self.assertEqual(
+                [key for _, _, key in s3.uploads],
+                [f"{prefix}/data.npy", f"{prefix}/manifest.json"],
+            )
+
+            upload_count = len(s3.uploads)
+            repeated = aws_run.publish_input_artifacts(
+                s3,
+                self.state,
+                ["output/events"],
+                base_dir=root,
+            )
+            self.assertEqual(repeated, published)
+            self.assertEqual(len(s3.uploads), upload_count)
+
+    def test_publish_input_artifact_validates_paths_and_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "missing-manifest").mkdir()
+            s3 = FakeS3({})
+
+            for value in ("/absolute", "../traversal", ".", "output"):
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    aws_run.publish_input_artifacts(
+                        s3, self.state, [value], base_dir=root
+                    )
+            with self.assertRaisesRegex(SystemExit, "manifest.json"):
+                aws_run.publish_input_artifacts(
+                    s3, self.state, ["missing-manifest"], base_dir=root
+                )
+
     def test_refresh_script_collects_current_and_legacy_outputs(self):
         script = aws_run.build_artifact_refresh_script(
             self.state,
@@ -134,11 +198,34 @@ class ArtifactTests(unittest.TestCase):
         )
         self.assertNotIn("--exclude events_checkpoint.pkl", script_with_checkpoint)
 
+        script_with_input = aws_run.build_artifact_refresh_script(
+            self.state,
+            {
+                "scratch_dir": "/scratch",
+                "inputs": [{"path": "output/events"}],
+            },
+            self.run_id,
+        )
+        self.assertIn("--exclude events", script_with_input)
+        self.assertIn("--exclude 'events/*'", script_with_input)
+
     def test_submit_command_is_argument_safe(self):
         args = aws_run.build_parser().parse_args(
-            ["submit", "--", "openalex", "events", "--min-ngram", "2"]
+            [
+                "submit",
+                "--input",
+                "output/events",
+                "--input",
+                "output/event_clusters",
+                "--",
+                "openalex",
+                "events",
+                "--min-ngram",
+                "2",
+            ]
         )
         self.assertEqual(args.scratch_dir, "/mnt/aws-runner")
+        self.assertEqual(args.input, ["output/events", "output/event_clusters"])
         self.assertEqual(
             aws_run.pipeline_command(args),
             "openalex events --min-ngram 2",
@@ -148,6 +235,13 @@ class ArtifactTests(unittest.TestCase):
         args = aws_run.build_parser().parse_args(
             ["submit", "--", "openalex", "events"]
         )
+        args.prepared_inputs = [
+            {
+                "path": "output/events",
+                "manifest_sha256": "abc123",
+                "s3_uri": "s3://bucket/project/artifacts/abc123/",
+            }
+        ]
         state = {
             **self.state,
             "repo_url": "https://example.test/repo.git",
@@ -179,6 +273,27 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("aws sns publish", script)
         self.assertIn('notify_terminal_status "$terminal_status"', script)
         self.assertIn('trap on_error ERR', script)
+        self.assertIn('cache_root="${SCRATCH_DIR}/cache/artifacts/${expected_digest}"', script)
+        self.assertIn(
+            "stage_input output/events abc123 s3://bucket/project/artifacts/abc123/",
+            script,
+        )
+        self.assertIn('cp -a --reflink=auto "${cache_root}/." "$destination/"', script)
+        self.assertIn("--exclude events --exclude 'events/*'", script)
+        self.assertLess(
+            script.index('CURRENT_STEP="staging input artifacts"'),
+            script.index('bash -lc "$PIPELINE_COMMAND"'),
+        )
+
+        status = aws_run.initial_status(
+            state,
+            args,
+            self.run_id,
+            aws_run.pipeline_command(args),
+            "submitted",
+            "Submitted remote command",
+        )
+        self.assertEqual(status["inputs"], args.prepared_inputs)
 
     def test_launcher_mounts_instance_store_before_creating_run_directory(self):
         args = aws_run.build_parser().parse_args(
@@ -292,7 +407,7 @@ class ArtifactTests(unittest.TestCase):
         fake_s3 = FakeS3({})
         parser = aws_run.build_parser()
         with tempfile.TemporaryDirectory() as temp_dir:
-            args = parser.parse_args(["download", "--output-dir", temp_dir])
+            args = parser.parse_args(["download", "--output-dir", temp_dir, "--yes"])
             context = (self.state, fake_s3, self.run_id, {"status": "success"}, [artifact])
             with mock.patch.object(aws_run, "artifact_command_context", return_value=context):
                 result = aws_run.command_download(args)
@@ -300,12 +415,56 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((Path(temp_dir) / "nested/results.csv").is_file())
 
+    def test_download_defaults_to_output_and_confirms_existing_directory(self):
+        artifact = {
+            "key": "project/runs/run-1/output/events/manifest.json",
+            "relative_path": "events/manifest.json",
+            "size": 5,
+        }
+        fake_s3 = FakeS3({})
+        context = (self.state, fake_s3, self.run_id, {"status": "success"}, [artifact])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "output"
+            destination.mkdir()
+            args = aws_run.build_parser().parse_args(["download"])
+            with (
+                mock.patch.object(aws_run, "DEFAULT_DOWNLOAD_ROOT", str(destination)),
+                mock.patch.object(aws_run, "artifact_command_context", return_value=context),
+                mock.patch("builtins.input", return_value=""),
+            ):
+                result = aws_run.command_download(args)
+
+            self.assertEqual(result, 0)
+            self.assertTrue((destination / "events" / "manifest.json").is_file())
+
+    def test_download_decline_leaves_existing_directory_unchanged(self):
+        artifact = {
+            "key": "project/runs/run-1/output/results.csv",
+            "relative_path": "results.csv",
+            "size": 5,
+        }
+        fake_s3 = FakeS3({})
+        context = (self.state, fake_s3, self.run_id, {"status": "success"}, [artifact])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = aws_run.build_parser().parse_args(
+                ["download", "--output-dir", temp_dir]
+            )
+            with (
+                mock.patch.object(aws_run, "artifact_command_context", return_value=context),
+                mock.patch("builtins.input", return_value="n"),
+            ):
+                result = aws_run.command_download(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(fake_s3.downloads, [])
+
     def test_artifact_cli_defaults(self):
         args = aws_run.build_parser().parse_args(["download"])
 
         self.assertFalse(args.refresh)
         self.assertFalse(args.include_checkpoint)
         self.assertIsNone(args.output_dir)
+        self.assertFalse(args.yes)
         self.assertEqual(
             args.refresh_timeout_seconds,
             aws_run.DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS,

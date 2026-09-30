@@ -220,6 +220,32 @@ openalex-aws artifacts
 openalex-aws download
 ```
 
+`download` writes artifacts into the local `output/` directory by default,
+preserving their paths. It asks for confirmation when the destination already
+exists; pass `--yes` to confirm non-interactively or `--output-dir` to choose a
+different destination.
+
+Stage local artifact directories from the submitting machine with repeatable
+`--input` options. Each directory must contain `manifest.json`; it is
+content-addressed in S3, cached on the worker's NVMe storage, and exposed at
+the same relative path inside the isolated run:
+
+```bash
+openalex-aws submit \
+  --input output/events \
+  --input output/event_clusters \
+  -- openalex new-links \
+  --events-dir output/events \
+  --clusters-dir output/event_clusters
+```
+
+The first submission publishes and downloads each artifact. Later submissions
+with the same manifests reuse both the S3 objects and the worker cache without
+transferring their contents again. The cache is repopulated from S3 after the
+instance is stopped or terminated. Staged paths beneath `output/` are excluded
+when run results are synchronized, so inputs are not copied into every run's
+output prefix.
+
 `status` reads the durable run state from S3. Add `--live` to query the worker
 directly through SSM and display the process state, fast-storage usage, database
 cache, and recent launcher/stdout/stderr lines:

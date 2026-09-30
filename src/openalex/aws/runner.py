@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import subprocess
@@ -23,8 +24,9 @@ DEFAULT_SSM_READY_TIMEOUT_SECONDS = 600
 DEFAULT_ARTIFACT_REFRESH_TIMEOUT_SECONDS = 600
 DEFAULT_LIVE_STATUS_TIMEOUT_SECONDS = 60
 DEFAULT_LIVE_LOG_BYTES = 5_000
-DEFAULT_DOWNLOAD_ROOT = "downloads"
+DEFAULT_DOWNLOAD_ROOT = "output"
 CHECKPOINT_FILENAME = "events_checkpoint.pkl"
+INPUT_ARTIFACTS_DIR = "artifacts"
 
 
 def utc_now() -> str:
@@ -105,6 +107,106 @@ def load_state(path: str) -> Dict[str, Any]:
 
 def run_prefix(state: Dict[str, Any], run_id: str) -> str:
     return prefixed_key(state["prefix"], f"runs/{run_id}")
+
+
+def _safe_input_path(value: str) -> PurePosixPath:
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise SystemExit(
+            f"Input path must be a non-empty relative path without '.' or '..': {value!r}"
+        )
+    return path
+
+
+def _s3_object_exists(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        if client_error_code(exc) in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
+
+
+def publish_input_artifacts(
+    s3,
+    state: Dict[str, Any],
+    input_paths: List[str],
+    *,
+    base_dir: Optional[Path] = None,
+) -> List[Dict[str, str]]:
+    """Publish complete local artifact directories under immutable manifest digests."""
+    root = (base_dir or Path.cwd()).resolve()
+    bucket = state["bucket"]
+    artifacts: List[Dict[str, str]] = []
+    seen_destinations: List[PurePosixPath] = []
+    for value in input_paths:
+        relative = _safe_input_path(value)
+        destination = relative.as_posix()
+        if relative == PurePosixPath("output"):
+            raise SystemExit("The whole output directory cannot be staged as an input")
+        if any(
+            relative == prior
+            or relative.is_relative_to(prior)
+            or prior.is_relative_to(relative)
+            for prior in seen_destinations
+        ):
+            raise SystemExit(f"Input paths overlap at {destination!r}")
+        seen_destinations.append(relative)
+        source = root.joinpath(*relative.parts)
+        manifest = source / "manifest.json"
+        if not source.is_dir() or not manifest.is_file():
+            raise SystemExit(
+                f"Input artifact {destination!r} must be a directory containing manifest.json"
+            )
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        artifact_prefix = prefixed_key(
+            state["prefix"], f"{INPUT_ARTIFACTS_DIR}/{digest}"
+        )
+        manifest_key = f"{artifact_prefix}/manifest.json"
+        if not _s3_object_exists(s3, bucket, manifest_key):
+            files = sorted(
+                (
+                    path
+                    for path in source.rglob("*")
+                    if path.is_file() and path != manifest
+                ),
+                key=lambda path: path.relative_to(source).as_posix(),
+            )
+            print(
+                f"Publishing input {destination} to "
+                f"{s3_uri(bucket, artifact_prefix)}/ ..."
+            )
+            for path in files:
+                relative_file = path.relative_to(source).as_posix()
+                s3.upload_file(
+                    str(path),
+                    bucket,
+                    f"{artifact_prefix}/{relative_file}",
+                )
+            s3.upload_file(str(manifest), bucket, manifest_key)
+        else:
+            print(f"Reusing published input {destination} ({digest[:12]}).")
+        artifacts.append(
+            {
+                "path": destination,
+                "manifest_sha256": digest,
+                "s3_uri": f"{s3_uri(bucket, artifact_prefix)}/",
+            }
+        )
+    return artifacts
+
+
+def input_output_exclude_options(inputs: List[Dict[str, str]]) -> str:
+    """Return aws s3 sync exclusions for staged inputs beneath output/."""
+    options = []
+    for artifact in inputs:
+        path = PurePosixPath(artifact["path"])
+        if path.parts[0] != "output":
+            continue
+        relative = PurePosixPath(*path.parts[1:]).as_posix()
+        options.extend(("--exclude", relative, "--exclude", f"{relative}/*"))
+    return "".join(f" {q(value)}" for value in options)
 
 
 def put_s3_json(s3, bucket: str, key: str, data: Dict[str, Any]) -> None:
@@ -253,6 +355,7 @@ def build_artifact_refresh_script(
     run_dir = f"{scratch_dir}/runs/{run_id}/work"
     destination = s3_uri(state["bucket"], artifact_output_prefix(state, run_id))
     checkpoint_option = "" if include_checkpoint else f" --exclude {q(CHECKPOINT_FILENAME)}"
+    input_options = input_output_exclude_options(status.get("inputs", []))
     compiled_db = f"{scratch_dir}/compiled_articles.db"
 
     return f"""set -Eeuo pipefail
@@ -260,7 +363,7 @@ RUN_DIR={q(run_dir)}
 DESTINATION={q(destination)}
 COMPILED_DB={q(compiled_db)}
 if [ -d "$RUN_DIR/output" ]; then
-  aws s3 sync --no-progress "$RUN_DIR/output" "$DESTINATION"{checkpoint_option}
+  aws s3 sync --no-progress "$RUN_DIR/output" "$DESTINATION"{checkpoint_option}{input_options}
 fi
 if [ -f "$COMPILED_DB" ]; then
   aws s3 cp --no-progress "$COMPILED_DB" "${{DESTINATION}}compiled_articles.db"
@@ -531,6 +634,13 @@ def build_remote_runner_script(
         (value for value in args.remote_command if value != "--"),
         "command",
     )
+    inputs = list(getattr(args, "prepared_inputs", []))
+    inputs_json = json.dumps(inputs, separators=(",", ":"), sort_keys=True)
+    output_input_options = input_output_exclude_options(inputs)
+    stage_input_commands = "\n".join(
+        f"  stage_input {q(item['path'])} {q(item['manifest_sha256'])} {q(item['s3_uri'])}"
+        for item in inputs
+    )
 
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
@@ -555,8 +665,9 @@ STATUS_INTERVAL_SECONDS={q(args.status_interval_seconds)}
 PIPELINE_COMMAND={q(command)}
 INSTALL_DEPS={q("1" if not args.skip_dependency_install else "0")}
 FORCE_DB_DOWNLOAD={q("1" if args.force_db_download else "0")}
+INPUT_ARTIFACTS_JSON={q(inputs_json)}
 INSTANCE_ID="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
-export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND
+export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND INPUT_ARTIFACTS_JSON
 
 WORK_DIR="${{SCRATCH_DIR}}/runs/${{RUN_ID}}"
 RUN_DIR="${{WORK_DIR}}/work"
@@ -614,6 +725,9 @@ if os.path.exists(path):
         prior = {{}}
 payload["started_at"] = prior.get("started_at", payload["updated_at"])
 payload["command"] = prior.get("command", os.environ.get("PIPELINE_COMMAND", ""))
+payload["inputs"] = prior.get(
+    "inputs", json.loads(os.environ.get("INPUT_ARTIFACTS_JSON", "[]"))
+)
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)
     handle.write("\\n")
@@ -629,7 +743,7 @@ sync_artifacts() {{
 
 sync_output() {{
   if [ -d "${{RUN_DIR}}/output" ]; then
-    aws s3 sync "${{RUN_DIR}}/output" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/" >/dev/null 2>&1 || true
+    aws s3 sync "${{RUN_DIR}}/output" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/"{output_input_options} >/dev/null 2>&1 || true
   fi
 }}
 
@@ -837,6 +951,59 @@ PY
   ln -sf "$target" "${{RUN_DIR}}/articles.db"
 }}
 
+manifest_sha256() {{
+  python3 - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}}
+
+stage_input() {{
+  local relative_path="$1"
+  local expected_digest="$2"
+  local source_uri="$3"
+  local cache_root="${{SCRATCH_DIR}}/cache/artifacts/${{expected_digest}}"
+  local temporary="${{cache_root}}.tmp-${{RUN_ID}}"
+  local destination="${{RUN_DIR}}/${{relative_path}}"
+  local actual_digest=""
+
+  if [ -f "${{cache_root}}/manifest.json" ]; then
+    actual_digest="$(manifest_sha256 "${{cache_root}}/manifest.json")"
+    if [ "$actual_digest" != "$expected_digest" ]; then
+      rm -rf "$cache_root"
+    fi
+  fi
+  if [ ! -f "${{cache_root}}/manifest.json" ]; then
+    echo "Caching input $relative_path from $source_uri" >>"$LAUNCHER_LOG"
+    rm -rf "$temporary"
+    mkdir -p "$temporary" "$(dirname "$cache_root")"
+    aws s3 sync --no-progress "$source_uri" "$temporary" >>"$LAUNCHER_LOG" 2>&1
+    if [ ! -f "${{temporary}}/manifest.json" ]; then
+      echo "Input $relative_path has no downloaded manifest.json" >>"$LAUNCHER_LOG"
+      return 1
+    fi
+    actual_digest="$(manifest_sha256 "${{temporary}}/manifest.json")"
+    if [ "$actual_digest" != "$expected_digest" ]; then
+      echo "Input $relative_path manifest digest changed during download" >>"$LAUNCHER_LOG"
+      return 1
+    fi
+    rm -rf "$cache_root"
+    mv "$temporary" "$cache_root"
+  else
+    echo "Reusing cached input $relative_path at $cache_root" >>"$LAUNCHER_LOG"
+  fi
+
+  rm -rf "$destination"
+  mkdir -p "$destination"
+  cp -a --reflink=auto "${{cache_root}}/." "$destination/"
+}}
+
+stage_inputs() {{
+{stage_input_commands or "  :"}
+}}
+
 CHILD_PID=""
 CURRENT_STEP="initializing runner"
 on_term() {{
@@ -897,6 +1064,14 @@ on_error() {{
     write_status "running" "Downloading SQLite database"
     sync_artifacts
     download_db
+    sync_artifacts
+  fi
+
+  if [ "$INPUT_ARTIFACTS_JSON" != "[]" ]; then
+    CURRENT_STEP="staging input artifacts"
+    write_status "running" "Staging input artifacts"
+    sync_artifacts
+    stage_inputs
     sync_artifacts
   fi
 
@@ -1088,6 +1263,7 @@ def initial_status(
         "branch": args.branch,
         "commit": args.commit,
         "scratch_dir": args.scratch_dir,
+        "inputs": list(getattr(args, "prepared_inputs", [])),
         "s3_status_uri": s3_uri(state["bucket"], f"{prefix}/status.json"),
         "s3_stdout_uri": s3_uri(state["bucket"], f"{prefix}/stdout.log"),
         "s3_stderr_uri": s3_uri(state["bucket"], f"{prefix}/stderr.log"),
@@ -1104,6 +1280,11 @@ def command_submit(args: argparse.Namespace) -> int:
     command = pipeline_command(args)
     bucket = state["bucket"]
     prefix = run_prefix(state, run_id)
+    args.prepared_inputs = publish_input_artifacts(
+        s3,
+        state,
+        args.input,
+    )
 
     if not args.no_start:
         ensure_instance_running(
@@ -1154,6 +1335,11 @@ def print_status(status: Dict[str, Any]) -> None:
         print(f"stderr: {status.get('s3_stderr_uri')}")
     if status.get("s3_output_prefix"):
         print(f"output: {status.get('s3_output_prefix')}")
+    for artifact in status.get("inputs", []):
+        print(
+            f"input: {artifact.get('path')} <- {artifact.get('s3_uri')} "
+            f"({str(artifact.get('manifest_sha256', ''))[:12]})"
+        )
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -1278,7 +1464,23 @@ def command_download(args: argparse.Namespace) -> int:
             "No downloadable artifacts found. If the worker still has the files, retry with --refresh."
         )
 
-    destination = Path(args.output_dir) if args.output_dir else Path(DEFAULT_DOWNLOAD_ROOT) / run_id
+    destination = Path(args.output_dir) if args.output_dir else Path(DEFAULT_DOWNLOAD_ROOT)
+    if destination.exists() and not destination.is_dir():
+        raise SystemExit(f"Download destination exists and is not a directory: {destination}")
+    if destination.exists() and not args.yes:
+        try:
+            answer = input(
+                f"Download into existing directory {destination}? "
+                "Existing files may be overwritten. [Y/n] "
+            ).strip().lower()
+        except EOFError as exc:
+            raise SystemExit(
+                f"Confirmation required for existing directory {destination}; "
+                "rerun with --yes to proceed non-interactively."
+            ) from exc
+        if answer not in {"", "y", "yes"}:
+            print("Download cancelled.")
+            return 0
     destination.mkdir(parents=True, exist_ok=True)
     total_size = 0
     print(
@@ -1384,6 +1586,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("--force-db-download", action="store_true", help="Redownload the SQLite DB even if a complete local copy exists.")
     submit.add_argument("--snapshot-s3-uri", default=None, help="S3 URI for an OpenAlex snapshot, used by compile-from-snapshot.")
+    submit.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        metavar="RELATIVE_DIR",
+        help=(
+            "Publish and stage a local manifest artifact at the same relative path. "
+            "Repeat for multiple inputs."
+        ),
+    )
     submit.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="Remote local scratch directory.")
     submit.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor.")
     submit.add_argument("--ssh-user", default="ec2-user", help="SSH user for --executor ssh.")
@@ -1443,7 +1655,13 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument(
         "--output-dir",
         default=None,
-        help=f"Local destination. Defaults to {DEFAULT_DOWNLOAD_ROOT}/<run-id>.",
+        help=f"Local destination. Defaults to {DEFAULT_DOWNLOAD_ROOT}/.",
+    )
+    download.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Download into an existing destination without prompting.",
     )
     download.set_defaults(func=command_download)
 
