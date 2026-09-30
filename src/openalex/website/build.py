@@ -99,6 +99,18 @@ def l2_normalize_cooccurrence(matrix):
     return filtered.multiply(1.0 / norms[:, None]).tocsr()
 
 
+def cosine_complete_linkage(matrix) -> np.ndarray:
+    """Complete linkage on cosine distance of L2-normalized co-occurrence rows."""
+    count = matrix.shape[0]
+    if count <= 1:
+        return np.empty((0, 4), dtype=float)
+    normalized = l2_normalize_cooccurrence(matrix)
+    similarities = (normalized @ normalized.T).toarray()
+    distances = np.clip(1.0 - similarities, 0.0, 2.0)
+    np.fill_diagonal(distances, 0.0)
+    return linkage(squareform(distances, checks=False), method="complete")
+
+
 def cluster_keywords(
     matrix,
     selected_indices: np.ndarray,
@@ -121,14 +133,7 @@ def cluster_keywords(
         linkage_matrix = np.empty((0, 4), dtype=float)
         labels = np.array([1], dtype=np.int32)
     else:
-        normalized = l2_normalize_cooccurrence(filtered)
-        similarities = (normalized @ normalized.T).toarray()
-        distances = np.clip(1.0 - similarities, 0.0, 2.0)
-        np.fill_diagonal(distances, 0.0)
-        linkage_matrix = linkage(
-            squareform(distances, checks=False),
-            method="complete",
-        )
+        linkage_matrix = cosine_complete_linkage(filtered)
         labels = fcluster(
             linkage_matrix,
             t=1.0 - cluster_similarity,
@@ -284,7 +289,7 @@ def load_cluster_artifacts(
     clusters_dir: str | Path,
     event_artifacts: dict[str, Any],
 ) -> dict[str, Any]:
-    """Load blockmodel output and align its keywords to the event vocabulary."""
+    """Load cluster output and align its keywords to the event vocabulary."""
     root = Path(clusters_dir).expanduser().resolve()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     keywords = np.load(root / manifest["keywords"], allow_pickle=False).astype(str)
@@ -371,7 +376,7 @@ def build_graph_payload(
     allowed: set[str] | None = None,
     papers_by_year: Mapping[int, int] | None = None,
 ) -> dict[str, Any]:
-    """Build keyword and cluster graph views from blockmodel artifacts."""
+    """Build keyword and cluster graph views from cluster artifacts."""
     if max_keywords < 1:
         raise ValueError("max_keywords must be positive")
     if max_edges < 1:
@@ -872,7 +877,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--clusters-dir",
         type=Path,
         default=None,
-        help="Optional blockmodel output used by graph.html.",
+        help="Optional cluster-events output used by graph.html.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
     parser.add_argument(

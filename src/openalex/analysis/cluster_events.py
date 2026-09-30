@@ -1,16 +1,12 @@
-"""Cluster event keywords with a degree-corrected assortative block model.
+"""Cluster event keywords with the keyword dendrogram.
 
-The co-occurrence matrix is an undirected multigraph: each keyword is a node
-and each off-diagonal count is the number of papers in which two keywords
-appear together. Self-counts stay off the graph because they record document
-frequency, not a pair of distinct keywords. The assortative model is
-graph-tool's degree-corrected planted partition model: groups are denser
-inside than between them, and the number of groups is chosen by minimizing
-description length.
+Complete linkage uses cosine distance between L2-normalized co-occurrence
+rows, the same similarity the website dendrogram uses. The cosine similarity
+threshold is the coarsest cut that still reaches a target number of clusters.
 
-The fitted partition is the grouping used for the coarsened matrix
-``H.T @ M @ H``. Yearly cluster counts read the Boolean paper-keyword
-incidence and count each paper once per cluster.
+The partition is the grouping used for the coarsened matrix ``H.T @ M @ H``.
+Yearly cluster counts read the Boolean paper-keyword incidence and count each
+paper once per cluster.
 """
 
 from __future__ import annotations
@@ -21,33 +17,40 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from scipy import sparse
+from scipy.cluster.hierarchy import fcluster
 
 from openalex.analysis.filter_events import find_filtered_events, genuine_ngrams
-from openalex.website.build import load_event_artifacts
+from openalex.website.build import cosine_complete_linkage, load_event_artifacts
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_RESTARTS = 3
-DEFAULT_SEED = 0
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 1
-METHOD = "degree-corrected-assortative-sbm"
+DEFAULT_N_CLUSTERS = 20
+DENDROGRAM_METHOD = "complete-linkage-cosine"
 
 
 @dataclass(frozen=True)
-class BlockmodelFit:
-    """Hierarchy of block assignments and its description length in nats."""
+class CosineCut:
+    """Complete-linkage cosine cut and the flat cluster count it produces."""
+
+    similarity: float
+    distance: float
+    clusters: int
+
+
+@dataclass(frozen=True)
+class DendrogramFit:
+    """Flat keyword partition from the complete-linkage cosine cut."""
 
     levels: tuple[np.ndarray, ...]
-    description_length: float
-
-
-FitFunction = Callable[..., BlockmodelFit]
+    cluster_similarity: float
+    target_clusters: int
 
 
 def cooccurrence_adjacency(matrix, selected: np.ndarray) -> sparse.csr_matrix:
@@ -71,15 +74,13 @@ def cooccurrence_adjacency(matrix, selected: np.ndarray) -> sparse.csr_matrix:
         raise ValueError("Co-occurrence matrix must be symmetric")
     block.setdiag(0)
     block.eliminate_zeros()
-    if block.nnz == 0:
-        raise ValueError("Selected keywords have no co-occurrences")
     return block
 
 
 def project_level(levels: Sequence[np.ndarray], level: int) -> np.ndarray:
-    """Project a nested block hierarchy onto the original keywords."""
+    """Project one hierarchy level onto the original keywords."""
     if not levels:
-        raise ValueError("Blockmodel hierarchy is empty")
+        raise ValueError("Cluster hierarchy is empty")
     if level < 0 or level >= len(levels):
         raise ValueError(f"Hierarchy level {level} is outside 0..{len(levels) - 1}")
     labels = np.asarray(levels[0], dtype=np.int64).copy()
@@ -127,50 +128,90 @@ def coarsen(adjacency: sparse.csr_matrix, groups: np.ndarray) -> sparse.csr_matr
     return coarse
 
 
-def fit_assortative(
-    adjacency: sparse.csr_matrix,
-    *,
-    restarts: int,
-    seed: int,
-) -> BlockmodelFit:
-    """Fit a degree-corrected assortative SBM and keep the shortest description.
+def cut_for_cluster_count(linkage_matrix: np.ndarray, target_clusters: int) -> CosineCut:
+    """Return the coarsest complete-linkage cut that still meets `target_clusters`.
 
-    The state is graph-tool's planted partition model (``PPBlockState``). Edge
-    weights are co-occurrence multiplicities, and degree correction stays on.
+    The similarity is the height of the last merge in that partition, so every
+    kept join has cosine similarity at least this value. Equal merge heights
+    skip some counts; the cut then uses the next finer partition. A target
+    above the number of separated keywords uses the finest partition.
     """
-    if restarts < 1:
-        raise ValueError("--restarts must be >= 1")
-    graph_tool, inference = _import_graph_tool()
-    graph_tool.seed_rng(int(seed))
-    upper = sparse.triu(adjacency, k=1, format="coo")
-    graph = graph_tool.Graph(directed=False)
-    graph.add_vertex(adjacency.shape[0])
-    weights = graph.new_edge_property("int64_t")
-    edges = np.column_stack(
-        (
-            upper.row.astype(np.int64, copy=False),
-            upper.col.astype(np.int64, copy=False),
-            upper.data.astype(np.int64, copy=False),
+    if target_clusters < 1:
+        raise ValueError("--n-clusters must be >= 1")
+    linkage_matrix = np.asarray(linkage_matrix, dtype=np.float64)
+    if linkage_matrix.size == 0:
+        chosen = CosineCut(similarity=1.0, distance=0.0, clusters=1)
+    else:
+        if linkage_matrix.ndim != 2 or linkage_matrix.shape[1] < 3:
+            raise ValueError("Linkage matrix must record merge distances")
+        distances = linkage_matrix[:, 2]
+        if distances.size > 1 and np.any(np.diff(distances) < 0):
+            raise ValueError("Linkage distances must be nondecreasing")
+        leaf_count = int(distances.shape[0]) + 1
+        attainable: list[CosineCut] = []
+        if float(distances[0]) > 0.0:
+            attainable.append(CosineCut(similarity=1.0, distance=0.0, clusters=leaf_count))
+        for included in range(1, leaf_count):
+            last = float(distances[included - 1])
+            if included < leaf_count - 1 and float(distances[included]) <= last:
+                continue
+            attainable.append(
+                CosineCut(
+                    similarity=1.0 - last,
+                    distance=last,
+                    clusters=leaf_count - included,
+                )
+            )
+        if not attainable:
+            raise RuntimeError("Dendrogram produced no attainable cluster count")
+        meeting = [cut for cut in attainable if cut.clusters >= target_clusters]
+        chosen = (
+            min(meeting, key=lambda cut: cut.clusters)
+            if meeting
+            else max(attainable, key=lambda cut: cut.clusters)
         )
-    )
-    graph.add_edge_list(edges, eprops=[weights])
+    if chosen.clusters == target_clusters:
+        logger.info(
+            "Cosine similarity %.6f yields %s clusters",
+            chosen.similarity,
+            chosen.clusters,
+        )
+    else:
+        logger.warning(
+            "Cosine similarity %.6f yields %s clusters; target was %s",
+            chosen.similarity,
+            chosen.clusters,
+            target_clusters,
+        )
+    return chosen
 
-    states = []
-    for restart in range(restarts):
-        logger.info("Blockmodel restart %s/%s", restart + 1, restarts)
-        state = inference.minimize_blockmodel_dl(
-            graph,
-            state=inference.PPBlockState,
-            state_args={"eweight": weights, "deg_corr": True},
+
+def fit_dendrogram(matrix, *, n_clusters: int) -> DendrogramFit:
+    """Cut complete linkage so the flat partition meets `n_clusters`."""
+    count = matrix.shape[0]
+    if count == 0:
+        raise ValueError("No keywords selected")
+    if count == 1:
+        linkage_matrix = np.empty((0, 4), dtype=float)
+    else:
+        linkage_matrix = cosine_complete_linkage(matrix)
+    cut = cut_for_cluster_count(linkage_matrix, n_clusters)
+    if count == 1:
+        labels = np.zeros(1, dtype=np.int32)
+    else:
+        labels = _compact_labels(
+            fcluster(linkage_matrix, t=cut.distance, criterion="distance")
         )
-        length = float(state.entropy())
-        logger.info("Restart %s description length: %.6f nats", restart + 1, length)
-        states.append((length, state))
-    length, state = min(states, key=lambda item: item[0])
-    blocks = np.asarray(state.get_blocks().a, dtype=np.int64).copy()
-    if blocks.shape != (adjacency.shape[0],):
-        raise RuntimeError("Blockmodel did not return a partition of the keywords")
-    return BlockmodelFit(levels=(blocks,), description_length=length)
+    observed = int(labels.max()) + 1 if labels.size else 0
+    if observed != cut.clusters:
+        raise AssertionError(
+            f"Dendrogram cut produced {observed} clusters, expected {cut.clusters}"
+        )
+    return DendrogramFit(
+        levels=(labels,),
+        cluster_similarity=float(cut.similarity),
+        target_clusters=int(n_clusters),
+    )
 
 
 def select_keywords(
@@ -207,6 +248,20 @@ def select_keywords(
             raise ValueError("No genuine keywords passed the document-frequency filter")
         raise ValueError("No keywords passed the document-frequency filter")
     return selected
+
+
+def _positive_norm_keywords(matrix, selected: np.ndarray) -> np.ndarray:
+    """Drop keywords whose co-occurrence row has zero L2 norm."""
+    selected = np.asarray(selected, dtype=np.int64)
+    block = matrix[selected][:, selected]
+    squared = np.asarray(block.multiply(block).sum(axis=1)).ravel()
+    kept = selected[squared > 0]
+    dropped = int(selected.size - kept.size)
+    if dropped:
+        logger.info("Dropping %s keywords with zero co-occurrence norm", dropped)
+    if kept.size == 0:
+        raise ValueError("Selected keywords have zero co-occurrence norm")
+    return kept
 
 
 def cluster_paper_counts(
@@ -279,11 +334,9 @@ def cluster_event_keywords(
     *,
     source: str = "events",
     min_document_frequency: int = DEFAULT_MIN_DOCUMENT_FREQUENCY,
-    restarts: int = DEFAULT_RESTARTS,
-    seed: int = DEFAULT_SEED,
     level: int = 0,
     filtered_dir: str | Path | None = None,
-    fit: FitFunction | None = None,
+    n_clusters: int = DEFAULT_N_CLUSTERS,
 ) -> dict[str, object]:
     """Cluster event keywords and write the coarsened event artifacts."""
     events_root = Path(events_dir).expanduser().resolve()
@@ -292,8 +345,8 @@ def cluster_event_keywords(
         raise ValueError("--output-dir must be different from --events-dir")
     if level < 0:
         raise ValueError("--level must be >= 0")
-    if restarts < 1:
-        raise ValueError("--restarts must be >= 1")
+    if n_clusters < 1:
+        raise ValueError("--n-clusters must be >= 1")
 
     artifacts = load_event_artifacts(events_root)
     filtered_root = find_filtered_events(events_root, filtered_dir) if source == "events" else None
@@ -306,14 +359,15 @@ def cluster_event_keywords(
         min_document_frequency=min_document_frequency,
         allowed=allowed,
     )
+    selected = _positive_norm_keywords(artifacts["matrix"], selected)
+    block = artifacts["matrix"][selected][:, selected].tocsr()
     adjacency = cooccurrence_adjacency(artifacts["matrix"], selected)
     logger.info(
-        "Clustering %s keywords with %s undirected co-occurrence pairs",
+        "Clustering %s keywords by complete linkage toward %s clusters",
         len(selected),
-        adjacency.nnz // 2,
+        n_clusters,
     )
-    fitter = fit_assortative if fit is None else fit
-    fitted = fitter(adjacency, restarts=restarts, seed=seed)
+    fitted = fit_dendrogram(block, n_clusters=n_clusters)
     if level >= len(fitted.levels):
         raise ValueError(
             f"--level {level} is outside the fitted hierarchy of {len(fitted.levels)} levels"
@@ -332,8 +386,6 @@ def cluster_event_keywords(
         yearly=yearly,
         source=source,
         min_document_frequency=min_document_frequency,
-        restarts=restarts,
-        seed=seed,
         filtered_dir=str(filtered_root) if filtered_root is not None else None,
     )
     summary = {
@@ -343,13 +395,15 @@ def cluster_event_keywords(
         "levels": int(groups_by_level.shape[0]),
         "groups": int(chosen.max()) + 1 if chosen.size else 0,
         "level": int(level),
-        "description_length_nats": fitted.description_length,
+        "method": DENDROGRAM_METHOD,
+        "cluster_similarity": fitted.cluster_similarity,
+        "target_clusters": int(fitted.target_clusters),
     }
     logger.info(
-        "Wrote %s groups at level %s (%s hierarchy levels) to %s",
+        "Wrote %s groups at cosine similarity %.6f (target %s) to %s",
         summary["groups"],
-        level,
-        summary["levels"],
+        fitted.cluster_similarity,
+        fitted.target_clusters,
         output,
     )
     return summary
@@ -358,8 +412,8 @@ def cluster_event_keywords(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Cluster event keywords with a degree-corrected assortative stochastic "
-            "block model and export cluster-level events."
+            "Cluster event keywords by complete linkage on cosine similarity, "
+            "choosing the threshold that meets --n-clusters."
         )
     )
     parser.add_argument("--events-dir", type=Path, default=Path("output/events"))
@@ -390,17 +444,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Drop keywords appearing in fewer papers than this.",
     )
     parser.add_argument(
-        "--restarts",
+        "--n-clusters",
         type=int,
-        default=DEFAULT_RESTARTS,
-        help="Independent fits. The shortest description length is kept.",
+        default=DEFAULT_N_CLUSTERS,
+        help=(
+            "Target number of clusters. The cosine similarity threshold is the coarsest "
+            "complete-linkage cut that still reaches this count "
+            f"(default {DEFAULT_N_CLUSTERS})."
+        ),
     )
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--level",
         type=int,
         default=0,
-        help="Partition reported as group in keyword_groups.csv. The assortative fit has a single level, 0.",
+        help="Partition reported as group in keyword_groups.csv. The dendrogram cut has a single level, 0.",
     )
     return parser
 
@@ -413,10 +470,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output_dir,
         source=args.keywords,
         min_document_frequency=args.min_document_frequency,
-        restarts=args.restarts,
-        seed=args.seed,
         level=args.level,
         filtered_dir=args.filtered_dir,
+        n_clusters=args.n_clusters,
     )
     print(json.dumps(summary, indent=2))
     return 0
@@ -453,32 +509,18 @@ def _event_rows(events_dir: Path) -> list[dict[str, str]]:
         return list(reader)
 
 
-def _import_graph_tool():
-    try:
-        import graph_tool
-        import graph_tool.inference
-    except ImportError as error:
-        raise RuntimeError(
-            "graph-tool is required for assortative blockmodel clustering. "
-            "Install it from conda-forge: conda install -c conda-forge graph-tool"
-        ) from error
-    return graph_tool, graph_tool.inference
-
-
 def _write_outputs(
     output: Path,
     artifacts: Mapping[str, object],
     selected: np.ndarray,
     adjacency: sparse.csr_matrix,
-    fitted: BlockmodelFit,
+    fitted: DendrogramFit,
     groups_by_level: np.ndarray,
     *,
     chosen_level: int,
     yearly: Mapping[tuple[int, int, int], int],
     source: str,
     min_document_frequency: int,
-    restarts: int,
-    seed: int,
     filtered_dir: str | None,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
@@ -516,7 +558,7 @@ def _write_outputs(
     _write_clusters(output / "clusters.csv", keywords, groups_by_level)
     _write_yearly(output / "cluster_by_year.csv", yearly, papers_by_year)
     manifest = {
-        "method": METHOD,
+        "method": DENDROGRAM_METHOD,
         "keywords": "keywords.npy",
         "groups_by_level": "groups_by_level.npy",
         "hierarchy": "hierarchy.npz",
@@ -529,17 +571,17 @@ def _write_outputs(
         "keyword_filter": "genuine" if filtered_dir else source,
         "filtered_dir": filtered_dir,
         "min_document_frequency": int(min_document_frequency),
-        "restarts": int(restarts),
-        "seed": int(seed),
         "levels": int(groups_by_level.shape[0]),
         "keyword_count": int(len(selected)),
         "alignment": "groups_by_level columns match keywords.npy",
-        "description_length_nats": fitted.description_length,
         "diagonal": "removed",
         "coarse_diagonal": "within-group pairs counted once in each direction",
         "edge_weight": "paper co-occurrence count",
-        "degree_corrected": True,
         "paper_counts": "a paper is counted once per cluster and year",
+        "cluster_similarity": fitted.cluster_similarity,
+        "target_clusters": fitted.target_clusters,
+        "linkage": "complete",
+        "profile": "l2-normalized-cooccurrence-cosine",
     }
     _atomic_json(output / "manifest.json", manifest)
 

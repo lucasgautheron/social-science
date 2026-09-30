@@ -351,7 +351,7 @@
     })
     .then((data) => {
       if (!data.graph) {
-        summary.textContent = "No blockmodel graph was supplied when this site was built.";
+        summary.textContent = "No cluster graph was supplied when this site was built.";
         panel.classList.add("graph-unavailable");
         keywordMode.disabled = true;
         clusterMode.disabled = true;

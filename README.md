@@ -56,30 +56,26 @@ paper contains multiple keywords in that cluster.
 
 ## Cluster events
 
-Cluster those keywords with a degree-corrected assortative stochastic block
-model (graph-tool's planted partition model).
-`graph-tool` is installed from conda-forge, separately from the pip extras:
+Cluster those keywords with the same complete-linkage dendrogram as the
+website. Each keyword is an L2-normalized co-occurrence row, and distance is
+cosine distance. The cosine similarity threshold is the coarsest cut that
+still reaches `--n-clusters` (default 20): every join kept in a cluster has
+similarity at least that high. Equal merge heights can skip a count; the cut
+then uses the next finer partition. A paper that contains several keywords
+from one cluster contributes once to that cluster's yearly count.
 
 ```bash
-conda install -c conda-forge graph-tool
 openalex cluster-events \
   --events-dir output/events \
   --output-dir output/event_clusters
 ```
-
-The fit treats each off-diagonal co-occurrence count as an undirected edge
-multiplicity and keeps the shortest description length across `--restarts`.
-Groups are assortative: a keyword is placed with the keywords it co-occurs
-with, and the number of groups is chosen by the description length. A paper
-that contains several keywords from one cluster contributes once to that
-cluster's yearly count.
 
 The default vocabulary is the keywords listed in `events.csv`. When
 `filtered_events/classifications.csv` sits beside that events directory, or
 `--filtered-dir` points at filter-events output, only keywords labelled
 genuine are clustered. `--keywords all` keeps the full co-occurrence
 vocabulary. `--level` selects which hierarchy depth is reported as `group`
-in `keyword_groups.csv`.
+in `keyword_groups.csv`. The dendrogram cut has a single level, 0.
 
 ## Filter events
 
@@ -174,8 +170,8 @@ python -m http.server --directory output/website 8000
 
 `index.html` ranks keywords by document frequency. `dendrogram.html` shows the
 complete-linkage keyword hierarchy and a sidebar with each node's share of
-that year's articles, plus cluster membership. `graph.html` switches between the keyword
-co-occurrence network and its blockmodel clusters. Nodes share cluster colors
+that year's articles and its descendant keywords. `graph.html` switches between
+the keyword co-occurrence network and its keyword clusters. Nodes share cluster colors
 and have area proportional to keyword document frequency (summed for cluster
 nodes). Cluster coordinates are the document-frequency-weighted barycenters of
 their displayed keywords. Graph edges use normalized pointwise mutual
@@ -190,7 +186,7 @@ The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,
 and cuts complete linkage at `--cluster-similarity 0.5`. If `H` is the cut
 membership matrix, it also exports `H.T @ M @ H` and verifies that the total
-count is preserved. The graph page keeps the 5,000 most frequent blockmodel
+count is preserved. The graph page keeps the 5,000 most frequent clustered
 keywords by default. Spatialization uses every positive-NPMI edge among those
 keywords, while rendering is limited to the 10,000 strongest edges. Use
 `--max-graph-keywords` and `--max-graph-edges` to change the display limits.
