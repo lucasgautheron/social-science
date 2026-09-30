@@ -31,7 +31,7 @@ from openalex.website.build import cosine_complete_linkage, load_event_artifacts
 logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 1
-DEFAULT_N_CLUSTERS = 20
+DEFAULT_N_CLUSTERS = 300
 DENDROGRAM_METHOD = "complete-linkage-cosine"
 
 

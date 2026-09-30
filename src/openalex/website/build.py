@@ -15,23 +15,19 @@ from urllib.parse import quote
 import numpy as np
 from scipy import sparse
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
-from scipy.sparse.csgraph import connected_components, laplacian
-from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import squareform
 
 DEFAULT_CLUSTER_SIMILARITY = 0.5
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 10
 DEFAULT_TOP_KEYWORDS = 100
 DEFAULT_MAX_DENDROGRAM_KEYWORDS = 500
-DEFAULT_MAX_GRAPH_KEYWORDS = 5_000
-DEFAULT_MAX_GRAPH_EDGES = 10_000
 SITE_ASSETS = (
     "index.html",
     "dendrogram.html",
-    "graph.html",
+    "clusters.html",
     "app.js",
     "dendrogram.js",
-    "graph.js",
+    "clusters.js",
     "style.css",
 )
 
@@ -367,20 +363,15 @@ def papers_by_year_from_manifest(manifest: Mapping[str, Any]) -> dict[int, int]:
     }
 
 
-def build_graph_payload(
+def build_cluster_list(
     artifacts: dict[str, Any],
     clusters_dir: str | Path,
     *,
-    max_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
-    max_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     allowed: set[str] | None = None,
     papers_by_year: Mapping[int, int] | None = None,
-) -> dict[str, Any]:
-    """Build keyword and cluster graph views from cluster artifacts."""
-    if max_keywords < 1:
-        raise ValueError("max_keywords must be positive")
-    if max_edges < 1:
-        raise ValueError("max_edges must be positive")
+    total_documents: int | None = None,
+) -> list[dict[str, Any]]:
+    """List every cluster by the share of documents containing any member keyword."""
     clustered = load_cluster_artifacts(clusters_dir, artifacts)
     if allowed is not None:
         keep = np.asarray(
@@ -388,255 +379,74 @@ def build_graph_payload(
             dtype=bool,
         )
         if not np.any(keep):
-            raise ValueError("No cluster keywords remain after the genuine-event filter")
+            return []
         clustered = {
             **clustered,
             "keywords": clustered["keywords"][keep],
             "groups": clustered["groups"][:, keep],
             "event_indices": clustered["event_indices"][keep],
         }
-    all_indices = clustered["event_indices"]
-    all_frequencies = artifacts["frequencies"][all_indices]
-    order = np.argsort(-all_frequencies, kind="stable")[:max_keywords]
-    event_indices = all_indices[order]
-    keywords = clustered["keywords"][order]
-    frequencies = all_frequencies[order].astype(np.int64, copy=False)
-    groups = clustered["groups"][clustered["level"], order]
-
-    all_matrix = artifacts["matrix"][all_indices][:, all_indices].tocsr()
-    all_matrix.setdiag(0)
-    all_matrix.eliminate_zeros()
-    original_edges = int(sparse.triu(all_matrix, k=1).nnz)
-
-    matrix = artifacts["matrix"][event_indices][:, event_indices].tocsr()
-    matrix.setdiag(0)
-    matrix.eliminate_zeros()
-    difference = (matrix - matrix.T).tocsr()
-    difference.eliminate_zeros()
-    if difference.nnz:
-        raise ValueError("Event co-occurrence matrix must be symmetric")
-    processed = int(artifacts["manifest"].get("processed_papers") or 0)
-    positive_rows, positive_columns, positive_weights = _positive_npmi_edges(
-        matrix,
-        frequencies,
-        processed,
+    indices = clustered["event_indices"]
+    keywords = clustered["keywords"]
+    groups = np.asarray(clustered["groups"][clustered["level"]], dtype=np.int32)
+    if groups.size == 0:
+        return []
+    frequencies = np.asarray(artifacts["frequencies"])[indices]
+    group_ids = sorted({int(group) for group in groups})
+    member_positions = []
+    for group in group_ids:
+        positions = np.flatnonzero(groups == group)
+        positions = positions[np.argsort(-frequencies[positions], kind="stable")]
+        member_positions.append(positions)
+    yearly_counts = aggregate_node_years(
+        artifacts,
+        indices,
+        [positions.tolist() for positions in member_positions],
     )
-    layout_matrix = _symmetric_edge_matrix(
-        len(keywords),
-        positive_rows,
-        positive_columns,
-        positive_weights,
-    )
-    coordinates = _spectral_layout(layout_matrix)
-
-    edge_order = np.lexsort(
-        (positive_columns, positive_rows, -positive_weights)
-    )
-    edge_order = edge_order[:max_edges]
-    rows = positive_rows[edge_order]
-    columns = positive_columns[edge_order]
-    weights = positive_weights[edge_order]
-
-    group_ids = sorted(set(int(group) for group in groups))
-    group_to_position = {group: position for position, group in enumerate(group_ids)}
-    member_positions = [np.flatnonzero(groups == group) for group in group_ids]
-    descendants = [[position] for position in range(len(keywords))]
-    descendants.extend(positions.tolist() for positions in member_positions)
-    yearly_counts = aggregate_node_years(artifacts, event_indices, descendants)
     if papers_by_year is None:
         papers_by_year = papers_by_year_from_manifest(artifacts["manifest"])
-
-    keyword_nodes = []
-    for position, keyword in enumerate(keywords):
-        group = int(groups[position])
-        keyword_nodes.append(
-            {
-                "id": f"keyword-{position}",
-                "kind": "keyword",
-                "keyword": str(keyword),
-                "keywords": [str(keyword)],
-                "group": group,
-                "color": _cluster_color(group),
-                "papers": int(frequencies[position]),
-                "x": float(coordinates[position, 0]),
-                "y": float(coordinates[position, 1]),
-                "yearly": _yearly_payload(
-                    yearly_counts.get(position, {}),
-                    papers_by_year,
-                ),
-            }
-        )
-
-    cluster_nodes = []
-    for cluster_position, (group, positions) in enumerate(
-        zip(group_ids, member_positions, strict=True)
-    ):
-        member_frequencies = frequencies[positions].astype(np.float64)
-        total_frequency = float(member_frequencies.sum())
-        if total_frequency:
-            center = np.average(coordinates[positions], axis=0, weights=member_frequencies)
-        else:
-            center = coordinates[positions].mean(axis=0)
-        members = [str(keywords[position]) for position in positions]
-        cluster_nodes.append(
-            {
-                "id": f"cluster-{group}",
-                "kind": "cluster",
-                "group": group,
-                "color": _cluster_color(group),
-                "papers": int(total_frequency),
-                "keyword_count": len(members),
-                "keywords": members,
-                "x": float(center[0]),
-                "y": float(center[1]),
-                "yearly": _yearly_payload(
-                    yearly_counts.get(len(keywords) + cluster_position, {}),
-                    papers_by_year,
-                ),
-            }
-        )
-
+    columns = np.empty(len(groups), dtype=np.int64)
+    for cluster_index, positions in enumerate(member_positions):
+        columns[positions] = cluster_index
     membership = sparse.csr_matrix(
         (
             np.ones(len(groups), dtype=np.int64),
-            (
-                np.arange(len(groups), dtype=np.int64),
-                np.asarray([group_to_position[int(group)] for group in groups]),
-            ),
+            (np.arange(len(groups), dtype=np.int64), columns),
         ),
         shape=(len(groups), len(group_ids)),
     )
-    cluster_frequencies, cluster_matrix = _cluster_incidence_statistics(
-        artifacts,
-        event_indices,
-        membership,
-    )
-    cluster_rows, cluster_columns, cluster_weights = _positive_npmi_edges(
-        cluster_matrix,
-        cluster_frequencies,
-        processed,
-    )
-    positive_cluster_edge_count = len(cluster_weights)
-    cluster_order = np.lexsort(
-        (cluster_columns, cluster_rows, -cluster_weights)
-    )[:max_edges]
-    cluster_rows = cluster_rows[cluster_order]
-    cluster_columns = cluster_columns[cluster_order]
-    cluster_weights = cluster_weights[cluster_order]
-    for position, frequency in enumerate(cluster_frequencies):
-        cluster_nodes[position]["document_frequency"] = int(frequency)
-    cluster_edges = [
-        {
-            "source": int(row),
-            "target": int(column),
-            "weight": float(weight),
-        }
-        for row, column, weight in zip(
-            cluster_rows,
-            cluster_columns,
-            cluster_weights,
-            strict=True,
+    document_counts = _cluster_document_counts(artifacts, indices, membership)
+    if total_documents is None:
+        total_documents = int(sum(papers_by_year.values()))
+    rows = []
+    for cluster_index, (group, positions) in enumerate(
+        zip(group_ids, member_positions, strict=True)
+    ):
+        papers = int(document_counts[cluster_index])
+        members = [str(keywords[position]) for position in positions]
+        rows.append(
+            {
+                "group": int(group),
+                "keywords": members,
+                "papers": papers,
+                "share": papers / total_documents if total_documents else 0.0,
+                "yearly": _yearly_payload(
+                    yearly_counts.get(cluster_index, {}),
+                    papers_by_year,
+                ),
+            }
         )
-    ]
-    keyword_edges = [
-        {"source": int(row), "target": int(column), "weight": float(weight)}
-        for row, column, weight in zip(rows, columns, weights, strict=True)
-    ]
-    return {
-        "level": int(clustered["level"]),
-        "edge_weight": "positive NPMI",
-        "layout_edges": "all positive-NPMI keyword edges before the display cap",
-        "keyword": {"nodes": keyword_nodes, "edges": keyword_edges},
-        "cluster": {"nodes": cluster_nodes, "edges": cluster_edges},
-        "limits": {"keywords": int(max_keywords), "edges": int(max_edges)},
-        "counts": {
-            "original_keywords": int(len(all_indices)),
-            "displayed_keywords": int(len(keywords)),
-            "original_edges": original_edges,
-            "positive_edges": int(len(positive_weights)),
-            "displayed_edges": int(len(keyword_edges)),
-            "displayed_clusters": int(len(cluster_nodes)),
-            "positive_cluster_edges": int(positive_cluster_edge_count),
-            "displayed_cluster_edges": int(len(cluster_edges)),
-        },
-    }
+    rows.sort(key=lambda item: (-item["papers"], item["keywords"]))
+    return rows
 
 
-def _positive_npmi_edges(
-    matrix: sparse.csr_matrix,
-    frequencies: np.ndarray,
-    processed_papers: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return upper-triangle edges whose normalized PMI is strictly positive."""
-    if processed_papers < 1:
-        raise ValueError("processed_papers must be positive to compute NPMI")
-    frequencies = np.asarray(frequencies, dtype=np.float64)
-    if frequencies.shape != (matrix.shape[0],):
-        raise ValueError("Frequencies must align with the co-occurrence matrix")
-    if np.any(frequencies < 0) or np.any(frequencies > processed_papers):
-        raise ValueError("Document frequencies must be between zero and processed_papers")
-    upper = sparse.triu(matrix, k=1, format="coo")
-    counts = upper.data.astype(np.float64, copy=False)
-    if np.any(counts < 0) or np.any(counts > processed_papers):
-        raise ValueError("Co-occurrence counts must be between zero and processed_papers")
-    endpoint_limits = np.minimum(frequencies[upper.row], frequencies[upper.col])
-    if np.any(counts > endpoint_limits):
-        raise ValueError("Co-occurrence counts cannot exceed endpoint document frequencies")
-    if not len(counts):
-        return (
-            np.array([], dtype=np.int32),
-            np.array([], dtype=np.int32),
-            np.array([], dtype=np.float64),
-        )
-    joint = counts / float(processed_papers)
-    expected = (
-        frequencies[upper.row]
-        * frequencies[upper.col]
-        / float(processed_papers * processed_papers)
-    )
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pmi = np.log(joint / expected)
-        denominator = -np.log(joint)
-        npmi = np.divide(
-            pmi,
-            denominator,
-            out=np.zeros_like(pmi),
-            where=denominator > 0,
-        )
-    npmi = np.clip(npmi, -1.0, 1.0)
-    keep = np.isfinite(npmi) & (npmi > 0)
-    return (
-        upper.row[keep].astype(np.int32, copy=False),
-        upper.col[keep].astype(np.int32, copy=False),
-        npmi[keep],
-    )
-
-
-def _symmetric_edge_matrix(
-    count: int,
-    rows: np.ndarray,
-    columns: np.ndarray,
-    weights: np.ndarray,
-) -> sparse.csr_matrix:
-    return sparse.coo_matrix(
-        (
-            np.concatenate((weights, weights)),
-            (np.concatenate((rows, columns)), np.concatenate((columns, rows))),
-        ),
-        shape=(count, count),
-        dtype=np.float64,
-    ).tocsr()
-
-
-def _cluster_incidence_statistics(
+def _cluster_document_counts(
     artifacts: dict[str, Any],
     selected_indices: np.ndarray,
     membership: sparse.csr_matrix,
-) -> tuple[np.ndarray, sparse.csr_matrix]:
-    """Return exact cluster document frequencies and paper co-occurrences."""
-    cluster_count = membership.shape[1]
-    frequencies = np.zeros(cluster_count, dtype=np.int64)
-    cooccurrence = sparse.csr_matrix((cluster_count, cluster_count), dtype=np.int64)
+) -> np.ndarray:
+    """Count papers that contain any keyword of each cluster."""
+    frequencies = np.zeros(membership.shape[1], dtype=np.int64)
     root = artifacts["root"]
     manifest = artifacts["manifest"]
     incidence_dir = root / manifest["incidence_dir"]
@@ -644,18 +454,15 @@ def _cluster_incidence_statistics(
         article_terms = sparse.load_npz(incidence_dir / relative).tocsr()
         if article_terms.shape[1] != len(artifacts["vocabulary"]):
             raise ValueError(f"Incidence width does not match the vocabulary for {relative}")
-        presence = (
-            article_terms[:, selected_indices].astype(np.int64) @ membership
-        ).tocsr()
+        presence = (article_terms[:, selected_indices].astype(np.int64) @ membership).tocsr()
         presence.data[:] = 1
         frequencies += np.asarray(presence.getnnz(axis=0), dtype=np.int64)
-        cooccurrence = (cooccurrence + presence.T @ presence).tocsr()
-    return frequencies, cooccurrence
+    return frequencies
 
 
 def _yearly_payload(
     counts: dict[int, int],
-    papers_by_year: dict[int, int],
+    papers_by_year: Mapping[int, int],
 ) -> list[dict[str, int | float]]:
     return [
         {
@@ -667,62 +474,6 @@ def _yearly_payload(
         }
         for year, papers in sorted(counts.items())
     ]
-
-
-def _cluster_color(group: int) -> str:
-    hue = (float(group) * 137.508) % 360.0
-    return f"hsl({hue:.1f} 62% 43%)"
-
-
-def _spectral_layout(matrix: sparse.csr_matrix) -> np.ndarray:
-    """Lay out sparse connected components deterministically and pack them."""
-    count = matrix.shape[0]
-    if count == 0:
-        return np.empty((0, 2), dtype=np.float64)
-    component_count, labels = connected_components(matrix, directed=False)
-    coordinates = np.zeros((count, 2), dtype=np.float64)
-    columns = max(1, math.ceil(math.sqrt(component_count)))
-    for component in range(component_count):
-        positions = np.flatnonzero(labels == component)
-        local = _component_layout(matrix[positions][:, positions])
-        row, column = divmod(component, columns)
-        coordinates[positions] = local + np.array([3.0 * column, 3.0 * row])
-    coordinates -= coordinates.mean(axis=0)
-    scale = float(np.max(np.abs(coordinates)))
-    if scale:
-        coordinates /= scale
-    return coordinates
-
-
-def _component_layout(matrix: sparse.csr_matrix) -> np.ndarray:
-    count = matrix.shape[0]
-    if count == 1:
-        return np.zeros((1, 2), dtype=np.float64)
-    if count == 2:
-        return np.array([[-1.0, 0.0], [1.0, 0.0]])
-    normalized = laplacian(matrix.astype(np.float64), normed=True)
-    if count <= 32:
-        _values, vectors = np.linalg.eigh(normalized.toarray())
-        coordinates = vectors[:, 1:3]
-    else:
-        start = np.linspace(1.0, 2.0, count, dtype=np.float64)
-        values, vectors = eigsh(
-            normalized,
-            k=3,
-            which="SM",
-            v0=start / np.linalg.norm(start),
-        )
-        vectors = vectors[:, np.argsort(values)]
-        coordinates = vectors[:, 1:3]
-    if coordinates.shape[1] == 1:
-        coordinates = np.column_stack((coordinates[:, 0], np.zeros(count)))
-    for axis in range(2):
-        pivot = int(np.argmax(np.abs(coordinates[:, axis])))
-        if coordinates[pivot, axis] < 0:
-            coordinates[:, axis] *= -1
-    coordinates -= coordinates.mean(axis=0)
-    scale = float(np.max(np.abs(coordinates)))
-    return coordinates / scale if scale else coordinates
 
 
 def _genuine_event_keywords(
@@ -752,8 +503,6 @@ def build_website(
     top_keywords: int = DEFAULT_TOP_KEYWORDS,
     min_document_frequency: int = DEFAULT_MIN_DOCUMENT_FREQUENCY,
     max_dendrogram_keywords: int = DEFAULT_MAX_DENDROGRAM_KEYWORDS,
-    max_graph_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
-    max_graph_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
     filtered_dir: str | Path | None = None,
     db_path: str | Path | None = None,
@@ -769,6 +518,7 @@ def build_website(
     else:
         papers_by_year = count_papers_by_year(db_path)
         yearly_denominator = "database"
+    total_documents = int(sum(papers_by_year.values())) or processed
     ranked = np.argsort(-frequencies, kind="stable")
     if allowed is not None:
         ranked = np.asarray(
@@ -818,6 +568,7 @@ def build_website(
             "cluster_similarity": cluster_similarity,
             "keyword_filter": "genuine" if allowed is not None else "vocabulary",
             "yearly_denominator": yearly_denominator,
+            "total_documents": total_documents,
         },
         "top_keywords": [
             {
@@ -829,14 +580,13 @@ def build_website(
         ],
         "dendrogram": {"nodes": nodes},
         "coarse_matrix": _sparse_payload(clustered["coarse"]),
-        "graph": (
-            build_graph_payload(
+        "cluster_list": (
+            build_cluster_list(
                 artifacts,
                 clusters_dir,
-                max_keywords=max_graph_keywords,
-                max_edges=max_graph_edges,
                 allowed=allowed,
                 papers_by_year=papers_by_year,
+                total_documents=total_documents,
             )
             if clusters_dir is not None
             else None
@@ -844,10 +594,14 @@ def build_website(
     }
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    expected_html = {"index.html", "dendrogram.html", "graph.html"}
+    expected_html = {"index.html", "dendrogram.html", "clusters.html"}
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
             stale_html.unlink()
+    for retired in ("graph.js",):
+        retired_path = output / retired
+        if retired_path.is_file():
+            retired_path.unlink()
     site = files("openalex.website").joinpath("site")
     for asset in SITE_ASSETS:
         write_text(output / asset, site.joinpath(asset).read_text(encoding="utf-8"))
@@ -861,8 +615,8 @@ def build_website(
         "keywords": len(payload["top_keywords"]),
         "dendrogram_keywords": len(selected),
         "clusters": payload["meta"]["clusters"],
-        "graph_keywords": (
-            payload["graph"]["counts"]["displayed_keywords"] if payload["graph"] else 0
+        "event_clusters": (
+            0 if payload["cluster_list"] is None else len(payload["cluster_list"])
         ),
         "keyword_filter": payload["meta"]["keyword_filter"],
         "genuine_keywords": None if allowed is None else len(allowed),
@@ -877,7 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--clusters-dir",
         type=Path,
         default=None,
-        help="Optional cluster-events output used by graph.html.",
+        help="Optional cluster-events output listed on clusters.html.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
     parser.add_argument(
@@ -914,16 +668,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CLUSTER_SIMILARITY,
     )
-    parser.add_argument(
-        "--max-graph-keywords",
-        type=int,
-        default=DEFAULT_MAX_GRAPH_KEYWORDS,
-    )
-    parser.add_argument(
-        "--max-graph-edges",
-        type=int,
-        default=DEFAULT_MAX_GRAPH_EDGES,
-    )
     return parser
 
 
@@ -935,10 +679,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--min-document-frequency must be positive")
     if args.max_dendrogram_keywords < 1:
         raise SystemExit("--max-dendrogram-keywords must be positive")
-    if args.max_graph_keywords < 1:
-        raise SystemExit("--max-graph-keywords must be positive")
-    if args.max_graph_edges < 1:
-        raise SystemExit("--max-graph-edges must be positive")
     summary = build_website(
         args.events_dir,
         clusters_dir=args.clusters_dir,
@@ -946,8 +686,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         top_keywords=args.top_keywords,
         min_document_frequency=args.min_document_frequency,
         max_dendrogram_keywords=args.max_dendrogram_keywords,
-        max_graph_keywords=args.max_graph_keywords,
-        max_graph_edges=args.max_graph_edges,
         cluster_similarity=args.cluster_similarity,
         filtered_dir=args.filtered_dir,
         db_path=args.db_path,

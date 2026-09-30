@@ -170,29 +170,22 @@ python -m http.server --directory output/website 8000
 
 `index.html` ranks keywords by document frequency. `dendrogram.html` shows the
 complete-linkage keyword hierarchy and a sidebar with each node's share of
-that year's articles and its descendant keywords. `graph.html` switches between
-the keyword co-occurrence network and its keyword clusters. Nodes share cluster colors
-and have area proportional to keyword document frequency (summed for cluster
-nodes). Cluster coordinates are the document-frequency-weighted barycenters of
-their displayed keywords. Graph edges use normalized pointwise mutual
-information (NPMI); zero and negative values are omitted. Cluster NPMI is
-computed from exact paper-level cluster incidence, counting a paper once even
-when it contains several keywords from the cluster.
+that year's articles and its descendant keywords. `clusters.html` lists every
+cluster from `cluster-events`. A cluster's size is the number of documents
+that contain any of its keywords, divided by the total number of documents,
+and each row plots that share by year.
 
-When genuine classifications are available, the index, dendrogram, and graph
-use those keywords. The graph drops cluster members labelled artefacts.
+When genuine classifications are available, the index, dendrogram, and cluster
+list use those keywords. Artefact-labelled members are left out of a cluster.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,
 and cuts complete linkage at `--cluster-similarity 0.5`. If `H` is the cut
 membership matrix, it also exports `H.T @ M @ H` and verifies that the total
-count is preserved. The graph page keeps the 5,000 most frequent clustered
-keywords by default. Spatialization uses every positive-NPMI edge among those
-keywords, while rendering is limited to the 10,000 strongest edges. Use
-`--max-graph-keywords` and `--max-graph-edges` to change the display limits.
+count is preserved.
 
-Omitting `--clusters-dir` still builds the site, but the graph page displays
-instructions instead of a network. `--db-path` divides each yearly frequency
+Omitting `--clusters-dir` still builds the site, but the cluster page explains
+that no clusters were supplied. `--db-path` divides each yearly frequency
 by the number of articles published that year. The count is one read-only
 `GROUP BY publication_year` over `idx_publication_year`, so the article rows
 are not read. Without `--db-path`, the curves use the processed-paper totals

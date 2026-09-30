@@ -8,7 +8,7 @@ from scipy import sparse
 import openalex.website.build as website_build
 from openalex.website.build import (
     aggregate_node_years,
-    build_graph_payload,
+    build_cluster_list,
     build_website,
     cluster_keywords,
     count_papers_by_year,
@@ -121,10 +121,11 @@ def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
     assert summary["dendrogram_keywords"] == 3
     assert (site_dir / "index.html").is_file()
     assert (site_dir / "dendrogram.html").is_file()
-    assert (site_dir / "graph.html").is_file()
+    assert (site_dir / "clusters.html").is_file()
+    assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
-    assert payload["graph"] is None
+    assert payload["cluster_list"] is None
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta", "gamma"}
     assert root["yearly"] == [
@@ -133,86 +134,42 @@ def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
     ]
 
 
-def test_graph_modes_colors_sizes_edges_and_barycenters(tmp_path, monkeypatch):
+def test_cluster_list_counts_documents_once(tmp_path):
     event_dir = tmp_path / "events"
     clusters_dir = tmp_path / "clusters"
     site_dir = tmp_path / "site"
     write_event_fixture(event_dir)
     write_cluster_fixture(clusters_dir)
     artifacts = load_event_artifacts(event_dir)
-    original_layout = website_build._spectral_layout
-    layout_nnz = []
-
-    def capture_layout(matrix):
-        layout_nnz.append(matrix.nnz)
-        return original_layout(matrix)
-
-    monkeypatch.setattr(website_build, "_spectral_layout", capture_layout)
-    graph = build_graph_payload(
-        artifacts,
-        clusters_dir,
-        max_keywords=3,
-        max_edges=1,
-    )
-
-    assert graph["counts"] == {
-        "original_keywords": 3,
-        "displayed_keywords": 3,
-        "original_edges": 2,
-        "positive_edges": 2,
-        "displayed_edges": 1,
-        "displayed_clusters": 2,
-        "positive_cluster_edges": 1,
-        "displayed_cluster_edges": 1,
-    }
-    assert layout_nnz == [4]
-    assert graph["layout_edges"] == "all positive-NPMI keyword edges before the display cap"
-    assert graph["keyword"]["edges"][0]["source"] == 0
-    assert graph["keyword"]["edges"][0]["target"] == 1
-    assert graph["keyword"]["edges"][0]["weight"] == pytest.approx(
-        np.log(1.25) / -np.log(0.4)
-    )
-    keyword_nodes = graph["keyword"]["nodes"]
-    cluster_nodes = graph["cluster"]["nodes"]
-    assert keyword_nodes[0]["color"] == keyword_nodes[1]["color"] == cluster_nodes[0]["color"]
-    assert keyword_nodes[2]["color"] == cluster_nodes[1]["color"]
-    assert cluster_nodes[0]["papers"] == 6
-    assert cluster_nodes[0]["document_frequency"] == 4
-    assert cluster_nodes[0]["keywords"] == ["beta", "alpha"]
-    assert cluster_nodes[0]["yearly"] == [
+    clusters = build_cluster_list(artifacts, clusters_dir)
+    assert [item["keywords"] for item in clusters] == [["beta", "alpha"], ["gamma"]]
+    assert clusters[0]["papers"] == 4
+    assert clusters[0]["share"] == pytest.approx(4 / 5)
+    assert clusters[0]["yearly"] == [
         {"year": 2020, "papers": 2, "share": 1.0},
         {"year": 2021, "papers": 2, "share": 2 / 3},
     ]
-    expected_x = (4 * keyword_nodes[0]["x"] + 2 * keyword_nodes[1]["x"]) / 6
-    expected_y = (4 * keyword_nodes[0]["y"] + 2 * keyword_nodes[1]["y"]) / 6
-    assert cluster_nodes[0]["x"] == expected_x
-    assert cluster_nodes[0]["y"] == expected_y
-    assert graph["cluster"]["edges"][0]["weight"] == pytest.approx(
-        np.log(1.25) / -np.log(0.4)
-    )
+    assert clusters[1]["papers"] == 2
+    assert clusters[1]["share"] == pytest.approx(2 / 5)
 
-    limited = build_graph_payload(
-        artifacts,
-        clusters_dir,
-        max_keywords=2,
-        max_edges=1,
-    )
-    assert [node["keyword"] for node in limited["keyword"]["nodes"]] == ["beta", "alpha"]
-    assert limited["counts"]["displayed_keywords"] == 2
-
+    (site_dir).mkdir()
+    (site_dir / "graph.html").write_text("stale graph", encoding="utf-8")
+    (site_dir / "graph.js").write_text("stale graph", encoding="utf-8")
     summary = build_website(
         event_dir,
         clusters_dir=clusters_dir,
         output_dir=site_dir,
         min_document_frequency=2,
         max_dendrogram_keywords=10,
-        max_graph_keywords=3,
-        max_graph_edges=1,
     )
-    assert summary["graph_keywords"] == 3
+    assert summary["event_clusters"] == 2
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
-    assert payload["graph"]["counts"]["displayed_edges"] == 1
-    assert "canvas" in (site_dir / "graph.html").read_text(encoding="utf-8")
+    assert payload["cluster_list"][0]["papers"] == 4
+    assert "canvas" not in (site_dir / "clusters.html").read_text(encoding="utf-8")
+    assert not (site_dir / "graph.html").exists()
+    assert not (site_dir / "graph.js").exists()
+    page = (site_dir / "clusters.js").read_text(encoding="utf-8")
+    assert "y(Number(item.share)" in page
 
 
 def test_website_uses_genuine_keywords_when_available(tmp_path):
@@ -236,17 +193,17 @@ def test_website_uses_genuine_keywords_when_available(tmp_path):
         output_dir=site_dir,
         min_document_frequency=2,
         max_dendrogram_keywords=10,
-        max_graph_keywords=3,
     )
     assert summary["keyword_filter"] == "genuine"
     assert summary["genuine_keywords"] == 2
     assert summary["dendrogram_keywords"] == 2
-    assert summary["graph_keywords"] == 2
+    assert summary["event_clusters"] == 1
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta"}
     assert [item["keyword"] for item in payload["top_keywords"]] == ["beta", "alpha"]
-    assert [node["keyword"] for node in payload["graph"]["keyword"]["nodes"]] == ["beta", "alpha"]
+    assert payload["cluster_list"][0]["keywords"] == ["beta", "alpha"]
+    assert payload["cluster_list"][0]["papers"] == 4
 
 
 def write_article_year_database(path, *, indexed=True):

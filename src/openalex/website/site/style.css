@@ -68,8 +68,10 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .keyword-list { display: grid; gap: .9rem; margin: 0; padding-left: 2.4rem; }
 .keyword-row { padding-left: .35rem; }
 .keyword-header { display: flex; justify-content: space-between; gap: 1rem; font-size: .88rem; }
-.keyword-header span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.keyword-header span { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.keyword-header strong { min-width: 0; font-weight: 650; line-height: 1.35; }
 .bar-track { height: .45rem; margin-top: .35rem; overflow: hidden; border-radius: 999px; background: #edf1ef; }
+.cluster-chart { display: block; width: 100%; height: 6.5rem; margin-top: .55rem; }
 .bar { height: 100%; min-width: 2px; border-radius: inherit; background: var(--accent); }
 .workspace { display: grid; min-height: 0; grid-template-columns: minmax(0, 1fr) minmax(20rem, 25rem); }
 .tree-panel, .graph-panel {
