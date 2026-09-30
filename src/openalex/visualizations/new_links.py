@@ -7,6 +7,7 @@ import csv
 import json
 import logging
 import os
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,10 @@ def build_cluster_link_plots(
     all_disconnected = np.zeros(cluster_count, dtype=np.int64)
     all_existing = np.zeros(cluster_count, dtype=np.int64)
     all_total = np.zeros(cluster_count, dtype=np.int64)
+    new_distance_histograms: list[defaultdict[int, float]] = [
+        defaultdict(float) for _ in range(cluster_count)
+    ]
+    outside_cluster_distance_histogram: defaultdict[int, float] = defaultdict(float)
 
     cluster_years_dir = root / manifest["cluster_years_dir"]
     for year in years:
@@ -77,6 +82,26 @@ def build_cluster_link_plots(
             weights=distances[connected] * sampling_weight[connected],
             minlength=cluster_count,
         )
+        for cluster in np.unique(link_clusters[connected]):
+            members = connected & (link_clusters == cluster)
+            values, inverse = np.unique(distances[members], return_inverse=True)
+            totals = np.bincount(
+                inverse,
+                weights=sampling_weight[members],
+            )
+            for distance, total in zip(values, totals, strict=True):
+                new_distance_histograms[int(cluster)][int(distance)] += float(total)
+        outside_connected = (link_clusters < 0) & (distances >= 0)
+        values, inverse = np.unique(
+            distances[outside_connected],
+            return_inverse=True,
+        )
+        totals = np.bincount(
+            inverse,
+            weights=sampling_weight[outside_connected],
+        )
+        for distance, total in zip(values, totals, strict=True):
+            outside_cluster_distance_histogram[int(distance)] += float(total)
 
         with np.load(cluster_years_dir / f"{year}.npz", allow_pickle=False) as stats:
             new_connected += stats["attributed_new_link_connected"]
@@ -98,16 +123,25 @@ def build_cluster_link_plots(
     ):
         raise ValueError("Cluster distance reservoir does not align with metadata")
     reservoir_sample_count = np.diff(reservoir_offsets)
+    all_distance_histograms: list[defaultdict[int, float]] = [
+        defaultdict(float) for _ in range(cluster_count)
+    ]
     for cluster in range(cluster_count):
         sample = reservoir_distances[
             reservoir_offsets[cluster] : reservoir_offsets[cluster + 1]
         ]
         if sample.size:
+            weight = float(reservoir_population[cluster]) / sample.size
             all_distance_sum[cluster] = (
-                float(reservoir_population[cluster])
-                / sample.size
-                * float(sample.sum(dtype=np.int64))
+                weight * float(sample.sum(dtype=np.int64))
             )
+            values, counts = np.unique(sample, return_counts=True)
+            for distance, count in zip(values, counts, strict=True):
+                all_distance_histograms[cluster][int(distance)] += (
+                    float(count) * weight
+                )
+        if all_existing[cluster]:
+            all_distance_histograms[cluster][0] += float(all_existing[cluster])
 
     average_new = _safe_average(new_distance_sum, new_connected)
     average_all = _safe_average(all_distance_sum, all_connected)
@@ -129,6 +163,9 @@ def build_cluster_link_plots(
         reservoir_sample_count,
         new_selection,
         all_selection,
+        new_distance_histograms,
+        all_distance_histograms,
+        outside_cluster_distance_histogram,
     )
 
     output.mkdir(parents=True, exist_ok=True)
@@ -249,6 +286,9 @@ def _summary_rows(
     reservoir_sample_count: np.ndarray,
     new_selection: ResidualSelection,
     all_selection: ResidualSelection,
+    new_distance_histograms: Sequence[Mapping[int, float]],
+    all_distance_histograms: Sequence[Mapping[int, float]],
+    outside_cluster_distance_histogram: Mapping[int, float],
 ) -> list[dict[str, object]]:
     new_highlighted = set(int(index) for index in new_selection.highlighted)
     all_highlighted = set(int(index) for index in all_selection.highlighted)
@@ -265,6 +305,12 @@ def _summary_rows(
                 "new_link_residual": float(new_selection.residuals[index]),
                 "new_link_size_quantile": int(new_selection.size_quantile[index]),
                 "new_link_highlighted": index in new_highlighted,
+                "new_link_distance_distribution": _distribution_json(
+                    new_distance_histograms[index]
+                ),
+                "outside_cluster_distance_distribution": _distribution_json(
+                    outside_cluster_distance_histogram
+                ),
                 "average_all_link_distance": float(average_all[index]),
                 "all_link_connected_count": int(all_connected[index]),
                 "all_link_disconnected_count": int(all_disconnected[index]),
@@ -279,9 +325,23 @@ def _summary_rows(
                 "all_link_residual": float(all_selection.residuals[index]),
                 "all_link_size_quantile": int(all_selection.size_quantile[index]),
                 "all_link_highlighted": index in all_highlighted,
+                "all_link_distance_distribution": _distribution_json(
+                    all_distance_histograms[index]
+                ),
             }
         )
     return rows
+
+
+def _distribution_json(histogram: Mapping[int, float]) -> str:
+    return json.dumps(
+        [
+            [int(distance), float(count)]
+            for distance, count in sorted(histogram.items())
+            if count > 0
+        ],
+        separators=(",", ":"),
+    )
 
 
 def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
@@ -295,6 +355,8 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "new_link_residual",
         "new_link_size_quantile",
         "new_link_highlighted",
+        "new_link_distance_distribution",
+        "outside_cluster_distance_distribution",
         "average_all_link_distance",
         "all_link_connected_count",
         "all_link_disconnected_count",
@@ -305,6 +367,7 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "all_link_residual",
         "all_link_size_quantile",
         "all_link_highlighted",
+        "all_link_distance_distribution",
     ]
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", newline="", encoding="utf-8") as handle:

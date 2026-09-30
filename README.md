@@ -160,12 +160,13 @@ the cluster's highest-frequency keyword.
 
 ## Website
 
-Build the three-page site:
+Build the four-page site:
 
 ```bash
 openalex build-website \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
+  --new-link-visualizations-dir output/new_link_visualizations \
   --db-path /path/to/articles.db \
   --output-dir output/website
 python -m http.server --directory output/website 8000
@@ -176,7 +177,15 @@ complete-linkage keyword hierarchy and a sidebar with each node's share of
 that year's articles and its descendant keywords. `clusters.html` lists every
 cluster from `cluster-events`. A cluster's size is the number of documents
 that contain any of its keywords, divided by the total number of documents,
-and each row plots that share by year.
+and each row plots that share by year. `link-distances.html` interactively
+plots cluster paper count on a logarithmic x-axis against the two mean-distance
+measures from `visualize-new-links`. Its points use one neutral style rather
+than the static plots' residual highlights; hovering a point shows the cluster
+and its share-of-papers curve by year, followed by its discrete connected-link
+distance distribution (0, 1, 2, ...) overlaid with the sampling-weighted
+distribution of new links outside every cluster (`cluster_id == -1`). The
+cluster search matches labels, member keywords, and cluster ids, and filters
+the scatter points immediately.
 
 When genuine classifications are available, the index, dendrogram, and cluster
 list use those keywords. Artefact-labelled members are left out of a cluster.
@@ -192,7 +201,8 @@ that no clusters were supplied. `--db-path` divides each yearly frequency
 by the number of articles published that year. The count is one read-only
 `GROUP BY publication_year` over `idx_publication_year`, so the article rows
 are not read. Without `--db-path`, the curves use the processed-paper totals
-stored in the event manifest.
+stored in the event manifest. Omitting `--new-link-visualizations-dir` leaves
+the link-distance page in an empty state.
 
 Publish a fresh orphan `gh-pages` commit with:
 

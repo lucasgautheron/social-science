@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sqlite3
@@ -25,9 +26,11 @@ SITE_ASSETS = (
     "index.html",
     "dendrogram.html",
     "clusters.html",
+    "link-distances.html",
     "app.js",
     "dendrogram.js",
     "clusters.js",
+    "link-distances.js",
     "style.css",
 )
 
@@ -440,6 +443,76 @@ def build_cluster_list(
     return rows
 
 
+def load_link_distance_summary(
+    visualizations_dir: str | Path,
+    clusters: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Load new-link scatter data and attach each cluster's temporal series."""
+    path = (
+        Path(visualizations_dir).expanduser().resolve()
+        / "cluster_link_distance_summary.csv"
+    )
+    yearly_by_group = {
+        int(cluster["group"]): cluster
+        for cluster in (clusters or [])
+    }
+    integer_fields = (
+        "paper_count",
+        "new_link_connected_count",
+        "new_link_disconnected_count",
+        "all_link_connected_count",
+        "all_link_disconnected_count",
+        "all_link_existing_count",
+        "all_link_observation_count",
+    )
+    distance_fields = (
+        "average_new_link_distance",
+        "average_all_link_distance",
+    )
+    distribution_fields = (
+        "new_link_distance_distribution",
+        "all_link_distance_distribution",
+        "outside_cluster_distance_distribution",
+    )
+    rows: list[dict[str, Any]] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "cluster_id",
+            "label",
+            *integer_fields,
+            *distance_fields,
+            *distribution_fields,
+        }
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "New-link summary is missing columns: "
+                + ", ".join(sorted(missing))
+            )
+        for source in reader:
+            cluster_id = int(source["cluster_id"])
+            cluster = yearly_by_group.get(cluster_id)
+            row: dict[str, Any] = {
+                "cluster_id": cluster_id,
+                "label": source["label"],
+                "keywords": [] if cluster is None else list(cluster["keywords"]),
+                "yearly": [] if cluster is None else list(cluster["yearly"]),
+            }
+            row.update({field: int(source[field]) for field in integer_fields})
+            for field in distance_fields:
+                value = float(source[field])
+                row[field] = value if math.isfinite(value) else None
+            for field in distribution_fields:
+                distribution = json.loads(source[field])
+                row[field] = [
+                    [int(distance), float(count)]
+                    for distance, count in distribution
+                ]
+            rows.append(row)
+    return rows
+
+
 def _cluster_document_counts(
     artifacts: dict[str, Any],
     selected_indices: np.ndarray,
@@ -506,6 +579,7 @@ def build_website(
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
     filtered_dir: str | Path | None = None,
     db_path: str | Path | None = None,
+    new_link_visualizations_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
     vocabulary = artifacts["vocabulary"]
@@ -559,6 +633,22 @@ def build_website(
                 }
             )
         node["yearly"] = yearly
+    cluster_list = (
+        build_cluster_list(
+            artifacts,
+            clusters_dir,
+            allowed=allowed,
+            papers_by_year=papers_by_year,
+            total_documents=total_documents,
+        )
+        if clusters_dir is not None
+        else None
+    )
+    link_distances = (
+        load_link_distance_summary(new_link_visualizations_dir, cluster_list)
+        if new_link_visualizations_dir is not None
+        else None
+    )
     payload = {
         "meta": {
             "processed_papers": processed,
@@ -580,21 +670,17 @@ def build_website(
         ],
         "dendrogram": {"nodes": nodes},
         "coarse_matrix": _sparse_payload(clustered["coarse"]),
-        "cluster_list": (
-            build_cluster_list(
-                artifacts,
-                clusters_dir,
-                allowed=allowed,
-                papers_by_year=papers_by_year,
-                total_documents=total_documents,
-            )
-            if clusters_dir is not None
-            else None
-        ),
+        "cluster_list": cluster_list,
+        "link_distances": link_distances,
     }
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    expected_html = {"index.html", "dendrogram.html", "clusters.html"}
+    expected_html = {
+        "index.html",
+        "dendrogram.html",
+        "clusters.html",
+        "link-distances.html",
+    }
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
             stale_html.unlink()
@@ -617,6 +703,9 @@ def build_website(
         "clusters": payload["meta"]["clusters"],
         "event_clusters": (
             0 if payload["cluster_list"] is None else len(payload["cluster_list"])
+        ),
+        "link_clusters": (
+            0 if payload["link_distances"] is None else len(payload["link_distances"])
         ),
         "keyword_filter": payload["meta"]["keyword_filter"],
         "genuine_keywords": None if allowed is None else len(allowed),
@@ -650,6 +739,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "filter-events output whose genuine keywords are shown. "
             "Defaults to a filtered_events directory beside --events-dir when classifications.csv exists."
+        ),
+    )
+    parser.add_argument(
+        "--new-link-visualizations-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional visualize-new-links output used by link-distances.html."
         ),
     )
     parser.add_argument("--top-keywords", type=int, default=DEFAULT_TOP_KEYWORDS)
@@ -689,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster_similarity=args.cluster_similarity,
         filtered_dir=args.filtered_dir,
         db_path=args.db_path,
+        new_link_visualizations_dir=args.new_link_visualizations_dir,
     )
     print(json.dumps(summary, indent=2))
     return 0

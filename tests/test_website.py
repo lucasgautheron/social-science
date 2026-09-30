@@ -104,7 +104,7 @@ def test_complete_linkage_and_coarse_matrix_preserve_counts(tmp_path):
     assert result["coarse"].sum() == result["matrix"].sum()
 
 
-def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
+def test_website_has_four_pages_and_exact_paper_unions(tmp_path):
     event_dir = tmp_path / "events"
     site_dir = tmp_path / "site"
     write_event_fixture(event_dir)
@@ -121,6 +121,7 @@ def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
     assert (site_dir / "index.html").is_file()
     assert (site_dir / "dendrogram.html").is_file()
     assert (site_dir / "clusters.html").is_file()
+    assert (site_dir / "link-distances.html").is_file()
     assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
@@ -131,6 +132,59 @@ def test_website_has_three_pages_and_exact_paper_unions(tmp_path):
         {"year": 2020, "papers": 2, "share": 1.0},
         {"year": 2021, "papers": 2, "share": 2 / 3},
     ]
+
+
+def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    plots_dir = tmp_path / "plots"
+    site_dir = tmp_path / "site"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    plots_dir.mkdir()
+    (plots_dir / "cluster_link_distance_summary.csv").write_text(
+        "cluster_id,label,paper_count,average_new_link_distance,"
+        "new_link_connected_count,new_link_disconnected_count,"
+        "average_all_link_distance,all_link_connected_count,"
+        "all_link_disconnected_count,all_link_existing_count,"
+        "all_link_observation_count,new_link_distance_distribution,"
+        "all_link_distance_distribution,outside_cluster_distance_distribution\n"
+        '0,beta,4,2.5,8,2,1.25,10,2,2,12,"[[1,8],[2,2]]","[[0,2],[2,8]]","[[2,20],[3,5]]"\n'
+        '1,gamma,2,nan,0,3,3.0,4,3,1,7,[],"[[0,1],[3,3]]","[[2,20],[3,5]]"\n',
+        encoding="utf-8",
+    )
+
+    summary = build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        new_link_visualizations_dir=plots_dir,
+        output_dir=site_dir,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+    )
+
+    assert summary["link_clusters"] == 2
+    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    first, second = payload["link_distances"]
+    assert first["label"] == "beta"
+    assert first["keywords"] == ["beta", "alpha"]
+    assert first["yearly"] == payload["cluster_list"][0]["yearly"]
+    assert first["average_new_link_distance"] == 2.5
+    assert first["new_link_distance_distribution"] == [[1, 8.0], [2, 2.0]]
+    assert first["outside_cluster_distance_distribution"] == [
+        [2, 20.0],
+        [3, 5.0],
+    ]
+    assert second["average_new_link_distance"] is None
+    script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
+    assert "scatter-point" in script
+    assert "Connected-distance distribution" in script
+    assert "New links outside clusters" in script
+    assert "All clusters" not in script
+    assert "filteredRows()" in script
+    assert "new_link_highlighted" not in script
+    page = (site_dir / "link-distances.html").read_text(encoding="utf-8")
+    assert 'id="cluster-search"' in page
 
 
 def test_cluster_list_counts_documents_once(tmp_path):

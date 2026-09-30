@@ -631,6 +631,14 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert int(rows[0]["all_link_new_connected_count"]) == 2
     assert int(rows[0]["all_link_distance_sample_count"]) == 2
     assert int(rows[0]["all_link_disconnected_count"]) == 2
+    assert json.loads(rows[0]["new_link_distance_distribution"]) == [[2, 1.0]]
+    assert json.loads(rows[0]["all_link_distance_distribution"]) == [
+        [0, 1.0],
+        [2, 2.0],
+    ]
+    assert json.loads(rows[0]["outside_cluster_distance_distribution"]) == [
+        [3, 1.0]
+    ]
     assert float(rows[1]["average_all_link_distance"]) == pytest.approx(2)
     assert int(rows[1]["all_link_disconnected_count"]) == 3
     assert rows[0]["label"] == "alpha"
