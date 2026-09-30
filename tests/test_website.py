@@ -73,7 +73,7 @@ def write_cluster_fixture(root):
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "method": "nested-degree-corrected-sbm",
+                "method": "degree-corrected-assortative-sbm",
                 "keywords": "keywords.npy",
                 "groups_by_level": "groups_by_level.npy",
                 "coarse_level": 0,

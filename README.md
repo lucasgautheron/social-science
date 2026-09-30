@@ -56,7 +56,8 @@ paper contains multiple keywords in that cluster.
 
 ## Cluster events
 
-Cluster those keywords with a nested degree-corrected stochastic block model.
+Cluster those keywords with a degree-corrected assortative stochastic block
+model (graph-tool's planted partition model).
 `graph-tool` is installed from conda-forge, separately from the pip extras:
 
 ```bash
@@ -68,13 +69,68 @@ openalex cluster-events \
 
 The fit treats each off-diagonal co-occurrence count as an undirected edge
 multiplicity and keeps the shortest description length across `--restarts`.
-Level 0 is the finest partition; coarser cuts of the same hierarchy are written
-too. A paper that contains several keywords from one cluster contributes once
-to that cluster's yearly count.
+Groups are assortative: a keyword is placed with the keywords it co-occurs
+with, and the number of groups is chosen by the description length. A paper
+that contains several keywords from one cluster contributes once to that
+cluster's yearly count.
 
 The default vocabulary is the keywords listed in `events.csv`. `--keywords all`
 clusters every keyword in the co-occurrence vocabulary. `--level` selects which
 hierarchy depth is reported as `group` in `keyword_groups.csv`.
+
+## New coauthorship links
+
+Build every author pair in its first coauthorship year, its distance in the
+cumulative network through the preceding year, and a uniquely attributable
+event cluster:
+
+```bash
+openalex new-links \
+  --db-path /path/to/articles.db \
+  --events-dir output/events \
+  --clusters-dir output/event_clusters \
+  --output-dir output/new_links
+```
+
+All new links are added to the cumulative graph. Results retain simple random
+samples of up to 10,000 no-cluster links per year and 10,000 links per
+attributed cluster and year; change these with `--no-cluster-sample` and
+`--cluster-sample`, and reproduce them with `--sampling-seed`. They are
+partitioned as `years/<year>.npz`, with int32 `author_i` and `author_j` indices
+into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
+`sampling_weight`. Distance `-1` means the authors were disconnected. Cluster
+`-1` means no unique cluster is present on every paper responsible for that
+first-year link. Use `sampling_weight` when estimating totals. Exact
+population/sample counts and inclusion probabilities are in `manifest.json`.
+Event artifacts produced before article-id incidence sidecars were added must
+be regenerated.
+
+Both `network` and `new-links` skip papers with more than 16 authors by
+default; change this with `--max-authors`. Exact distances use bidirectional
+BFS for sources with few targets and grouped BFS otherwise. Per-year search
+counts, visited nodes, inspected edges, and timing are recorded under
+`distance_stats` in the new-link manifest.
+
+Plot cluster paper counts on a logarithmic x-axis against connected-only mean
+distance:
+
+```bash
+openalex visualize-new-links \
+  --new-links-dir output/new_links \
+  --output-dir output/new_link_visualizations
+```
+
+This writes separate scatter plots for first links and for all coauthor-pair
+observations on cluster papers. In the latter, pairs already linked before the
+paper contribute distance zero. Connected new observations use one uniform
+reservoir of up to `--cluster-sample` observations per cluster across all
+years. Exact connected denominators and reservoir-weighted distance sums keep
+the plotted means design-unbiased. (The first-link output above remains sampled
+per cluster and year.) Disconnected pairs are excluded from both means and
+reported separately in `cluster_link_distance_summary.csv`. Points are gray;
+within each of four size quantiles, the most positive and negative residuals
+from a regression on log paper count are highlighted in red and labeled with
+the cluster's highest-frequency keyword.
 
 ## Website
 

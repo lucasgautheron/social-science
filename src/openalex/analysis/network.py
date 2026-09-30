@@ -27,7 +27,7 @@ from scipy import sparse
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_AUTHORS = 100
+DEFAULT_MAX_AUTHORS = 16
 DEFAULT_MAX_EDGES = 200_000_000
 DEFAULT_CACHE_MB = 2048
 _FETCH_SIZE = 200_000

@@ -117,7 +117,9 @@ class LemmaTokenizer(object):
         return [self.wnl.lemmatize(t) for t in word_tokenize(articles)]
 
 
-# Configure logging
+# Configure logging. fast-langdetect logs one INFO line for every abstract
+# longer than its 80-character model window, which hides batch progress.
+logging.getLogger("fast_langdetect").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -350,13 +352,15 @@ def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
             'cooccurrence': sparse.csr_matrix((n_terms, n_terms), dtype=np.int64),
             'doc_frequency': np.zeros(n_terms, dtype=np.int64),
             'article_term': sparse.csr_matrix((0, n_terms), dtype=np.int8),
+            'article_ids': np.array([], dtype=np.int64),
             'years': np.array([], dtype=np.int32),
             'processed_docs': 0,
         }
 
     texts = []
+    article_ids = []
     years = []
-    for _article_id, year, title, abstract in articles_data:
+    for article_id, year, title, abstract in articles_data:
         title = title or ""
         abstract = abstract or ""
         if not ((title and is_english(title)) or (abstract and is_english(abstract))):
@@ -365,6 +369,7 @@ def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
         processed_text = preprocess_text(title + '. ' + abstract)
         if processed_text.strip():
             texts.append(processed_text)
+            article_ids.append(int(article_id))
             years.append(int(year))
 
     if not texts:
@@ -372,6 +377,7 @@ def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
             'cooccurrence': sparse.csr_matrix((n_terms, n_terms), dtype=np.int64),
             'doc_frequency': np.zeros(n_terms, dtype=np.int64),
             'article_term': sparse.csr_matrix((0, n_terms), dtype=np.int8),
+            'article_ids': np.array([], dtype=np.int64),
             'years': np.array([], dtype=np.int32),
             'processed_docs': 0,
         }
@@ -398,6 +404,7 @@ def extract_cooccurrence_for_articles(articles_data: List[Tuple]) -> Dict:
         'cooccurrence': cooccurrence,
         'doc_frequency': doc_frequency,
         'article_term': article_term,
+        'article_ids': np.asarray(article_ids, dtype=np.int64),
         'years': np.asarray(years, dtype=np.int32),
         'processed_docs': len(texts),
     }
@@ -1082,34 +1089,43 @@ class EventExtractor:
     ) -> int:
         """Persist one filtered paper-keyword shard for a database batch."""
         article_terms = []
+        article_ids_by_chunk = []
         years_by_chunk = []
         for chunk_result in chunk_results:
             article_term = chunk_result['article_term'].tocsr()
+            article_ids = np.asarray(chunk_result['article_ids'], dtype=np.int64)
             years = np.asarray(chunk_result['years'], dtype=np.int32)
-            if article_term.shape[0] != len(years):
-                raise ValueError("Incidence rows and years do not match")
+            if article_term.shape[0] != len(years) or article_term.shape[0] != len(article_ids):
+                raise ValueError("Incidence rows, article ids, and years do not match")
             keep = np.asarray(article_term.getnnz(axis=1)).ravel() > 0
             if np.any(keep):
                 article_terms.append(article_term[keep])
+                article_ids_by_chunk.append(article_ids[keep])
                 years_by_chunk.append(years[keep])
 
         if not article_terms:
             return 0
 
         article_term = sparse.vstack(article_terms, format="csr")
+        article_ids = np.concatenate(article_ids_by_chunk)
         years = np.concatenate(years_by_chunk)
         incidence_dir = self.output_dir / "incidence"
         incidence_dir.mkdir(parents=True, exist_ok=True)
         stem = f"part_{batch_number:06d}"
         matrix_path = incidence_dir / f"{stem}.npz"
+        article_ids_path = incidence_dir / f"{stem}_article_ids.npy"
         years_path = incidence_dir / f"{stem}_years.npy"
         matrix_tmp = incidence_dir / f".{stem}.npz.tmp"
+        article_ids_tmp = incidence_dir / f".{stem}_article_ids.npy.tmp"
         years_tmp = incidence_dir / f".{stem}_years.npy.tmp"
         with matrix_tmp.open("wb") as handle:
             sparse.save_npz(handle, article_term, compressed=True)
+        with article_ids_tmp.open("wb") as handle:
+            np.save(handle, article_ids, allow_pickle=False)
         with years_tmp.open("wb") as handle:
             np.save(handle, years, allow_pickle=False)
         matrix_tmp.replace(matrix_path)
+        article_ids_tmp.replace(article_ids_path)
         years_tmp.replace(years_path)
         return article_term.shape[0]
 
@@ -1250,6 +1266,7 @@ class EventExtractor:
             "document_frequency": "event_document_frequency.npy",
             "incidence_dir": "incidence",
             "incidence_parts": incidence_parts,
+            "incidence_article_ids": True,
             "processed_papers": int(self.total_docs_processed),
             "papers_by_year": {
                 str(year): int(count)

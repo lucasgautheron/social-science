@@ -18,8 +18,10 @@ COMMANDS = {
     "events": "openalex.events",
     "export-parquet": "openalex.db.export_parquet",
     "network": "openalex.analysis.network",
+    "new-links": "openalex.analysis.new_links",
     "random-order": "openalex.db.random_order",
     "vacuum": "openalex.db.vacuum",
+    "visualize-new-links": "openalex.visualizations.new_links",
 }
 
 

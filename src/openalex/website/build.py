@@ -754,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--clusters-dir",
         type=Path,
         default=None,
-        help="Optional nested blockmodel output used by graph.html.",
+        help="Optional blockmodel output used by graph.html.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
     parser.add_argument("--top-keywords", type=int, default=DEFAULT_TOP_KEYWORDS)

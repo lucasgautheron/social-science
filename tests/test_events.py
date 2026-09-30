@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import sqlite3
 
 import numpy as np
@@ -90,6 +91,13 @@ def test_cooccurrence_counts_do_not_overflow_int8(monkeypatch):
     assert result["cooccurrence"][0, 1] == 256
 
 
+def test_language_detection_does_not_log_every_truncation(caplog):
+    text = "This English abstract is intentionally much longer than eighty characters."
+    with caplog.at_level(logging.INFO):
+        events.is_english(text)
+    assert "Truncating input" not in caplog.text
+
+
 def test_article_chunks_cover_every_process():
     assert events.article_chunk_size(100000, 2000, 64) == 781
     assert len(events.chunk_articles([object()] * 100000, 781)) == 129
@@ -108,10 +116,12 @@ def test_incidence_chunks_are_filtered_and_combined_per_batch(tmp_path):
     chunk_results = [
         {
             "article_term": sparse.csr_matrix([[1, 0], [0, 0]], dtype=np.int8),
+            "article_ids": np.array([11, 12], dtype=np.int64),
             "years": np.array([2020, 2021], dtype=np.int32),
         },
         {
             "article_term": sparse.csr_matrix([[0, 0], [0, 1]], dtype=np.int8),
+            "article_ids": np.array([13, 14], dtype=np.int64),
             "years": np.array([2022, 2023], dtype=np.int32),
         },
     ]
@@ -123,6 +133,7 @@ def test_incidence_chunks_are_filtered_and_combined_per_batch(tmp_path):
             [
                 {
                     "article_term": sparse.csr_matrix((2, 2), dtype=np.int8),
+                    "article_ids": np.array([15, 16], dtype=np.int64),
                     "years": np.array([2024, 2025], dtype=np.int32),
                 }
             ],
@@ -133,10 +144,12 @@ def test_incidence_chunks_are_filtered_and_combined_per_batch(tmp_path):
     incidence_dir = tmp_path / "events" / "incidence"
     assert sorted(path.name for path in incidence_dir.iterdir()) == [
         "part_000001.npz",
+        "part_000001_article_ids.npy",
         "part_000001_years.npy",
     ]
     assert sparse.load_npz(incidence_dir / "part_000001.npz").toarray().tolist() == [
         [1, 0],
         [0, 1],
     ]
+    assert np.load(incidence_dir / "part_000001_article_ids.npy").tolist() == [11, 14]
     assert np.load(incidence_dir / "part_000001_years.npy").tolist() == [2020, 2023]

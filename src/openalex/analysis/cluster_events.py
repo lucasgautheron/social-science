@@ -1,16 +1,16 @@
-"""Cluster event keywords with a nested degree-corrected block model.
+"""Cluster event keywords with a degree-corrected assortative block model.
 
 The co-occurrence matrix is an undirected multigraph: each keyword is a node
 and each off-diagonal count is the number of papers in which two keywords
 appear together. Self-counts stay off the graph because they record document
-frequency, not a pair of distinct keywords. A nested degree-corrected
-stochastic block model is fit by minimizing description length, so the number
-of groups and the depth of each branch are chosen by the data rather than by
-one cosine threshold.
+frequency, not a pair of distinct keywords. The assortative model is
+graph-tool's degree-corrected planted partition model: groups are denser
+inside than between them, and the number of groups is chosen by minimizing
+description length.
 
-The finest hierarchy level is the partition used for the coarsened matrix
-``H.T @ M @ H``. Coarser levels are exported as well. Yearly cluster counts
-read the Boolean paper-keyword incidence and count each paper once per cluster.
+The fitted partition is the grouping used for the coarsened matrix
+``H.T @ M @ H``. Yearly cluster counts read the Boolean paper-keyword
+incidence and count each paper once per cluster.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RESTARTS = 3
 DEFAULT_SEED = 0
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 1
-METHOD = "nested-degree-corrected-sbm"
+METHOD = "degree-corrected-assortative-sbm"
 
 
 @dataclass(frozen=True)
@@ -126,13 +126,17 @@ def coarsen(adjacency: sparse.csr_matrix, groups: np.ndarray) -> sparse.csr_matr
     return coarse
 
 
-def fit_nested_degree_corrected(
+def fit_assortative(
     adjacency: sparse.csr_matrix,
     *,
     restarts: int,
     seed: int,
 ) -> BlockmodelFit:
-    """Fit a nested degree-corrected SBM and keep the shortest description."""
+    """Fit a degree-corrected assortative SBM and keep the shortest description.
+
+    The state is graph-tool's planted partition model (``PPBlockState``). Edge
+    weights are co-occurrence multiplicities, and degree correction stays on.
+    """
     if restarts < 1:
         raise ValueError("--restarts must be >= 1")
     graph_tool, inference = _import_graph_tool()
@@ -153,20 +157,19 @@ def fit_nested_degree_corrected(
     states = []
     for restart in range(restarts):
         logger.info("Blockmodel restart %s/%s", restart + 1, restarts)
-        state = inference.minimize_nested_blockmodel_dl(
+        state = inference.minimize_blockmodel_dl(
             graph,
-            base_state_args={"eweight": weights, "deg_corr": True},
+            state=inference.PPBlockState,
+            state_args={"eweight": weights, "deg_corr": True},
         )
         length = float(state.entropy())
         logger.info("Restart %s description length: %.6f nats", restart + 1, length)
         states.append((length, state))
     length, state = min(states, key=lambda item: item[0])
-    levels = tuple(
-        np.asarray(level.get_blocks().a, dtype=np.int64).copy() for level in state.get_levels()
-    )
-    if not levels or levels[0].shape != (adjacency.shape[0],):
+    blocks = np.asarray(state.get_blocks().a, dtype=np.int64).copy()
+    if blocks.shape != (adjacency.shape[0],):
         raise RuntimeError("Blockmodel did not return a partition of the keywords")
-    return BlockmodelFit(levels=levels, description_length=length)
+    return BlockmodelFit(levels=(blocks,), description_length=length)
 
 
 def select_keywords(
@@ -297,7 +300,7 @@ def cluster_event_keywords(
         len(selected),
         adjacency.nnz // 2,
     )
-    fitter = fit_nested_degree_corrected if fit is None else fit
+    fitter = fit_assortative if fit is None else fit
     fitted = fitter(adjacency, restarts=restarts, seed=seed)
     if level >= len(fitted.levels):
         raise ValueError(
@@ -341,7 +344,7 @@ def cluster_event_keywords(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Cluster event keywords with a nested degree-corrected stochastic "
+            "Cluster event keywords with a degree-corrected assortative stochastic "
             "block model and export cluster-level events."
         )
     )
@@ -370,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--level",
         type=int,
         default=0,
-        help="Hierarchy depth reported as group in keyword_groups.csv. 0 is the finest partition.",
+        help="Partition reported as group in keyword_groups.csv. The assortative fit has a single level, 0.",
     )
     return parser
 
@@ -428,7 +431,7 @@ def _import_graph_tool():
         import graph_tool.inference
     except ImportError as error:
         raise RuntimeError(
-            "graph-tool is required for nested blockmodel clustering. "
+            "graph-tool is required for assortative blockmodel clustering. "
             "Install it from conda-forge: conda install -c conda-forge graph-tool"
         ) from error
     return graph_tool, graph_tool.inference

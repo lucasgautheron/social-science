@@ -9,7 +9,7 @@ from openalex.analysis.cluster_events import (
     BlockmodelFit,
     cluster_event_keywords,
     cooccurrence_adjacency,
-    fit_nested_degree_corrected,
+    fit_assortative,
     project_level,
 )
 from openalex.cli import COMMANDS
@@ -153,7 +153,7 @@ def test_cluster_events_count_each_paper_once(tmp_path):
     assert "rare" not in by_keyword
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["method"] == "nested-degree-corrected-sbm"
+    assert manifest["method"] == "degree-corrected-assortative-sbm"
     assert manifest["degree_corrected"] is True
     assert manifest["diagonal"] == "removed"
 
@@ -173,4 +173,4 @@ def test_missing_graph_tool_explains_the_install(monkeypatch):
     monkeypatch.setattr("builtins.__import__", blocked)
     adjacency = sparse.csr_matrix([[0, 1], [1, 0]], dtype=np.int64)
     with pytest.raises(RuntimeError, match="conda-forge"):
-        fit_nested_degree_corrected(adjacency, restarts=1, seed=0)
+        fit_assortative(adjacency, restarts=1, seed=0)
