@@ -21,13 +21,14 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from scipy import sparse
 
+from openalex.analysis.filter_events import find_filtered_events, genuine_ngrams
 from openalex.website.build import load_event_artifacts
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,7 @@ def select_keywords(
     *,
     source: str,
     min_document_frequency: int,
+    allowed: Collection[str] | None = None,
 ) -> np.ndarray:
     """Choose vocabulary rows, in vocabulary order."""
     if min_document_frequency < 1:
@@ -190,6 +192,8 @@ def select_keywords(
         selected = np.flatnonzero(eligible).astype(np.int64, copy=False)
     else:
         wanted = {row["ngram"] for row in _event_rows(Path(artifacts["root"]))}
+        if allowed is not None:
+            wanted &= set(allowed)
         selected = np.asarray(
             [
                 index
@@ -199,6 +203,8 @@ def select_keywords(
             dtype=np.int64,
         )
     if selected.size == 0:
+        if allowed is not None:
+            raise ValueError("No genuine keywords passed the document-frequency filter")
         raise ValueError("No keywords passed the document-frequency filter")
     return selected
 
@@ -276,6 +282,7 @@ def cluster_event_keywords(
     restarts: int = DEFAULT_RESTARTS,
     seed: int = DEFAULT_SEED,
     level: int = 0,
+    filtered_dir: str | Path | None = None,
     fit: FitFunction | None = None,
 ) -> dict[str, object]:
     """Cluster event keywords and write the coarsened event artifacts."""
@@ -289,10 +296,15 @@ def cluster_event_keywords(
         raise ValueError("--restarts must be >= 1")
 
     artifacts = load_event_artifacts(events_root)
+    filtered_root = find_filtered_events(events_root, filtered_dir) if source == "events" else None
+    allowed = genuine_ngrams(filtered_root) if filtered_root is not None else None
+    if allowed is not None:
+        logger.info("Restricting clusters to %s genuine keywords from %s", len(allowed), filtered_root)
     selected = select_keywords(
         artifacts,
         source=source,
         min_document_frequency=min_document_frequency,
+        allowed=allowed,
     )
     adjacency = cooccurrence_adjacency(artifacts["matrix"], selected)
     logger.info(
@@ -322,10 +334,12 @@ def cluster_event_keywords(
         min_document_frequency=min_document_frequency,
         restarts=restarts,
         seed=seed,
+        filtered_dir=str(filtered_root) if filtered_root is not None else None,
     )
     summary = {
         "output_dir": str(output),
         "keywords": int(len(selected)),
+        "keyword_filter": "genuine" if allowed is not None else source,
         "levels": int(groups_by_level.shape[0]),
         "groups": int(chosen.max()) + 1 if chosen.size else 0,
         "level": int(level),
@@ -354,7 +368,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--keywords",
         choices=("events", "all"),
         default="events",
-        help="Cluster events.csv keywords, or every keyword in the co-occurrence vocabulary.",
+        help=(
+            "Cluster events.csv keywords, or every keyword in the co-occurrence vocabulary. "
+            "The events source uses genuine keywords when filter-events output is available."
+        ),
+    )
+    parser.add_argument(
+        "--filtered-dir",
+        type=Path,
+        default=None,
+        help=(
+            "filter-events output whose genuine keywords are clustered. "
+            "Defaults to a filtered_events directory beside --events-dir when classifications.csv exists. "
+            "Ignored with --keywords all."
+        ),
     )
     parser.add_argument(
         "--min-document-frequency",
@@ -389,6 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         restarts=args.restarts,
         seed=args.seed,
         level=args.level,
+        filtered_dir=args.filtered_dir,
     )
     print(json.dumps(summary, indent=2))
     return 0
@@ -451,6 +479,7 @@ def _write_outputs(
     min_document_frequency: int,
     restarts: int,
     seed: int,
+    filtered_dir: str | None,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     coarse_dir = output / "coarse"
@@ -497,6 +526,8 @@ def _write_outputs(
         "coarse_dir": "coarse",
         "coarse_level": int(chosen_level),
         "keyword_source": source,
+        "keyword_filter": "genuine" if filtered_dir else source,
+        "filtered_dir": filtered_dir,
         "min_document_frequency": int(min_document_frequency),
         "restarts": int(restarts),
         "seed": int(seed),

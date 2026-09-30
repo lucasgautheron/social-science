@@ -213,6 +213,40 @@ def test_graph_modes_colors_sizes_edges_and_barycenters(tmp_path, monkeypatch):
     assert "canvas" in (site_dir / "graph.html").read_text(encoding="utf-8")
 
 
+def test_website_uses_genuine_keywords_when_available(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    site_dir = tmp_path / "site"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    filtered = tmp_path / "filtered_events"
+    filtered.mkdir()
+    (filtered / "classifications.csv").write_text(
+        "ngram,label,reason\n"
+        "alpha,genuine,topic\n"
+        "beta,genuine,topic\n"
+        "gamma,artefact,non-English\n",
+        encoding="utf-8",
+    )
+    summary = build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        output_dir=site_dir,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+        max_graph_keywords=3,
+    )
+    assert summary["keyword_filter"] == "genuine"
+    assert summary["genuine_keywords"] == 2
+    assert summary["dendrogram_keywords"] == 2
+    assert summary["graph_keywords"] == 2
+    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
+    assert set(root["keywords"]) == {"alpha", "beta"}
+    assert [item["keyword"] for item in payload["top_keywords"]] == ["beta", "alpha"]
+    assert [node["keyword"] for node in payload["graph"]["keyword"]["nodes"]] == ["beta", "alpha"]
+
+
 def test_npmi_discards_zero_and_negative_edges():
     matrix = sparse.csr_matrix(
         [

@@ -74,9 +74,12 @@ with, and the number of groups is chosen by the description length. A paper
 that contains several keywords from one cluster contributes once to that
 cluster's yearly count.
 
-The default vocabulary is the keywords listed in `events.csv`. `--keywords all`
-clusters every keyword in the co-occurrence vocabulary. `--level` selects which
-hierarchy depth is reported as `group` in `keyword_groups.csv`.
+The default vocabulary is the keywords listed in `events.csv`. When
+`filtered_events/classifications.csv` sits beside that events directory, or
+`--filtered-dir` points at filter-events output, only keywords labelled
+genuine are clustered. `--keywords all` keeps the full co-occurrence
+vocabulary. `--level` selects which hierarchy depth is reported as `group`
+in `keyword_groups.csv`.
 
 ## Filter events
 
@@ -92,9 +95,15 @@ openalex filter-events \
   --output-dir output/filtered_events
 ```
 
-The command reads `OPENAI_API_KEY`. `classifications.csv` records the label, a
-short reason, and those three neighbors. `classifications.jsonl` is the
-checkpoint; `--resume` skips keywords already classified.
+The command reads `OPENAI_API_KEY`. Requests start at least 200 ms apart
+(`--request-interval`), which keeps a run under GPT-6 Luna's Tier 1 limit of
+500 requests and 500,000 tokens per minute. `classifications.csv` records the
+label, a short reason, and those three neighbors. `classifications.jsonl` is
+the checkpoint; `--resume` skips keywords already classified.
+
+`cluster-events` and `build-website` use the genuine keywords from that file
+when it is available. `--keywords all` on the cluster command keeps every
+co-occurrence keyword.
 
 ## New coauthorship links
 
@@ -172,6 +181,9 @@ their displayed keywords. Graph edges use normalized pointwise mutual
 information (NPMI); zero and negative values are omitted. Cluster NPMI is
 computed from exact paper-level cluster incidence, counting a paper once even
 when it contains several keywords from the cluster.
+
+When genuine classifications are available, the index, dendrogram, and graph
+use those keywords. The graph drops cluster members labelled artefacts.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,

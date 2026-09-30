@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ from openalex.analysis.filter_events import (
     Classification,
     KeywordContext,
     Neighbor,
+    RequestThrottle,
     classification_from_response,
     classify_keyword,
     filter_events,
@@ -159,6 +161,30 @@ def test_classify_keyword_sends_neighbors_to_gpt_luna():
     assert verdict.label == "genuine"
 
 
+def test_requests_start_at_least_one_interval_apart():
+    starts = []
+
+    class Responses:
+        def create(self, **kwargs):
+            starts.append(time.monotonic())
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(text='{"label": "genuine", "reason": "A topic."}')
+                        ]
+                    )
+                ]
+            )
+
+    context = KeywordContext(ngram="alpha", neighbors=(), event={})
+    client = SimpleNamespace(responses=Responses())
+    throttle = RequestThrottle(0.05)
+    classify_keyword(context, client=client, max_retries=1, throttle=throttle)
+    classify_keyword(context, client=client, max_retries=1, throttle=throttle)
+    assert starts[1] - starts[0] >= 0.05
+
+
 def test_filter_events_classifies_each_extracted_keyword(tmp_path):
     events = tmp_path / "events"
     output = tmp_path / "filtered"
@@ -199,6 +225,13 @@ def test_filter_events_classifies_each_extracted_keyword(tmp_path):
         resume=True,
     )
     assert again == []
+
+
+def test_missing_filtered_directory_is_reported(tmp_path):
+    from openalex.analysis.filter_events import find_filtered_events
+
+    with pytest.raises(FileNotFoundError, match="classifications.csv"):
+        find_filtered_events(tmp_path / "events", tmp_path / "missing")
 
 
 def test_filter_events_command_is_registered():

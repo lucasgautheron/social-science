@@ -60,9 +60,18 @@ def select_keywords(
     *,
     min_document_frequency: int,
     max_keywords: int,
+    vocabulary: np.ndarray | None = None,
+    allowed: set[str] | None = None,
 ) -> np.ndarray:
     """Select frequent words with a nonzero filtered co-occurrence direction."""
     candidates = np.flatnonzero(frequencies >= min_document_frequency)
+    if allowed is not None:
+        if vocabulary is None:
+            raise ValueError("vocabulary is required when filtering keywords")
+        candidates = np.asarray(
+            [int(index) for index in candidates if str(vocabulary[int(index)]) in allowed],
+            dtype=np.int64,
+        )
     if not len(candidates):
         return candidates
     ranked = candidates[np.argsort(-frequencies[candidates], kind="stable")]
@@ -310,6 +319,7 @@ def build_graph_payload(
     *,
     max_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
     max_edges: int = DEFAULT_MAX_GRAPH_EDGES,
+    allowed: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build keyword and cluster graph views from blockmodel artifacts."""
     if max_keywords < 1:
@@ -317,6 +327,19 @@ def build_graph_payload(
     if max_edges < 1:
         raise ValueError("max_edges must be positive")
     clustered = load_cluster_artifacts(clusters_dir, artifacts)
+    if allowed is not None:
+        keep = np.asarray(
+            [str(keyword) in allowed for keyword in clustered["keywords"]],
+            dtype=bool,
+        )
+        if not np.any(keep):
+            raise ValueError("No cluster keywords remain after the genuine-event filter")
+        clustered = {
+            **clustered,
+            "keywords": clustered["keywords"][keep],
+            "groups": clustered["groups"][:, keep],
+            "event_indices": clustered["event_indices"][keep],
+        }
     all_indices = clustered["event_indices"]
     all_frequencies = artifacts["frequencies"][all_indices]
     order = np.argsort(-all_frequencies, kind="stable")[:max_keywords]
@@ -649,6 +672,18 @@ def _component_layout(matrix: sparse.csr_matrix) -> np.ndarray:
     return coordinates / scale if scale else coordinates
 
 
+def _genuine_event_keywords(
+    events_dir: str | Path,
+    filtered_dir: str | Path | None,
+) -> set[str] | None:
+    from openalex.analysis.filter_events import find_filtered_events, genuine_ngrams
+
+    root = find_filtered_events(events_dir, filtered_dir)
+    if root is None:
+        return None
+    return genuine_ngrams(root)
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -667,17 +702,27 @@ def build_website(
     max_graph_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
     max_graph_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
+    filtered_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
     vocabulary = artifacts["vocabulary"]
     frequencies = artifacts["frequencies"]
+    allowed = _genuine_event_keywords(events_dir, filtered_dir)
     processed = int(artifacts["manifest"].get("processed_papers") or 0)
-    top_indices = np.argsort(-frequencies, kind="stable")[:top_keywords]
+    ranked = np.argsort(-frequencies, kind="stable")
+    if allowed is not None:
+        ranked = np.asarray(
+            [int(index) for index in ranked if str(vocabulary[int(index)]) in allowed],
+            dtype=np.int64,
+        )
+    top_indices = ranked[:top_keywords]
     selected = select_keywords(
         artifacts["matrix"],
         frequencies,
         min_document_frequency=min_document_frequency,
         max_keywords=max_dendrogram_keywords,
+        vocabulary=vocabulary,
+        allowed=allowed,
     )
     clustered = cluster_keywords(
         artifacts["matrix"],
@@ -715,6 +760,7 @@ def build_website(
             "clusters": len(set(int(value) for value in clustered["labels"])),
             "min_document_frequency": min_document_frequency,
             "cluster_similarity": cluster_similarity,
+            "keyword_filter": "genuine" if allowed is not None else "vocabulary",
         },
         "top_keywords": [
             {
@@ -732,6 +778,7 @@ def build_website(
                 clusters_dir,
                 max_keywords=max_graph_keywords,
                 max_edges=max_graph_edges,
+                allowed=allowed,
             )
             if clusters_dir is not None
             else None
@@ -759,6 +806,8 @@ def build_website(
         "graph_keywords": (
             payload["graph"]["counts"]["displayed_keywords"] if payload["graph"] else 0
         ),
+        "keyword_filter": payload["meta"]["keyword_filter"],
+        "genuine_keywords": None if allowed is None else len(allowed),
     }
 
 
@@ -772,6 +821,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional blockmodel output used by graph.html.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
+    parser.add_argument(
+        "--filtered-dir",
+        type=Path,
+        default=None,
+        help=(
+            "filter-events output whose genuine keywords are shown. "
+            "Defaults to a filtered_events directory beside --events-dir when classifications.csv exists."
+        ),
+    )
     parser.add_argument("--top-keywords", type=int, default=DEFAULT_TOP_KEYWORDS)
     parser.add_argument(
         "--min-document-frequency",
@@ -823,6 +881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_graph_keywords=args.max_graph_keywords,
         max_graph_edges=args.max_graph_edges,
         cluster_similarity=args.cluster_similarity,
+        filtered_dir=args.filtered_dir,
     )
     print(json.dumps(summary, indent=2))
     return 0

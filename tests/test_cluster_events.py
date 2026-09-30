@@ -158,6 +158,51 @@ def test_cluster_events_count_each_paper_once(tmp_path):
     assert manifest["diagonal"] == "removed"
 
 
+def write_genuine_classifications(events_dir, rows, directory=None):
+    filtered = events_dir.parent / "filtered_events" if directory is None else directory
+    filtered.mkdir()
+    lines = ["ngram,label,reason", *[f"{ngram},{label},because" for ngram, label in rows]]
+    (filtered / "classifications.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def fit_partition(adjacency, *, restarts, seed):
+    count = adjacency.shape[0]
+    return BlockmodelFit(levels=(np.zeros(count, dtype=np.int64),), description_length=0.5)
+
+
+def test_cluster_events_uses_genuine_keywords_when_available(tmp_path):
+    events = tmp_path / "events"
+    output = tmp_path / "clusters"
+    write_event_fixture(events)
+    write_genuine_classifications(
+        events,
+        [("alpha", "genuine"), ("beta", "genuine"), ("gamma", "artefact")],
+    )
+    summary = cluster_event_keywords(events, output, restarts=1, seed=0, fit=fit_partition)
+    assert summary["keywords"] == 2
+    assert summary["keyword_filter"] == "genuine"
+    assert np.load(output / "keywords.npy", allow_pickle=False).astype(str).tolist() == ["alpha", "beta"]
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["keyword_filter"] == "genuine"
+
+
+def test_cluster_events_all_keeps_the_full_vocabulary(tmp_path):
+    events = tmp_path / "events"
+    output = tmp_path / "clusters"
+    write_event_fixture(events)
+    write_genuine_classifications(events, [("alpha", "genuine")])
+    summary = cluster_event_keywords(
+        events,
+        output,
+        source="all",
+        restarts=1,
+        seed=0,
+        fit=fit_partition,
+    )
+    assert summary["keywords"] == 4
+    assert summary["keyword_filter"] == "all"
+
+
 def test_cluster_events_command_is_registered():
     assert COMMANDS["cluster-events"] == "openalex.analysis.cluster_events"
 

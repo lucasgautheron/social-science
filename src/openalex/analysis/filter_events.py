@@ -32,10 +32,12 @@ logger = logging.getLogger(__name__)
 MODEL = "gpt-6-luna"
 DEFAULT_NEIGHBORS = 3
 DEFAULT_WORKERS = 8
+DEFAULT_REQUEST_INTERVAL = 0.2
 DEFAULT_REASONING_EFFORT = "low"
 DEFAULT_MAX_RETRIES = 4
 REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 LABELS = ("genuine", "artefact")
+FILTERED_DIR_NAME = "filtered_events"
 _COSINE_BATCH = 256
 
 SYSTEM_PROMPT = """You classify keywords extracted from social-science papers because their frequency changed sharply over about the last 15 years.
@@ -86,6 +88,48 @@ class Classification:
 
 
 Classify = Callable[[KeywordContext], Classification]
+
+
+def find_filtered_events(
+    events_dir: str | Path,
+    filtered_dir: str | Path | None = None,
+) -> Path | None:
+    """Return a filter-events directory, or none when classifications are absent.
+
+    An explicit directory must contain ``classifications.csv``. Otherwise the
+    sibling ``filtered_events`` directory is used when that file is there.
+    """
+    if filtered_dir is not None:
+        root = Path(filtered_dir).expanduser().resolve()
+        path = root / "classifications.csv"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{path} was not found. Run filter-events or omit --filtered-dir."
+            )
+        return root
+    sibling = Path(events_dir).expanduser().resolve().parent / FILTERED_DIR_NAME
+    if (sibling / "classifications.csv").is_file():
+        return sibling
+    return None
+
+
+def genuine_ngrams(filtered_dir: str | Path) -> set[str]:
+    """Return keywords labelled genuine in a filter-events directory."""
+    path = Path(filtered_dir) / "classifications.csv"
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "ngram" not in reader.fieldnames or "label" not in reader.fieldnames:
+            raise ValueError(f"{path} must contain ngram and label columns")
+        labels: dict[str, str] = {}
+        for row in reader:
+            label = row["label"]
+            if label not in LABELS:
+                raise ValueError(f"{path} has an unknown label {label!r} for {row['ngram']!r}")
+            labels[row["ngram"]] = label
+    genuine = {ngram for ngram, label in labels.items() if label == "genuine"}
+    if not genuine:
+        raise ValueError(f"{path} does not label any keyword genuine")
+    return genuine
 
 
 def top_correlated_indices(matrix, k: int) -> list[list[tuple[int, float]]]:
@@ -144,6 +188,28 @@ def classification_from_response(ngram: str, response) -> Classification:
     raise RuntimeError(f"Model response for {ngram!r} did not match the classification schema")
 
 
+class RequestThrottle:
+    """Keep the start of each request at least `interval` seconds apart."""
+
+    def __init__(self, interval: float):
+        if interval < 0:
+            raise ValueError("--request-interval must be >= 0")
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self) -> None:
+        if self.interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            if delay > 0:
+                time.sleep(delay)
+                now = time.monotonic()
+            self._next = max(self._next, now) + self.interval
+
+
 def classify_keyword(
     context: KeywordContext,
     *,
@@ -151,6 +217,7 @@ def classify_keyword(
     model: str = MODEL,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    throttle: RequestThrottle | None = None,
 ) -> Classification:
     """Ask the model to classify one keyword, retrying transient API errors."""
     if max_retries < 1:
@@ -159,6 +226,8 @@ def classify_keyword(
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
+            if throttle is not None:
+                throttle.wait()
             response = client.responses.create(
                 model=model,
                 reasoning={"effort": reasoning_effort},
@@ -180,7 +249,7 @@ def classify_keyword(
             last_error = error
             if attempt + 1 >= max_retries or not _retryable(error):
                 raise
-            delay = min(2**attempt, 30)
+            delay = _retry_delay(error, attempt)
             logger.warning(
                 "Retrying %s after %s (%s/%s)",
                 context.ngram,
@@ -200,6 +269,7 @@ def filter_events(
     model: str = MODEL,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     workers: int = DEFAULT_WORKERS,
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
     max_retries: int = DEFAULT_MAX_RETRIES,
     resume: bool = False,
     client=None,
@@ -210,6 +280,8 @@ def filter_events(
         raise ValueError("--neighbors must be >= 1")
     if workers < 1:
         raise ValueError("--workers must be >= 1")
+    if request_interval < 0:
+        raise ValueError("--request-interval must be >= 0")
     if reasoning_effort not in REASONING_EFFORTS:
         raise ValueError(f"--reasoning-effort must be one of {', '.join(REASONING_EFFORTS)}")
     events_root = Path(events_dir).expanduser().resolve()
@@ -238,6 +310,8 @@ def filter_events(
     )
     if pending and classify is None:
         model_client = _openai_client(client)
+        throttle = RequestThrottle(request_interval)
+        logger.info("Spacing requests by %.0f ms", request_interval * 1000)
 
         def classify(context: KeywordContext) -> Classification:
             return classify_keyword(
@@ -246,6 +320,7 @@ def filter_events(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 max_retries=max_retries,
+                throttle=throttle,
             )
 
     verdicts = _classify_pending(pending, classify, checkpoint, completed, workers=workers)
@@ -324,6 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REASONING_EFFORT,
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=DEFAULT_REQUEST_INTERVAL,
+        help="Minimum seconds between the start of each model request, shared across workers.",
+    )
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument(
         "--resume",
@@ -343,6 +424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model=args.model,
         reasoning_effort=args.reasoning_effort,
         workers=args.workers,
+        request_interval=args.request_interval,
         max_retries=args.max_retries,
         resume=args.resume,
     )
@@ -424,6 +506,19 @@ def _parse_classification(text: str) -> dict[str, str] | None:
             continue
         return {"label": label, "reason": reason.strip()}
     return None
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    delay = min(2**attempt, 30)
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("retry-after") if headers is not None else None
+    if retry_after is None:
+        return delay
+    try:
+        return max(delay, float(retry_after))
+    except (TypeError, ValueError):
+        return delay
 
 
 def _retryable(error: Exception) -> bool:
