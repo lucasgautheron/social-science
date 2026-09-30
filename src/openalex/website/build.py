@@ -72,6 +72,22 @@ def select_keywords(
     return ranked[norms > 0]
 
 
+def l2_normalize_cooccurrence(matrix):
+    """L2-normalize each co-occurrence row, as in the keyword dendrogram.
+
+    Cosine similarity of these rows is the similarity clustered by complete
+    linkage. Every row must have positive norm; the dendrogram drops the rest
+    before calling this.
+    """
+    filtered = matrix.astype(np.float64).tocsr()
+    if filtered.shape[0] != filtered.shape[1]:
+        raise ValueError("Co-occurrence matrix must be square")
+    norms = np.sqrt(np.asarray(filtered.multiply(filtered).sum(axis=1)).ravel())
+    if norms.size and np.any(norms <= 0):
+        raise ValueError("Co-occurrence rows must have positive L2 norm")
+    return filtered.multiply(1.0 / norms[:, None]).tocsr()
+
+
 def cluster_keywords(
     matrix,
     selected_indices: np.ndarray,
@@ -90,12 +106,11 @@ def cluster_keywords(
             "labels": np.array([], dtype=np.int32),
             "coarse": sparse.csr_matrix((0, 0), dtype=matrix.dtype),
         }
-    norms = np.sqrt(np.asarray(filtered.multiply(filtered).sum(axis=1)).ravel())
-    normalized = filtered.multiply(1.0 / norms[:, None]).tocsr()
     if count == 1:
         linkage_matrix = np.empty((0, 4), dtype=float)
         labels = np.array([1], dtype=np.int32)
     else:
+        normalized = l2_normalize_cooccurrence(filtered)
         similarities = (normalized @ normalized.T).toarray()
         distances = np.clip(1.0 - similarities, 0.0, 2.0)
         np.fill_diagonal(distances, 0.0)

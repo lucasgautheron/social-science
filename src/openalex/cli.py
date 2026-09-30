@@ -16,6 +16,7 @@ COMMANDS = {
     "download": "openalex.imports.download",
     "embeddings": "openalex.analysis.embeddings",
     "events": "openalex.events",
+    "filter-events": "openalex.analysis.filter_events",
     "export-parquet": "openalex.db.export_parquet",
     "network": "openalex.analysis.network",
     "new-links": "openalex.analysis.new_links",

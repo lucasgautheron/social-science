@@ -78,6 +78,24 @@ The default vocabulary is the keywords listed in `events.csv`. `--keywords all`
 clusters every keyword in the co-occurrence vocabulary. `--level` selects which
 hierarchy depth is reported as `group` in `keyword_groups.csv`.
 
+## Filter events
+
+Classify each extracted keyword as a genuine scientific term or a spurious
+artefact. The classifier is GPT-6 Luna (`gpt-6-luna`). Each prompt shows the
+keyword and the three other keywords with the most similar co-occurrence
+profiles: cosine similarity of L2-normalized co-occurrence rows, the same
+similarity used to build the keyword dendrogram.
+
+```bash
+openalex filter-events \
+  --events-dir output/events \
+  --output-dir output/filtered_events
+```
+
+The command reads `OPENAI_API_KEY`. `classifications.csv` records the label, a
+short reason, and those three neighbors. `classifications.jsonl` is the
+checkpoint; `--resume` skips keywords already classified.
+
 ## New coauthorship links
 
 Build every author pair in its first coauthorship year, its distance in the
