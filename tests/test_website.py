@@ -414,3 +414,10 @@ def test_sharded_incidence_counts_each_paper_once(tmp_path):
     assert counts[1] == {2020: 2, 2021: 1, 2022: 0}
     assert sum(counts[0].values()) == 4
     assert sum(counts[1].values()) == 3
+    parallel = aggregate_node_years(
+        artifacts,
+        np.array([0, 1]),
+        [[0, 1], [1]],
+        workers=2,
+    )
+    assert parallel == counts

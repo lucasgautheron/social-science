@@ -74,6 +74,7 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
             "OPENALEX_CLUSTERS_DIR": str(clusters),
             "OPENALEX_DB_PATH": str(database),
             "OPENALEX_NEW_LINK_VISUALIZATIONS_DIR": str(visualizations),
+            "OPENALEX_INCIDENCE_WORKERS": "16",
             "GIT_AUTHOR_NAME": "Test",
             "GIT_AUTHOR_EMAIL": "test@example.com",
             "GIT_COMMITTER_NAME": "Test",
@@ -93,3 +94,4 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
         arguments[arguments.index("--new-link-visualizations-dir") + 1]
         == str(visualizations)
     )
+    assert arguments[arguments.index("--incidence-workers") + 1] == "16"

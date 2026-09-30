@@ -6,8 +6,11 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
 import sqlite3
+import sys
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -230,6 +233,8 @@ def aggregate_node_years(
     artifacts: dict[str, Any],
     selected_indices: np.ndarray,
     descendants: list[list[int]],
+    *,
+    workers: int = 1,
 ) -> dict[int, dict[int, int]]:
     """Count each paper once per node/year using sparse Boolean incidence."""
     if not descendants:
@@ -237,40 +242,41 @@ def aggregate_node_years(
     return _aggregate_group_years(
         artifacts,
         [(selected_indices, descendants)],
+        workers=workers,
     )[0]
 
 
 def _aggregate_group_years(
     artifacts: dict[str, Any],
     groupings: Sequence[tuple[np.ndarray, Sequence[Any]]],
+    *,
+    workers: int = 1,
 ) -> list[dict[int, dict[int, int]]]:
     """Count papers for every grouping in one pass over the incidence shards.
 
     Each grouping is a keyword index array plus the member positions of each
     node. A paper contributes once to a node when it contains any member
-    keyword. Summing those yearly counts is the node's document total.
+    keyword. Shards are counted separately and their yearly totals are added.
+    Summing those yearly counts is the node's document total.
     """
     if not groupings:
         return []
     vocabulary_size = len(artifacts["vocabulary"])
     membership, widths = _group_membership(vocabulary_size, groupings)
-    counts: dict[int, np.ndarray] = {}
     root = artifacts["root"]
     manifest = artifacts["manifest"]
     incidence_dir = root / manifest["incidence_dir"]
-    for relative in manifest.get("incidence_parts", []):
-        article_terms = sparse.load_npz(incidence_dir / relative).tocsr()
-        years = np.load(
-            incidence_dir / relative.replace(".npz", "_years.npy"),
-            allow_pickle=False,
-        ).astype(np.int32, copy=False)
-        if article_terms.shape[0] != len(years):
-            raise ValueError(f"Incidence rows and years do not match for {relative}")
-        if article_terms.shape[1] != vocabulary_size:
-            raise ValueError(
-                f"Incidence width does not match the vocabulary for {relative}"
-            )
-        _add_presence_years(counts, article_terms, years, membership)
+    parts = list(manifest.get("incidence_parts", []))
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    workers = min(workers, len(parts)) if parts else 1
+    counts = _scan_incidence_shards(
+        incidence_dir,
+        parts,
+        vocabulary_size,
+        membership,
+        workers,
+    )
     results: list[dict[int, dict[int, int]]] = []
     offset = 0
     for width in widths:
@@ -315,6 +321,104 @@ def _group_membership(
         dtype=np.int64,
     )
     return membership, widths
+
+
+_INCIDENCE_MEMBERSHIP: sparse.csr_matrix | None = None
+_INCIDENCE_VOCABULARY_SIZE = 0
+
+
+def _init_incidence_worker(membership: sparse.csr_matrix, vocabulary_size: int) -> None:
+    global _INCIDENCE_MEMBERSHIP, _INCIDENCE_VOCABULARY_SIZE
+    _INCIDENCE_MEMBERSHIP = membership
+    _INCIDENCE_VOCABULARY_SIZE = vocabulary_size
+
+
+def _presence_years_for_paths(
+    matrix_path: str,
+    years_path: str,
+    vocabulary_size: int,
+    membership: sparse.csr_matrix,
+) -> dict[int, np.ndarray]:
+    relative = Path(matrix_path).name
+    article_terms = sparse.load_npz(matrix_path).tocsr()
+    years = np.load(years_path, allow_pickle=False).astype(np.int32, copy=False)
+    if article_terms.shape[0] != len(years):
+        raise ValueError(f"Incidence rows and years do not match for {relative}")
+    if article_terms.shape[1] != vocabulary_size:
+        raise ValueError(f"Incidence width does not match the vocabulary for {relative}")
+    counts: dict[int, np.ndarray] = {}
+    _add_presence_years(counts, article_terms, years, membership)
+    return counts
+
+
+def _shard_presence_years(paths: tuple[str, str]) -> dict[int, np.ndarray]:
+    membership = _INCIDENCE_MEMBERSHIP
+    if membership is None:
+        raise RuntimeError("Incidence worker was not initialized")
+    matrix_path, years_path = paths
+    return _presence_years_for_paths(
+        matrix_path,
+        years_path,
+        _INCIDENCE_VOCABULARY_SIZE,
+        membership,
+    )
+
+
+def _merge_year_counts(
+    parts: Sequence[Mapping[int, np.ndarray]],
+) -> dict[int, np.ndarray]:
+    totals: dict[int, np.ndarray] = {}
+    for counts in parts:
+        for year, values in counts.items():
+            bucket = totals.get(year)
+            if bucket is None:
+                totals[year] = np.array(values, dtype=np.int64, copy=True)
+            else:
+                bucket += values
+    return totals
+
+
+def _scan_incidence_shards(
+    incidence_dir: Path,
+    parts: Sequence[str],
+    vocabulary_size: int,
+    membership: sparse.csr_matrix,
+    workers: int,
+) -> dict[int, np.ndarray]:
+    tasks = [
+        (
+            str(incidence_dir / relative),
+            str(incidence_dir / relative.replace(".npz", "_years.npy")),
+        )
+        for relative in parts
+    ]
+    if workers <= 1:
+        return _merge_year_counts(
+            _presence_years_for_paths(
+                matrix_path,
+                years_path,
+                vocabulary_size,
+                membership,
+            )
+            for matrix_path, years_path in tasks
+        )
+    print(
+        f"Reading {len(tasks)} incidence shards with {workers} workers",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        context = multiprocessing.get_context("forkserver")
+    except ValueError:
+        context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        initializer=_init_incidence_worker,
+        initargs=(membership, vocabulary_size),
+    ) as executor:
+        shard_counts = executor.map(_shard_presence_years, tasks, chunksize=1)
+        return _merge_year_counts(shard_counts)
 
 
 def _add_presence_years(
@@ -657,6 +761,7 @@ def build_website(
     filtered_dir: str | Path | None = None,
     db_path: str | Path | None = None,
     new_link_visualizations_dir: str | Path | None = None,
+    incidence_workers: int = 1,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
     vocabulary = artifacts["vocabulary"]
@@ -711,7 +816,11 @@ def build_website(
         groupings.append(
             (prepared_clusters["indices"], prepared_clusters["descendants"])
         )
-    grouped_years = _aggregate_group_years(artifacts, groupings) if groupings else []
+    grouped_years = (
+        _aggregate_group_years(artifacts, groupings, workers=incidence_workers)
+        if groupings
+        else []
+    )
     node_years: dict[int, dict[int, int]] = {}
     next_group = 0
     if descendants:
@@ -861,6 +970,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CLUSTER_SIMILARITY,
     )
+    parser.add_argument(
+        "--incidence-workers",
+        type=int,
+        default=1,
+        help=(
+            "Processes used to read incidence shards. Each process holds one "
+            "uncompressed shard. Defaults to 1."
+        ),
+    )
     return parser
 
 
@@ -872,6 +990,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--min-document-frequency must be positive")
     if args.max_dendrogram_keywords < 1:
         raise SystemExit("--max-dendrogram-keywords must be positive")
+    if args.incidence_workers < 1:
+        raise SystemExit("--incidence-workers must be positive")
     summary = build_website(
         args.events_dir,
         clusters_dir=args.clusters_dir,
@@ -883,6 +1003,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         filtered_dir=args.filtered_dir,
         db_path=args.db_path,
         new_link_visualizations_dir=args.new_link_visualizations_dir,
+        incidence_workers=args.incidence_workers,
     )
     print(json.dumps(summary, indent=2))
     return 0
