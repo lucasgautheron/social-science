@@ -167,13 +167,14 @@ Build the three-page site:
 openalex build-website \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
+  --db-path /path/to/articles.db \
   --output-dir output/website
 python -m http.server --directory output/website 8000
 ```
 
 `index.html` ranks keywords by document frequency. `dendrogram.html` shows the
-complete-linkage keyword hierarchy and a sidebar with exact yearly paper
-frequency plus cluster membership. `graph.html` switches between the keyword
+complete-linkage keyword hierarchy and a sidebar with each node's share of
+that year's articles, plus cluster membership. `graph.html` switches between the keyword
 co-occurrence network and its blockmodel clusters. Nodes share cluster colors
 and have area proportional to keyword document frequency (summed for cluster
 nodes). Cluster coordinates are the document-frequency-weighted barycenters of
@@ -195,12 +196,17 @@ keywords, while rendering is limited to the 10,000 strongest edges. Use
 `--max-graph-keywords` and `--max-graph-edges` to change the display limits.
 
 Omitting `--clusters-dir` still builds the site, but the graph page displays
-instructions instead of a network.
+instructions instead of a network. `--db-path` divides each yearly frequency
+by the number of articles published that year. The count is one read-only
+`GROUP BY publication_year` over `idx_publication_year`, so the article rows
+are not read. Without `--db-path`, the curves use the processed-paper totals
+stored in the event manifest.
 
 Publish a fresh orphan `gh-pages` commit with:
 
 ```bash
 OPENALEX_CLUSTERS_DIR=output/event_clusters \
+OPENALEX_DB_PATH=/path/to/articles.db \
   scripts/deploy-gh-pages.sh output/events
 ```
 

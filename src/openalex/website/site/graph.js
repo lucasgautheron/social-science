@@ -174,6 +174,12 @@
     tooltip.style.top = `${point.y - 12}px`;
   }
 
+  function formatPercent(share) {
+    const percent = 100 * Number(share || 0);
+    const digits = percent >= 10 ? 1 : percent >= 1 ? 2 : 3;
+    return `${percent.toFixed(digits)}%`;
+  }
+
   function lineChart(values) {
     const chart = svgNode("svg", { class: "line-chart", viewBox: "0 0 340 180" });
     if (!values.length) {
@@ -182,31 +188,32 @@
       chart.append(message);
       return chart;
     }
-    const padding = { left: 44, right: 12, top: 16, bottom: 30 };
+    const padding = { left: 52, right: 12, top: 16, bottom: 30 };
     const years = values.map((item) => item.year);
-    const counts = values.map((item) => item.papers);
+    const shares = values.map((item) => Number(item.share) || 0);
     const minYear = Math.min(...years);
     const maxYear = Math.max(...years);
-    const maxCount = Math.max(1, ...counts);
+    const maxShare = Math.max(0, ...shares);
+    const scale = maxShare > 0 ? maxShare : 1;
     const x = (year) => padding.left + ((year - minYear) / Math.max(1, maxYear - minYear)) * (340 - padding.left - padding.right);
-    const y = (count) => 180 - padding.bottom - (count / maxCount) * (180 - padding.top - padding.bottom);
+    const y = (share) => 180 - padding.bottom - (share / scale) * (180 - padding.top - padding.bottom);
     chart.append(
       svgNode("path", {
         class: "axis",
         d: `M ${padding.left} ${padding.top} V ${180 - padding.bottom} H ${340 - padding.right}`,
       }),
     );
-    const path = values.map((item, index) => `${index ? "L" : "M"} ${x(item.year)} ${y(item.papers)}`).join(" ");
+    const path = values.map((item, index) => `${index ? "L" : "M"} ${x(item.year)} ${y(Number(item.share) || 0)}`).join(" ");
     chart.append(svgNode("path", { class: "series", d: path }));
     for (const item of values) {
       const point = svgNode("circle", {
         class: "series-point",
         cx: x(item.year),
-        cy: y(item.papers),
+        cy: y(Number(item.share) || 0),
         r: 3.5,
       });
       const title = svgNode("title");
-      title.textContent = `${item.year}: ${Number(item.papers).toLocaleString()} papers (${(100 * item.share).toFixed(2)}%)`;
+      title.textContent = `${item.year}: ${formatPercent(item.share)} of papers (${Number(item.papers).toLocaleString()})`;
       point.append(title);
       chart.append(point);
     }
@@ -215,7 +222,7 @@
     const finish = svgNode("text", { class: "axis-label end", x: 340 - padding.right, y: 172 });
     finish.textContent = String(maxYear);
     const maximum = svgNode("text", { class: "axis-label", x: 4, y: padding.top + 4 });
-    maximum.textContent = maxCount.toLocaleString();
+    maximum.textContent = formatPercent(maxShare);
     chart.append(start, finish, maximum);
     return chart;
   }
@@ -234,7 +241,7 @@
       ? `${Number(node.papers).toLocaleString()} papers`
       : `${Number(node.papers).toLocaleString()} summed keyword frequency · ${Number(node.document_frequency).toLocaleString()} distinct papers`;
     const chartTitle = document.createElement("h3");
-    chartTitle.textContent = "Papers by year";
+    chartTitle.textContent = "Share of papers by year";
     const wordTitle = document.createElement("h3");
     wordTitle.textContent = node.kind === "keyword" ? "Cluster" : "Included keywords";
     const words = document.createElement("div");

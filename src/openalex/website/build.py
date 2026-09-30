@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections.abc import Sequence
+import sqlite3
+from collections.abc import Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import numpy as np
 from scipy import sparse
@@ -313,6 +315,53 @@ def load_cluster_artifacts(
     }
 
 
+def count_papers_by_year(db_path: str | Path) -> dict[int, int]:
+    """Count articles per publication year.
+
+    One grouped index scan of ``idx_publication_year``. The index holds every
+    year, so SQLite never reads the article rows.
+    """
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Database not found: {path}")
+    uri = f"file:{quote(str(path))}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA temp_store = MEMORY")
+        connection.execute("PRAGMA cache_size = -262144")
+        connection.execute("PRAGMA mmap_size = 268435456")
+        indexed = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_publication_year'
+            """
+        ).fetchone()
+        indexed_by = " INDEXED BY idx_publication_year" if indexed else ""
+        rows = connection.execute(
+            f"""
+            SELECT publication_year, COUNT(*)
+            FROM articles{indexed_by}
+            GROUP BY publication_year
+            """
+        )
+        return {
+            int(year): int(count)
+            for year, count in rows
+            if year is not None
+        }
+    finally:
+        connection.close()
+
+
+def papers_by_year_from_manifest(manifest: Mapping[str, Any]) -> dict[int, int]:
+    return {
+        int(year): int(count)
+        for year, count in manifest.get("papers_by_year", {}).items()
+    }
+
+
 def build_graph_payload(
     artifacts: dict[str, Any],
     clusters_dir: str | Path,
@@ -320,6 +369,7 @@ def build_graph_payload(
     max_keywords: int = DEFAULT_MAX_GRAPH_KEYWORDS,
     max_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     allowed: set[str] | None = None,
+    papers_by_year: Mapping[int, int] | None = None,
 ) -> dict[str, Any]:
     """Build keyword and cluster graph views from blockmodel artifacts."""
     if max_keywords < 1:
@@ -388,10 +438,8 @@ def build_graph_payload(
     descendants = [[position] for position in range(len(keywords))]
     descendants.extend(positions.tolist() for positions in member_positions)
     yearly_counts = aggregate_node_years(artifacts, event_indices, descendants)
-    papers_by_year = {
-        int(year): int(count)
-        for year, count in artifacts["manifest"].get("papers_by_year", {}).items()
-    }
+    if papers_by_year is None:
+        papers_by_year = papers_by_year_from_manifest(artifacts["manifest"])
 
     keyword_nodes = []
     for position, keyword in enumerate(keywords):
@@ -703,12 +751,19 @@ def build_website(
     max_graph_edges: int = DEFAULT_MAX_GRAPH_EDGES,
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
     filtered_dir: str | Path | None = None,
+    db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
     vocabulary = artifacts["vocabulary"]
     frequencies = artifacts["frequencies"]
     allowed = _genuine_event_keywords(events_dir, filtered_dir)
     processed = int(artifacts["manifest"].get("processed_papers") or 0)
+    if db_path is None:
+        papers_by_year = papers_by_year_from_manifest(artifacts["manifest"])
+        yearly_denominator = "processed_papers"
+    else:
+        papers_by_year = count_papers_by_year(db_path)
+        yearly_denominator = "database"
     ranked = np.argsort(-frequencies, kind="stable")
     if allowed is not None:
         ranked = np.asarray(
@@ -737,10 +792,6 @@ def build_website(
         clustered["labels"],
     )
     node_years = aggregate_node_years(artifacts, selected, descendants)
-    papers_by_year = {
-        int(year): int(count)
-        for year, count in artifacts["manifest"].get("papers_by_year", {}).items()
-    }
     for node in nodes:
         yearly = []
         for year, count in node_years.get(int(node["id"]), {}).items():
@@ -761,6 +812,7 @@ def build_website(
             "min_document_frequency": min_document_frequency,
             "cluster_similarity": cluster_similarity,
             "keyword_filter": "genuine" if allowed is not None else "vocabulary",
+            "yearly_denominator": yearly_denominator,
         },
         "top_keywords": [
             {
@@ -779,6 +831,7 @@ def build_website(
                 max_keywords=max_graph_keywords,
                 max_edges=max_graph_edges,
                 allowed=allowed,
+                papers_by_year=papers_by_year,
             )
             if clusters_dir is not None
             else None
@@ -808,6 +861,7 @@ def build_website(
         ),
         "keyword_filter": payload["meta"]["keyword_filter"],
         "genuine_keywords": None if allowed is None else len(allowed),
+        "yearly_denominator": yearly_denominator,
     }
 
 
@@ -821,6 +875,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional blockmodel output used by graph.html.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("output/website"))
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help=(
+            "Read-only corpus used to divide each yearly frequency by that year's "
+            "article count. One index scan of idx_publication_year."
+        ),
+    )
     parser.add_argument(
         "--filtered-dir",
         type=Path,
@@ -882,6 +945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_graph_edges=args.max_graph_edges,
         cluster_similarity=args.cluster_similarity,
         filtered_dir=args.filtered_dir,
+        db_path=args.db_path,
     )
     print(json.dumps(summary, indent=2))
     return 0

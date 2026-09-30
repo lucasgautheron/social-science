@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from openalex.website.build import (
     build_graph_payload,
     build_website,
     cluster_keywords,
+    count_papers_by_year,
     load_event_artifacts,
     select_keywords,
 )
@@ -245,6 +247,87 @@ def test_website_uses_genuine_keywords_when_available(tmp_path):
     assert set(root["keywords"]) == {"alpha", "beta"}
     assert [item["keyword"] for item in payload["top_keywords"]] == ["beta", "alpha"]
     assert [node["keyword"] for node in payload["graph"]["keyword"]["nodes"]] == ["beta", "alpha"]
+
+
+def write_article_year_database(path, *, indexed=True):
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE articles (
+            article_id INTEGER PRIMARY KEY,
+            publication_year INTEGER,
+            title TEXT
+        )
+        """
+    )
+    if indexed:
+        connection.execute(
+            "CREATE INDEX idx_publication_year ON articles (publication_year)"
+        )
+    connection.executemany(
+        "INSERT INTO articles (publication_year, title) VALUES (?, ?)",
+        [(2020, "paper")] * 10 + [(2021, "paper")] * 20 + [(None, "undated")],
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_count_papers_by_year_scans_the_year_index(tmp_path):
+    database = tmp_path / "articles.db"
+    write_article_year_database(database)
+    connection = sqlite3.connect(database)
+    plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT publication_year, COUNT(*)
+        FROM articles INDEXED BY idx_publication_year
+        GROUP BY publication_year
+        """
+    ).fetchall()
+    connection.close()
+    assert count_papers_by_year(database) == {2020: 10, 2021: 20}
+    assert any("idx_publication_year" in " ".join(str(value) for value in row) for row in plan)
+
+
+def test_count_papers_by_year_without_index(tmp_path):
+    database = tmp_path / "articles.db"
+    write_article_year_database(database, indexed=False)
+    assert count_papers_by_year(database) == {2020: 10, 2021: 20}
+
+
+def test_yearly_curves_use_database_article_counts(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    site_dir = tmp_path / "site"
+    database = tmp_path / "articles.db"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    write_article_year_database(database)
+    summary = build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        output_dir=site_dir,
+        db_path=database,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+        max_graph_keywords=3,
+        max_graph_edges=1,
+    )
+    assert summary["yearly_denominator"] == "database"
+    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    assert payload["meta"]["yearly_denominator"] == "database"
+    root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
+    expected = [
+        {"year": 2020, "papers": 2, "share": 0.2},
+        {"year": 2021, "papers": 2, "share": 0.1},
+    ]
+    assert root["yearly"] == expected
+    cluster = next(node for node in payload["graph"]["cluster"]["nodes"] if node["group"] == 0)
+    assert cluster["yearly"] == expected
+    dendrogram = (site_dir / "dendrogram.js").read_text(encoding="utf-8")
+    graph = (site_dir / "graph.js").read_text(encoding="utf-8")
+    assert "y(Number(item.share)" in dendrogram
+    assert "y(Number(item.share)" in graph
 
 
 def test_npmi_discards_zero_and_negative_edges():

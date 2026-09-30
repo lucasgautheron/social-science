@@ -35,6 +35,13 @@ if [[ -n "${OPENALEX_CLUSTERS_DIR:-}" ]]; then
   fi
   BUILD_ARGS+=(--clusters-dir "$OPENALEX_CLUSTERS_DIR")
 fi
+if [[ -n "${OPENALEX_DB_PATH:-}" ]]; then
+  if [[ ! -f "$OPENALEX_DB_PATH" ]]; then
+    echo "Database not found: $OPENALEX_DB_PATH" >&2
+    exit 2
+  fi
+  BUILD_ARGS+=(--db-path "$OPENALEX_DB_PATH")
+fi
 
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   "${PYTHON:-python}" -m openalex.website.build \
