@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -35,8 +36,9 @@ DEFAULT_MAX_AUTHORS = 16
 DEFAULT_MAX_EDGES = 200_000_000
 DEFAULT_MAX_EVENT_PAIRS = 100_000_000
 DEFAULT_GROUPED_BFS_MIN_TARGETS = 4
-DEFAULT_NO_CLUSTER_SAMPLE = 10_000
-DEFAULT_CLUSTER_SAMPLE = 10_000
+DEFAULT_DISTANCE_WORKERS = 16
+DEFAULT_NO_CLUSTER_SAMPLE = 2_000
+DEFAULT_CLUSTER_SAMPLE = 2_000
 DEFAULT_SAMPLING_SEED = 0
 DEFAULT_CACHE_MB = 2048
 _FETCH_SIZE = 200_000
@@ -65,6 +67,7 @@ def build_new_links(
     max_edges: int = DEFAULT_MAX_EDGES,
     max_event_pairs: int = DEFAULT_MAX_EVENT_PAIRS,
     grouped_bfs_min_targets: int = DEFAULT_GROUPED_BFS_MIN_TARGETS,
+    distance_workers: int = DEFAULT_DISTANCE_WORKERS,
     no_cluster_sample: int = DEFAULT_NO_CLUSTER_SAMPLE,
     cluster_sample: int = DEFAULT_CLUSTER_SAMPLE,
     sampling_seed: int = DEFAULT_SAMPLING_SEED,
@@ -78,6 +81,7 @@ def build_new_links(
         max_edges,
         max_event_pairs,
         grouped_bfs_min_targets,
+        distance_workers,
         no_cluster_sample,
         cluster_sample,
         sampling_seed,
@@ -209,6 +213,7 @@ def build_new_links(
             max_edges,
             max_event_pairs,
             grouped_bfs_min_targets,
+            distance_workers,
             no_cluster_sample,
             cluster_sample,
             sampling_seed,
@@ -244,13 +249,14 @@ def build_new_links(
         manifest["distance_stats"][str(year)] = distance_stats
         _atomic_json(manifest_path, manifest)
         logger.info(
-            "Year %s: new_links=%s stored=%s clustered=%s distance=%.1fs searches=%s+%s "
+            "Year %s: new_links=%s stored=%s clustered=%s distance=%.1fs workers=%s searches=%s+%s "
             "visited=%s inspected_edges=%s elapsed=%.1fs",
             year,
             all_left.size,
             arrays["author_i"].size,
             manifest["clustered_link_counts"][str(year)],
             distance_stats["seconds"],
+            distance_stats["workers"],
             distance_stats["bidirectional_searches"],
             distance_stats["grouped_searches"],
             distance_stats["visited_nodes"],
@@ -306,6 +312,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use grouped BFS at this many targets per source; use bidirectional BFS below it.",
     )
     parser.add_argument(
+        "--distance-workers",
+        type=int,
+        default=DEFAULT_DISTANCE_WORKERS,
+        help="Parallel exact-distance searches; each worker uses O(author count) scratch memory.",
+    )
+    parser.add_argument(
         "--no-cluster-sample",
         type=int,
         default=DEFAULT_NO_CLUSTER_SAMPLE,
@@ -336,6 +348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_edges=args.max_edges,
         max_event_pairs=args.max_event_pairs,
         grouped_bfs_min_targets=args.grouped_bfs_min_targets,
+        distance_workers=args.distance_workers,
         no_cluster_sample=args.no_cluster_sample,
         cluster_sample=args.cluster_sample,
         sampling_seed=args.sampling_seed,
@@ -350,6 +363,7 @@ def _validate_options(
     max_edges: int,
     max_event_pairs: int,
     grouped_bfs_min_targets: int,
+    distance_workers: int,
     no_cluster_sample: int,
     cluster_sample: int,
     sampling_seed: int,
@@ -363,6 +377,8 @@ def _validate_options(
         raise ValueError("--max-event-pairs must be >= 1")
     if grouped_bfs_min_targets < 2:
         raise ValueError("--grouped-bfs-min-targets must be >= 2")
+    if distance_workers < 1:
+        raise ValueError("--distance-workers must be >= 1")
     if no_cluster_sample < 0:
         raise ValueError("--no-cluster-sample must be >= 0")
     if cluster_sample < 1:
@@ -675,6 +691,7 @@ def _process_year(
     max_edges: int,
     max_event_pairs: int,
     grouped_bfs_min_targets: int,
+    distance_workers: int,
     no_cluster_sample: int,
     cluster_sample: int,
     sampling_seed: int,
@@ -786,6 +803,7 @@ def _process_year(
         distance_left,
         distance_right,
         grouped_bfs_min_targets,
+        distance_workers,
     )
     left = all_left[retained]
     right = all_right[retained]
@@ -1169,6 +1187,7 @@ def _distances(
     left: np.ndarray,
     right: np.ndarray,
     grouped_bfs_min_targets: int,
+    distance_workers: int = DEFAULT_DISTANCE_WORKERS,
 ) -> tuple[np.ndarray, dict[str, int | float]]:
     started = time.perf_counter()
     result = np.full(left.size, DISCONNECTED, dtype=np.int32)
@@ -1181,6 +1200,7 @@ def _distances(
         "inspected_edges": 0,
         "seconds": 0.0,
         "visited_nodes": 0,
+        "workers": 0,
     }
     if left.size == 0:
         empty_stats["seconds"] = time.perf_counter() - started
@@ -1207,33 +1227,46 @@ def _distances(
     indptr = graph.indptr.astype(np.int64, copy=False)
     graph_indices = graph.indices.astype(np.int32, copy=False)
     sorted_distances = np.full(sorted_sources.size, DISCONNECTED, dtype=np.int32)
-    visited_nodes = 0
-    inspected_edges = 0
     bidirectional_searches = int(np.count_nonzero(~grouped_mask))
     grouped_searches = int(np.count_nonzero(grouped_groups))
+    ranges = _distance_chunk_ranges(starts, sorted_sources.size, distance_workers)
+    if len(ranges) == 1:
+        chunk_results = [
+            _distance_chunk(
+                indptr,
+                graph_indices,
+                sorted_sources,
+                sorted_targets,
+                grouped_bfs_min_targets,
+            )
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+            futures = [
+                executor.submit(
+                    _distance_chunk,
+                    indptr,
+                    graph_indices,
+                    sorted_sources[start:stop],
+                    sorted_targets[start:stop],
+                    grouped_bfs_min_targets,
+                )
+                for start, stop in ranges
+            ]
+            chunk_results = [future.result() for future in futures]
 
-    if bidirectional_searches:
-        bidirectional, visited, inspected = _bidirectional_exact_bfs_profiled(
-            indptr,
-            graph_indices,
-            sorted_sources[~grouped_mask],
-            sorted_targets[~grouped_mask],
-        )
-        sorted_distances[~grouped_mask] = bidirectional
-        visited_nodes += int(visited)
-        inspected_edges += int(inspected)
-    if grouped_searches:
-        grouped, visited, inspected, searches = _grouped_exact_bfs_profiled(
-            indptr,
-            graph_indices,
-            sorted_sources[grouped_mask],
-            sorted_targets[grouped_mask],
-        )
-        if int(searches) != grouped_searches:
-            raise RuntimeError("Grouped BFS source accounting is inconsistent")
-        sorted_distances[grouped_mask] = grouped
-        visited_nodes += int(visited)
-        inspected_edges += int(inspected)
+    visited_nodes = 0
+    inspected_edges = 0
+    observed_grouped_searches = 0
+    for (start, stop), (chunk_distances, visited, inspected, searches) in zip(
+        ranges, chunk_results, strict=True
+    ):
+        sorted_distances[start:stop] = chunk_distances
+        visited_nodes += visited
+        inspected_edges += inspected
+        observed_grouped_searches += searches
+    if observed_grouped_searches != grouped_searches:
+        raise RuntimeError("Grouped BFS source accounting is inconsistent")
 
     if np.any(sorted_distances == DISCONNECTED):
         raise RuntimeError("Union-Find and cumulative graph connectivity disagree")
@@ -1247,8 +1280,74 @@ def _distances(
         "inspected_edges": inspected_edges,
         "seconds": time.perf_counter() - started,
         "visited_nodes": visited_nodes,
+        "workers": len(ranges),
     }
     return result, stats
+
+
+def _distance_chunk_ranges(
+    starts: np.ndarray, pair_count: int, distance_workers: int
+) -> list[tuple[int, int]]:
+    """Split sorted pairs near equal sizes without splitting a source group."""
+    worker_count = min(distance_workers, int(starts.size))
+    if worker_count <= 1:
+        return [(0, pair_count)]
+    targets = np.arange(1, worker_count, dtype=np.float64) * pair_count / worker_count
+    group_indices = np.searchsorted(starts, targets, side="left")
+    group_indices = group_indices[group_indices < starts.size]
+    cuts = np.unique(starts[group_indices])
+    boundaries = np.concatenate(
+        (np.array([0], dtype=np.int64), cuts, np.array([pair_count], dtype=np.int64))
+    )
+    return [
+        (int(start), int(stop))
+        for start, stop in zip(boundaries[:-1], boundaries[1:], strict=True)
+        if start < stop
+    ]
+
+
+def _distance_chunk(
+    indptr: np.ndarray,
+    graph_indices: np.ndarray,
+    sources: np.ndarray,
+    targets: np.ndarray,
+    grouped_bfs_min_targets: int,
+) -> tuple[np.ndarray, int, int, int]:
+    """Run one independent source-aligned chunk with thread-local BFS scratch."""
+    boundaries = np.ones(sources.size, dtype=bool)
+    boundaries[1:] = sources[1:] != sources[:-1]
+    starts = np.flatnonzero(boundaries)
+    group_sizes = np.diff(np.append(starts, sources.size))
+    grouped_groups = group_sizes >= grouped_bfs_min_targets
+    grouped_mask = np.repeat(grouped_groups, group_sizes)
+    distances = np.full(sources.size, DISCONNECTED, dtype=np.int32)
+    visited_nodes = 0
+    inspected_edges = 0
+
+    if np.any(~grouped_mask):
+        values, visited, inspected = _bidirectional_exact_bfs_profiled(
+            indptr,
+            graph_indices,
+            sources[~grouped_mask],
+            targets[~grouped_mask],
+        )
+        distances[~grouped_mask] = values
+        visited_nodes += int(visited)
+        inspected_edges += int(inspected)
+    grouped_searches = int(np.count_nonzero(grouped_groups))
+    if grouped_searches:
+        values, visited, inspected, searches = _grouped_exact_bfs_profiled(
+            indptr,
+            graph_indices,
+            sources[grouped_mask],
+            targets[grouped_mask],
+        )
+        distances[grouped_mask] = values
+        visited_nodes += int(visited)
+        inspected_edges += int(inspected)
+        if int(searches) != grouped_searches:
+            raise RuntimeError("Grouped BFS source accounting is inconsistent")
+    return distances, visited_nodes, inspected_edges, grouped_searches
 
 
 @njit(cache=True)
@@ -1273,7 +1372,7 @@ def _grouped_exact_bfs(
     return _grouped_exact_bfs_profiled(indptr, graph_indices, sources, targets)[0]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _grouped_exact_bfs_profiled(
     indptr: np.ndarray,
     graph_indices: np.ndarray,
@@ -1339,7 +1438,7 @@ def _bidirectional_exact_bfs(
     )[0]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _bidirectional_exact_bfs_profiled(
     indptr: np.ndarray,
     graph_indices: np.ndarray,

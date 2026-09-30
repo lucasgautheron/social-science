@@ -332,6 +332,38 @@ def test_hybrid_uses_grouped_bfs_for_many_targets():
     assert stats["bidirectional_searches"] == 0
 
 
+def test_parallel_distances_match_single_worker():
+    graph = sparse.diags(
+        [np.ones(8, dtype=np.int8), np.ones(8, dtype=np.int8)],
+        offsets=[-1, 1],
+        shape=(9, 9),
+        format="csr",
+    )
+    parent = np.zeros(9, dtype=np.int32)
+    left = np.array([0, 0, 0, 0, 1, 2, 3, 4], dtype=np.int32)
+    right = np.array([2, 3, 4, 5, 4, 5, 6, 7], dtype=np.int32)
+
+    single, single_stats = _distances(
+        graph, parent, left, right, grouped_bfs_min_targets=4, distance_workers=1
+    )
+    parallel, parallel_stats = _distances(
+        graph, parent, left, right, grouped_bfs_min_targets=4, distance_workers=3
+    )
+
+    assert np.array_equal(parallel, single)
+    for key in (
+        "bidirectional_searches",
+        "connected_pairs",
+        "disconnected_pairs",
+        "distinct_sources",
+        "grouped_searches",
+        "inspected_edges",
+        "visited_nodes",
+    ):
+        assert parallel_stats[key] == single_stats[key]
+    assert parallel_stats["workers"] > 1
+
+
 def test_bidirectional_bfs_matches_scipy_shortest_paths():
     rng = np.random.default_rng(7)
     upper = sparse.triu(
@@ -372,13 +404,19 @@ def test_network_commands_default_to_sixteen_authors():
         build_new_links_parser()
         .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
         .no_cluster_sample
-        == 10_000
+        == 2_000
     )
     assert (
         build_new_links_parser()
         .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
         .cluster_sample
-        == 10_000
+        == 2_000
+    )
+    assert (
+        build_new_links_parser()
+        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .distance_workers
+        == 16
     )
 
 

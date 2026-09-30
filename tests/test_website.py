@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-import openalex.website.build as website_build
 from openalex.website.build import (
     aggregate_node_years,
     build_cluster_list,
@@ -267,41 +266,25 @@ def test_yearly_curves_use_database_article_counts(tmp_path):
         db_path=database,
         min_document_frequency=2,
         max_dendrogram_keywords=10,
-        max_graph_keywords=3,
-        max_graph_edges=1,
     )
     assert summary["yearly_denominator"] == "database"
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
     assert payload["meta"]["yearly_denominator"] == "database"
+    assert payload["meta"]["total_documents"] == 30
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     expected = [
         {"year": 2020, "papers": 2, "share": 0.2},
         {"year": 2021, "papers": 2, "share": 0.1},
     ]
     assert root["yearly"] == expected
-    cluster = next(node for node in payload["graph"]["cluster"]["nodes"] if node["group"] == 0)
+    cluster = next(item for item in payload["cluster_list"] if item["group"] == 0)
     assert cluster["yearly"] == expected
+    assert cluster["papers"] == 4
+    assert cluster["share"] == pytest.approx(4 / 30)
     dendrogram = (site_dir / "dendrogram.js").read_text(encoding="utf-8")
-    graph = (site_dir / "graph.js").read_text(encoding="utf-8")
+    clusters_js = (site_dir / "clusters.js").read_text(encoding="utf-8")
     assert "y(Number(item.share)" in dendrogram
-    assert "y(Number(item.share)" in graph
-
-
-def test_npmi_discards_zero_and_negative_edges():
-    matrix = sparse.csr_matrix(
-        [
-            [0, 1, 1],
-            [1, 0, 0],
-            [1, 0, 0],
-        ],
-        dtype=np.int64,
-    )
-    rows, columns, weights = website_build._positive_npmi_edges(
-        matrix,
-        np.array([3, 2, 3], dtype=np.int64),
-        4,
-    )
-    assert rows.size == columns.size == weights.size == 0
+    assert "y(Number(item.share)" in clusters_js
 
 
 def test_large_cluster_union_does_not_overflow(tmp_path):

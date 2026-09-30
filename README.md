@@ -116,7 +116,7 @@ openalex new-links \
 ```
 
 All new links are added to the cumulative graph. Results retain simple random
-samples of up to 10,000 no-cluster links per year and 10,000 links per
+samples of up to 2,000 no-cluster links per year and 2,000 links per
 attributed cluster and year; change these with `--no-cluster-sample` and
 `--cluster-sample`, and reproduce them with `--sampling-seed`. They are
 partitioned as `years/<year>.npz`, with int32 `author_i` and `author_j` indices
@@ -130,7 +130,10 @@ be regenerated.
 
 Both `network` and `new-links` skip papers with more than 16 authors by
 default; change this with `--max-authors`. Exact distances use bidirectional
-BFS for sources with few targets and grouped BFS otherwise. Per-year search
+BFS for sources with few targets and grouped BFS otherwise. `new-links` runs
+16 source-aligned distance workers by default; change this with
+`--distance-workers`. Each worker uses scratch space proportional to the
+author count while sharing the cumulative graph. Per-year search
 counts, visited nodes, inspected edges, and timing are recorded under
 `distance_stats` in the new-link manifest.
 
