@@ -204,6 +204,10 @@ def test_cluster_list_counts_documents_once(tmp_path):
     ]
     assert clusters[1]["papers"] == 2
     assert clusters[1]["share"] == pytest.approx(2 / 5)
+    assert clusters[1]["yearly"] == [
+        {"year": 2020, "papers": 0, "share": 0.0},
+        {"year": 2021, "papers": 2, "share": 2 / 3},
+    ]
 
     (site_dir).mkdir()
     (site_dir / "graph.html").write_text("stale graph", encoding="utf-8")
@@ -369,3 +373,44 @@ def test_large_cluster_union_does_not_overflow(tmp_path):
         [list(range(width))],
     )
     assert counts == {0: {2024: 1}}
+
+
+def test_sharded_incidence_counts_each_paper_once(tmp_path):
+    event_dir = tmp_path / "events"
+    incidence = event_dir / "incidence"
+    incidence.mkdir(parents=True)
+    sparse.save_npz(
+        incidence / "a.npz",
+        sparse.csr_matrix([[1, 1], [1, 0], [0, 0]], dtype=np.int8),
+    )
+    sparse.save_npz(
+        incidence / "b.npz",
+        sparse.csr_matrix([[0, 1], [1, 1]], dtype=np.int8),
+    )
+    np.save(
+        incidence / "a_years.npy",
+        np.array([2020, 2020, 2022], dtype=np.int32),
+        allow_pickle=False,
+    )
+    np.save(
+        incidence / "b_years.npy",
+        np.array([2021, 2020], dtype=np.int32),
+        allow_pickle=False,
+    )
+    artifacts = {
+        "root": event_dir,
+        "vocabulary": np.array(["alpha", "beta"]),
+        "manifest": {
+            "incidence_dir": "incidence",
+            "incidence_parts": ["a.npz", "b.npz"],
+        },
+    }
+    counts = aggregate_node_years(
+        artifacts,
+        np.array([0, 1]),
+        [[0, 1], [1]],
+    )
+    assert counts[0] == {2020: 3, 2021: 1, 2022: 0}
+    assert counts[1] == {2020: 2, 2021: 1, 2022: 0}
+    assert sum(counts[0].values()) == 4
+    assert sum(counts[1].values()) == 3

@@ -234,43 +234,120 @@ def aggregate_node_years(
     """Count each paper once per node/year using sparse Boolean incidence."""
     if not descendants:
         return {}
+    return _aggregate_group_years(
+        artifacts,
+        [(selected_indices, descendants)],
+    )[0]
+
+
+def _aggregate_group_years(
+    artifacts: dict[str, Any],
+    groupings: Sequence[tuple[np.ndarray, Sequence[Any]]],
+) -> list[dict[int, dict[int, int]]]:
+    """Count papers for every grouping in one pass over the incidence shards.
+
+    Each grouping is a keyword index array plus the member positions of each
+    node. A paper contributes once to a node when it contains any member
+    keyword. Summing those yearly counts is the node's document total.
+    """
+    if not groupings:
+        return []
     vocabulary_size = len(artifacts["vocabulary"])
-    rows: list[int] = []
-    columns: list[int] = []
-    for node_index, positions in enumerate(descendants):
-        for position in positions:
-            rows.append(int(selected_indices[position]))
-            columns.append(node_index)
-    membership = sparse.csr_matrix(
-        (
-            np.ones(len(rows), dtype=np.int64),
-            (np.asarray(rows), np.asarray(columns)),
-        ),
-        shape=(vocabulary_size, len(descendants)),
-    )
+    membership, widths = _group_membership(vocabulary_size, groupings)
     counts: dict[int, np.ndarray] = {}
     root = artifacts["root"]
-    incidence_dir = root / artifacts["manifest"]["incidence_dir"]
-    for relative in artifacts["manifest"].get("incidence_parts", []):
-        matrix_path = incidence_dir / relative
-        years_path = incidence_dir / relative.replace(".npz", "_years.npy")
-        article_terms = sparse.load_npz(matrix_path).tocsr()
-        years = np.load(years_path, allow_pickle=False).astype(np.int32, copy=False)
+    manifest = artifacts["manifest"]
+    incidence_dir = root / manifest["incidence_dir"]
+    for relative in manifest.get("incidence_parts", []):
+        article_terms = sparse.load_npz(incidence_dir / relative).tocsr()
+        years = np.load(
+            incidence_dir / relative.replace(".npz", "_years.npy"),
+            allow_pickle=False,
+        ).astype(np.int32, copy=False)
         if article_terms.shape[0] != len(years):
             raise ValueError(f"Incidence rows and years do not match for {relative}")
-        presence = (article_terms.astype(np.int64) @ membership).tocsr()
-        presence.data[:] = 1
-        for year in np.unique(years):
-            values = np.asarray(presence[years == year].sum(axis=0)).ravel()
-            counts.setdefault(int(year), np.zeros(len(descendants), dtype=np.int64))
-            counts[int(year)] += values.astype(np.int64)
-    return {
-        node: {
-            year: int(values[node])
-            for year, values in sorted(counts.items())
-        }
-        for node in range(len(descendants))
-    }
+        if article_terms.shape[1] != vocabulary_size:
+            raise ValueError(
+                f"Incidence width does not match the vocabulary for {relative}"
+            )
+        _add_presence_years(counts, article_terms, years, membership)
+    results: list[dict[int, dict[int, int]]] = []
+    offset = 0
+    for width in widths:
+        results.append(
+            {
+                node: {
+                    year: int(values[offset + node])
+                    for year, values in sorted(counts.items())
+                }
+                for node in range(width)
+            }
+        )
+        offset += width
+    return results
+
+
+def _group_membership(
+    vocabulary_size: int,
+    groupings: Sequence[tuple[np.ndarray, Sequence[Any]]],
+) -> tuple[sparse.csr_matrix, list[int]]:
+    """Stack each grouping's keyword-to-node indicators into one sparse matrix."""
+    row_parts: list[np.ndarray] = []
+    column_parts: list[np.ndarray] = []
+    widths: list[int] = []
+    column = 0
+    for selected_indices, descendants in groupings:
+        selected = np.asarray(selected_indices, dtype=np.int64)
+        widths.append(len(descendants))
+        for positions in descendants:
+            position_array = np.asarray(positions, dtype=np.int64)
+            if position_array.size:
+                row_parts.append(selected[position_array])
+                column_parts.append(np.full(position_array.size, column, dtype=np.int64))
+            column += 1
+    rows = np.concatenate(row_parts) if row_parts else np.empty(0, dtype=np.int64)
+    columns = (
+        np.concatenate(column_parts) if column_parts else np.empty(0, dtype=np.int64)
+    )
+    membership = sparse.csr_matrix(
+        (np.ones(rows.size, dtype=np.int64), (rows, columns)),
+        shape=(vocabulary_size, column),
+        dtype=np.int64,
+    )
+    return membership, widths
+
+
+def _add_presence_years(
+    counts: dict[int, np.ndarray],
+    article_terms,
+    years: np.ndarray,
+    membership: sparse.csr_matrix,
+) -> None:
+    """Add one shard's per-node paper counts.
+
+    Incidence is stored as int8. The product uses an int64 accumulator, so a
+    node that unions more keywords than int8 can hold still becomes presence
+    1 rather than wrapping to zero. Casting the shard to int64 first would
+    copy every stored count without changing that result.
+    """
+    node_count = membership.shape[1]
+    if node_count == 0:
+        return
+    unique_years = np.unique(years)
+    for year in unique_years:
+        counts.setdefault(int(year), np.zeros(node_count, dtype=np.int64))
+    if membership.nnz == 0 or article_terms.shape[0] == 0:
+        return
+    presence = article_terms @ membership
+    if presence.nnz == 0:
+        return
+    presence = presence.tocoo()
+    year_ids = np.searchsorted(unique_years, years[presence.row])
+    flat = year_ids.astype(np.int64) * node_count + presence.col.astype(np.int64)
+    binned = np.bincount(flat, minlength=int(unique_years.size * node_count))
+    binned = binned.reshape(unique_years.size, node_count)
+    for index, year in enumerate(unique_years):
+        counts[int(year)] += binned[index]
 
 
 def _sparse_payload(matrix) -> dict[str, Any]:
@@ -366,15 +443,12 @@ def papers_by_year_from_manifest(manifest: Mapping[str, Any]) -> dict[int, int]:
     }
 
 
-def build_cluster_list(
+def _prepare_cluster_list(
     artifacts: dict[str, Any],
     clusters_dir: str | Path,
-    *,
-    allowed: set[str] | None = None,
-    papers_by_year: Mapping[int, int] | None = None,
-    total_documents: int | None = None,
-) -> list[dict[str, Any]]:
-    """List every cluster by the share of documents containing any member keyword."""
+    allowed: set[str] | None,
+) -> dict[str, Any] | None:
+    """Align cluster members with the event vocabulary, or return nothing to list."""
     clustered = load_cluster_artifacts(clusters_dir, artifacts)
     if allowed is not None:
         keep = np.asarray(
@@ -382,7 +456,7 @@ def build_cluster_list(
             dtype=bool,
         )
         if not np.any(keep):
-            return []
+            return None
         clustered = {
             **clustered,
             "keywords": clustered["keywords"][keep],
@@ -393,7 +467,7 @@ def build_cluster_list(
     keywords = clustered["keywords"]
     groups = np.asarray(clustered["groups"][clustered["level"]], dtype=np.int32)
     if groups.size == 0:
-        return []
+        return None
     frequencies = np.asarray(artifacts["frequencies"])[indices]
     group_ids = sorted({int(group) for group in groups})
     member_positions = []
@@ -401,46 +475,69 @@ def build_cluster_list(
         positions = np.flatnonzero(groups == group)
         positions = positions[np.argsort(-frequencies[positions], kind="stable")]
         member_positions.append(positions)
-    yearly_counts = aggregate_node_years(
-        artifacts,
-        indices,
-        [positions.tolist() for positions in member_positions],
-    )
-    if papers_by_year is None:
-        papers_by_year = papers_by_year_from_manifest(artifacts["manifest"])
-    columns = np.empty(len(groups), dtype=np.int64)
-    for cluster_index, positions in enumerate(member_positions):
-        columns[positions] = cluster_index
-    membership = sparse.csr_matrix(
-        (
-            np.ones(len(groups), dtype=np.int64),
-            (np.arange(len(groups), dtype=np.int64), columns),
-        ),
-        shape=(len(groups), len(group_ids)),
-    )
-    document_counts = _cluster_document_counts(artifacts, indices, membership)
-    if total_documents is None:
-        total_documents = int(sum(papers_by_year.values()))
+    return {
+        "keywords": keywords,
+        "group_ids": group_ids,
+        "member_positions": member_positions,
+        "indices": indices,
+        "descendants": member_positions,
+    }
+
+
+def _cluster_rows(
+    prepared: Mapping[str, Any],
+    yearly_counts: Mapping[int, Mapping[int, int]],
+    papers_by_year: Mapping[int, int],
+    total_documents: int,
+) -> list[dict[str, Any]]:
+    """Build cluster rows from yearly presence counts.
+
+    A cluster's paper total is the sum of its yearly counts: every incidence
+    row belongs to one year, and each of those counts is already a Boolean
+    union of the member keywords.
+    """
     rows = []
     for cluster_index, (group, positions) in enumerate(
-        zip(group_ids, member_positions, strict=True)
+        zip(prepared["group_ids"], prepared["member_positions"], strict=True)
     ):
-        papers = int(document_counts[cluster_index])
-        members = [str(keywords[position]) for position in positions]
+        by_year = yearly_counts.get(cluster_index, {})
+        papers = int(sum(by_year.values()))
+        members = [str(prepared["keywords"][position]) for position in positions]
         rows.append(
             {
                 "group": int(group),
                 "keywords": members,
                 "papers": papers,
                 "share": papers / total_documents if total_documents else 0.0,
-                "yearly": _yearly_payload(
-                    yearly_counts.get(cluster_index, {}),
-                    papers_by_year,
-                ),
+                "yearly": _yearly_payload(by_year, papers_by_year),
             }
         )
     rows.sort(key=lambda item: (-item["papers"], item["keywords"]))
     return rows
+
+
+def build_cluster_list(
+    artifacts: dict[str, Any],
+    clusters_dir: str | Path,
+    *,
+    allowed: set[str] | None = None,
+    papers_by_year: Mapping[int, int] | None = None,
+    total_documents: int | None = None,
+) -> list[dict[str, Any]]:
+    """List every cluster by the share of documents containing any member keyword."""
+    prepared = _prepare_cluster_list(artifacts, clusters_dir, allowed)
+    if prepared is None:
+        return []
+    if papers_by_year is None:
+        papers_by_year = papers_by_year_from_manifest(artifacts["manifest"])
+    if total_documents is None:
+        total_documents = int(sum(papers_by_year.values()))
+    yearly_counts = aggregate_node_years(
+        artifacts,
+        prepared["indices"],
+        prepared["descendants"],
+    )
+    return _cluster_rows(prepared, yearly_counts, papers_by_year, total_documents)
 
 
 def load_link_distance_summary(
@@ -511,26 +608,6 @@ def load_link_distance_summary(
                 ]
             rows.append(row)
     return rows
-
-
-def _cluster_document_counts(
-    artifacts: dict[str, Any],
-    selected_indices: np.ndarray,
-    membership: sparse.csr_matrix,
-) -> np.ndarray:
-    """Count papers that contain any keyword of each cluster."""
-    frequencies = np.zeros(membership.shape[1], dtype=np.int64)
-    root = artifacts["root"]
-    manifest = artifacts["manifest"]
-    incidence_dir = root / manifest["incidence_dir"]
-    for relative in manifest.get("incidence_parts", []):
-        article_terms = sparse.load_npz(incidence_dir / relative).tocsr()
-        if article_terms.shape[1] != len(artifacts["vocabulary"]):
-            raise ValueError(f"Incidence width does not match the vocabulary for {relative}")
-        presence = (article_terms[:, selected_indices].astype(np.int64) @ membership).tocsr()
-        presence.data[:] = 1
-        frequencies += np.asarray(presence.getnnz(axis=0), dtype=np.int64)
-    return frequencies
 
 
 def _yearly_payload(
@@ -620,7 +697,26 @@ def build_website(
         clustered["linkage"],
         clustered["labels"],
     )
-    node_years = aggregate_node_years(artifacts, selected, descendants)
+    prepared_clusters = (
+        _prepare_cluster_list(artifacts, clusters_dir, allowed)
+        if clusters_dir is not None
+        else None
+    )
+    # One incidence read serves the dendrogram and the cluster curves. Cluster
+    # document totals are the sums of those yearly presence counts.
+    groupings: list[tuple[np.ndarray, Sequence[Any]]] = []
+    if descendants:
+        groupings.append((selected, descendants))
+    if prepared_clusters is not None:
+        groupings.append(
+            (prepared_clusters["indices"], prepared_clusters["descendants"])
+        )
+    grouped_years = _aggregate_group_years(artifacts, groupings) if groupings else []
+    node_years: dict[int, dict[int, int]] = {}
+    next_group = 0
+    if descendants:
+        node_years = grouped_years[next_group]
+        next_group += 1
     for node in nodes:
         yearly = []
         for year, count in node_years.get(int(node["id"]), {}).items():
@@ -633,17 +729,17 @@ def build_website(
                 }
             )
         node["yearly"] = yearly
-    cluster_list = (
-        build_cluster_list(
-            artifacts,
-            clusters_dir,
-            allowed=allowed,
-            papers_by_year=papers_by_year,
-            total_documents=total_documents,
+    if clusters_dir is None:
+        cluster_list = None
+    elif prepared_clusters is None:
+        cluster_list = []
+    else:
+        cluster_list = _cluster_rows(
+            prepared_clusters,
+            grouped_years[next_group],
+            papers_by_year,
+            total_documents,
         )
-        if clusters_dir is not None
-        else None
-    )
     link_distances = (
         load_link_distance_summary(new_link_visualizations_dir, cluster_list)
         if new_link_visualizations_dir is not None
