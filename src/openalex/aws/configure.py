@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -34,6 +35,7 @@ DEFAULT_BUCKET = "lucas-epistemic-bubbles"
 DEFAULT_REPO_URL = "https://github.com/lucasgautheron/social-science.git"
 DEFAULT_INSTANCE_TYPE = CPU_INSTANCE_TYPE
 DEFAULT_IAM_INSTANCE_PROFILE = "openalex-ec2-runner-profile"
+DEFAULT_IAM_ROLE = "openalex-ec2-runner-role"
 DEFAULT_AMI_PARAMETER = CPU_AMI_PARAMETER
 DEFAULT_ROOT_VOLUME_GB = 200
 STATE_S3_KEY = "state/aws_runner_state.json"
@@ -211,6 +213,197 @@ def existing_instance_is_reusable(ec2, state: Dict[str, Any]) -> bool:
     return instance.get("State", {}).get("Name") not in {"shutting-down", "terminated"}
 
 
+def ensure_runner_instance_profile(
+    iam,
+    instance_profile: str,
+    bucket: str,
+    prefix: str,
+    client_error,
+) -> str:
+    """Ensure the managed SSM/S3 instance profile exists and return its name."""
+    profile_name = instance_profile.rsplit("/", 1)[-1]
+    managed = profile_name == DEFAULT_IAM_INSTANCE_PROFILE
+    try:
+        response = iam.get_instance_profile(InstanceProfileName=profile_name)
+    except client_error as exc:
+        if client_error_code(exc) != "NoSuchEntity":
+            raise
+        if not managed:
+            raise SystemExit(
+                f"IAM instance profile {profile_name!r} does not exist. "
+                f"Create it or omit --iam-instance-profile to let setup manage "
+                f"{DEFAULT_IAM_INSTANCE_PROFILE!r}."
+            ) from exc
+        response = None
+
+    if not managed:
+        return profile_name
+
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+    try:
+        iam.get_role(RoleName=DEFAULT_IAM_ROLE)
+        iam.update_assume_role_policy(
+            RoleName=DEFAULT_IAM_ROLE,
+            PolicyDocument=json.dumps(trust_policy),
+        )
+    except client_error as exc:
+        if client_error_code(exc) != "NoSuchEntity":
+            raise
+        print(f"Creating IAM role {DEFAULT_IAM_ROLE}...")
+        iam.create_role(
+            RoleName=DEFAULT_IAM_ROLE,
+            AssumeRolePolicyDocument=json.dumps(trust_policy),
+            Description="Managed role for openalex-aws EC2 workers",
+        )
+
+    iam.attach_role_policy(
+        RoleName=DEFAULT_IAM_ROLE,
+        PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    )
+    normalized_prefix = normalize_prefix(prefix)
+    iam.put_role_policy(
+        RoleName=DEFAULT_IAM_ROLE,
+        PolicyName="OpenAlexRunnerS3Access",
+        PolicyDocument=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "LocateProjectBucket",
+                        "Effect": "Allow",
+                        "Action": "s3:GetBucketLocation",
+                        "Resource": f"arn:aws:s3:::{bucket}",
+                    },
+                    {
+                        "Sid": "ListProjectObjects",
+                        "Effect": "Allow",
+                        "Action": "s3:ListBucket",
+                        "Resource": f"arn:aws:s3:::{bucket}",
+                        "Condition": {
+                            "StringLike": {
+                                "s3:prefix": [
+                                    normalized_prefix,
+                                    f"{normalized_prefix}/*",
+                                ]
+                            }
+                        },
+                    },
+                    {
+                        "Sid": "ReadWriteProjectObjects",
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:DeleteObject",
+                            "s3:AbortMultipartUpload",
+                        ],
+                        "Resource": (
+                            f"arn:aws:s3:::{bucket}/{normalized_prefix}/*"
+                        ),
+                    },
+                ],
+            }
+        ),
+    )
+
+    if response is None:
+        print(f"Creating IAM instance profile {profile_name}...")
+        response = iam.create_instance_profile(
+            InstanceProfileName=profile_name
+        )
+    roles = response.get("InstanceProfile", {}).get("Roles", [])
+    role_names = {
+        role["RoleName"] for role in roles if role.get("RoleName")
+    }
+    if role_names and DEFAULT_IAM_ROLE not in role_names:
+        raise SystemExit(
+            f"Managed instance profile {profile_name!r} already contains "
+            f"unexpected role(s): {', '.join(sorted(role_names))}."
+        )
+    if DEFAULT_IAM_ROLE not in role_names:
+        for attempt in range(6):
+            try:
+                iam.add_role_to_instance_profile(
+                    InstanceProfileName=profile_name,
+                    RoleName=DEFAULT_IAM_ROLE,
+                )
+                break
+            except client_error as exc:
+                if (
+                    client_error_code(exc) != "NoSuchEntity"
+                    or attempt == 5
+                ):
+                    raise
+                print("Waiting for the IAM role and profile to propagate...")
+                time.sleep(2)
+    return profile_name
+
+
+def ensure_instance_profile_attachment(
+    ec2,
+    instance_id: str,
+    instance_profile: str,
+) -> None:
+    """Attach the selected instance profile to a new or reused EC2 worker."""
+    profile_name = instance_profile.rsplit("/", 1)[-1]
+    response = ec2.describe_iam_instance_profile_associations(
+        Filters=[{"Name": "instance-id", "Values": [instance_id]}]
+    )
+    associations = [
+        value
+        for value in response.get("IamInstanceProfileAssociations", [])
+        if value.get("State") not in {"disassociating", "disassociated"}
+    ]
+    association = associations[0] if associations else None
+    current_arn = (
+        association.get("IamInstanceProfile", {}).get("Arn", "")
+        if association
+        else ""
+    )
+    if current_arn.rsplit("/", 1)[-1] == profile_name:
+        return
+    target = {"Name": profile_name}
+    for attempt in range(6):
+        try:
+            if association:
+                print(
+                    f"Replacing IAM instance profile on {instance_id} with "
+                    f"{profile_name}..."
+                )
+                ec2.replace_iam_instance_profile_association(
+                    AssociationId=association["AssociationId"],
+                    IamInstanceProfile=target,
+                )
+            else:
+                print(
+                    f"Attaching IAM instance profile {profile_name} to "
+                    f"{instance_id}..."
+                )
+                ec2.associate_iam_instance_profile(
+                    InstanceId=instance_id,
+                    IamInstanceProfile=target,
+                )
+            return
+        except Exception as exc:
+            profile_is_propagating = (
+                client_error_code(exc) == "InvalidParameterValue"
+                and "iamInstanceProfile" in str(exc)
+            )
+            if not profile_is_propagating or attempt == 5:
+                raise
+            print("Waiting for the IAM instance profile to propagate...")
+            time.sleep(5)
+
+
 def create_instance(session, args: argparse.Namespace, ami_id: str) -> str:
     ec2 = session.client("ec2")
     run_args: Dict[str, Any] = {
@@ -248,7 +441,20 @@ def create_instance(session, args: argparse.Namespace, ami_id: str) -> str:
         run_args["IamInstanceProfile"] = {profile_key: args.iam_instance_profile}
 
     print(f"Launching {args.instance_type} instance...")
-    response = ec2.run_instances(**run_args)
+    for attempt in range(6):
+        try:
+            response = ec2.run_instances(**run_args)
+            break
+        except Exception as exc:
+            profile_is_propagating = (
+                args.iam_instance_profile
+                and client_error_code(exc) == "InvalidParameterValue"
+                and "iamInstanceProfile" in str(exc)
+            )
+            if not profile_is_propagating or attempt == 5:
+                raise
+            print("Waiting for the IAM instance profile to propagate...")
+            time.sleep(5)
     instance_id = response["Instances"][0]["InstanceId"]
     print(f"Created instance {instance_id}. Waiting until it is running...")
     ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
@@ -431,14 +637,16 @@ def command_setup(args: argparse.Namespace) -> int:
     args.bucket = args.bucket or prior_state.get("bucket") or DEFAULT_BUCKET
     args.prefix = args.prefix or prior_state.get("prefix") or DEFAULT_PREFIX
     args.project = args.project or prior_state.get("project") or "openalex"
+    prior_worker = worker_state(prior_state, args.worker)
     for field in ("key_name", "security_group_id", "subnet_id"):
         if getattr(args, field) is None:
             setattr(args, field, prior_state.get(field))
     if args.iam_instance_profile is None:
-        if "iam_instance_profile" in prior_state:
-            args.iam_instance_profile = prior_state["iam_instance_profile"]
-        else:
-            args.iam_instance_profile = DEFAULT_IAM_INSTANCE_PROFILE
+        args.iam_instance_profile = (
+            prior_worker.get("iam_instance_profile")
+            or prior_state.get("iam_instance_profile")
+            or DEFAULT_IAM_INSTANCE_PROFILE
+        )
     prefix = normalize_prefix(args.prefix)
     db_key = args.db_s3_key or prefixed_key(prefix, "input/articles.db")
     repo_url = normalize_repo_url(
@@ -472,13 +680,34 @@ def command_setup(args: argparse.Namespace) -> int:
     session.client("sts").get_caller_identity()
 
     ensure_bucket(s3, args.bucket, args.region, client_error)
+    iam = session.client("iam")
+    try:
+        args.iam_instance_profile = ensure_runner_instance_profile(
+            iam,
+            args.iam_instance_profile,
+            args.bucket,
+            prefix,
+            client_error,
+        )
+    except client_error as exc:
+        if client_error_code(exc) not in {
+            "AccessDenied",
+            "AccessDeniedException",
+            "UnauthorizedOperation",
+        }:
+            raise
+        raise SystemExit(
+            "setup could not provision the EC2 IAM role and instance profile. "
+            "Grant the current AWS identity IAM role/profile management "
+            "permissions, or pass an existing --iam-instance-profile."
+        ) from exc
 
     db_s3_uri = None
     if not args.skip_db_upload:
         upload_file(s3, Path(args.db_path), args.bucket, db_key, args.overwrite_db, client_error)
         db_s3_uri = s3_uri(args.bucket, db_key)
 
-    prior_worker = worker_state(prior_state, args.worker)
+    reused_instance = False
     if prior_worker and existing_instance_is_reusable(ec2, prior_worker):
         if (
             prior_worker.get("instance_type")
@@ -490,6 +719,7 @@ def command_setup(args: argparse.Namespace) -> int:
                 f"Destroy it explicitly before changing its instance type."
             )
         instance_id = prior_worker["instance_id"]
+        reused_instance = True
         print(f"Reusing existing {args.worker} worker {instance_id}.")
     elif args.no_launch:
         instance_id = prior_worker.get("instance_id")
@@ -497,6 +727,12 @@ def command_setup(args: argparse.Namespace) -> int:
     else:
         ami_id = resolve_ami_id(session, args.ami_id, ami_parameter)
         instance_id = create_instance(session, args, ami_id)
+    if reused_instance and instance_id:
+        ensure_instance_profile_attachment(
+            ec2,
+            instance_id,
+            args.iam_instance_profile,
+        )
 
     state = {
         **prior_state,

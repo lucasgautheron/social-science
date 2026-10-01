@@ -273,6 +273,12 @@ Provision the default CPU worker once:
 openalex-aws setup --worker cpu --db-path /path/to/articles.db
 ```
 
+`setup` creates and maintains the default EC2 role and instance profile with
+SSM access and S3 access limited to the configured bucket prefix. When an
+existing worker lacks that profile, rerunning `setup` attaches it in place; the
+instance is not replaced. Pass `--iam-instance-profile` to use a pre-existing
+custom profile instead.
+
 The CPU profile is the existing `i4i.8xlarge`. An existing flat state file is
 backed up and migrated without changing its instance ID. Provision the optional
 L4 profile independently; this keeps the CPU instance, whether running or

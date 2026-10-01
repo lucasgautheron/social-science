@@ -630,6 +630,10 @@ def ensure_instance_running(session, state: Dict[str, Any], auto_start: bool, wa
 def wait_until_ssm_online(session, instance_id: str, timeout: int) -> None:
     ssm = session.client("ssm")
     deadline = time.time() + timeout
+    print(
+        f"Waiting up to {timeout}s for SSM to come online for "
+        f"{instance_id}..."
+    )
     while time.time() < deadline:
         response = ssm.describe_instance_information(
             Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
