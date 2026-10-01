@@ -14,6 +14,7 @@ import pickle
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 from urllib.parse import quote
 
@@ -393,6 +394,7 @@ def build_embeddings(
                                 max_workers=1,
                                 initializer=_init_worker,
                                 initargs=(model_name, worker_device, encode_batch_size),
+                                mp_context=get_context("spawn"),
                             )
                             for worker_device in execution_devices
                         ]
