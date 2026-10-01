@@ -42,11 +42,12 @@ openalex embeddings \
   --resume
 ```
 
-CPU embedding uses 32 persistent worker processes by default. Each worker owns
-one model and one PyTorch thread; encoded chunks are committed to SQLite and
-checkpointed in order instead of retaining a whole source batch. Change CPU
-parallelism with `--workers`. GPU inference uses one process, for example
-`--workers 1 --device cuda --encode-batch-size 256`.
+Embedding execution is selected automatically. CPU hosts use 32 persistent
+worker processes by default. CUDA hosts use one persistent process per visible
+GPU (one process on the L4 `g6.8xlarge`) and a default encode batch size of 256;
+MPS uses one process. Each process owns one model, and encoded chunks are
+committed to SQLite and checkpointed in order. Override detection with
+`--device`, `--workers`, or `--encode-batch-size`.
 
 `output/embeddings/embeddings.db` supports exact retrieval by article ID.
 `manifest.json` records the model, dimension, text format, and completion
@@ -308,9 +309,6 @@ Run embeddings on the L4 with one CUDA process:
 openalex-aws submit --worker gpu -- openalex embeddings \
   --db-path articles.db \
   --output-dir output/embeddings \
-  --workers 1 \
-  --device cuda \
-  --encode-batch-size 256 \
   --resume
 ```
 

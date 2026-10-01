@@ -137,9 +137,44 @@ def test_embeddings_command_is_registered():
     assert COMMANDS["embeddings"] == "openalex.analysis.embeddings"
 
 
-def test_embeddings_default_to_32_workers():
+def test_embeddings_cli_defaults_to_automatic_runtime_selection():
     assert DEFAULT_WORKERS == 32
-    assert build_parser().parse_args([]).workers == 32
+    args = build_parser().parse_args([])
+    assert args.workers is None
+    assert args.device is None
+    assert args.encode_batch_size is None
+
+
+def test_embedding_runtime_uses_32_cpu_workers_without_an_accelerator(monkeypatch):
+    monkeypatch.setattr(
+        embeddings_module, "_detect_accelerator_devices", lambda: []
+    )
+
+    device, devices, workers, encode_batch_size = (
+        embeddings_module._resolve_runtime(None, None, None)
+    )
+
+    assert device == "cpu"
+    assert devices == ["cpu"] * 32
+    assert workers == 32
+    assert encode_batch_size == 32
+
+
+def test_embedding_runtime_uses_one_worker_per_visible_gpu(monkeypatch):
+    monkeypatch.setattr(
+        embeddings_module,
+        "_detect_accelerator_devices",
+        lambda: ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    )
+
+    device, devices, workers, encode_batch_size = (
+        embeddings_module._resolve_runtime(None, None, None)
+    )
+
+    assert device == "cuda"
+    assert devices == ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+    assert workers == 4
+    assert encode_batch_size == 256
 
 
 def test_resume_fills_holes_in_a_partial_legacy_database(tmp_path):
@@ -189,7 +224,9 @@ def test_parallel_results_are_saved_before_a_later_chunk_fails(tmp_path, monkeyp
 
     monkeypatch.setattr(embeddings_module, "ProcessPoolExecutor", FailingExecutor)
     with pytest.raises(RuntimeError, match="worker failed"):
-        build_embeddings(database, output, batch_size=2, workers=2)
+        build_embeddings(
+            database, output, batch_size=2, workers=2, device="cpu"
+        )
 
     partial = EmbeddingStore(output)
     assert partial.article_ids() == [1]
