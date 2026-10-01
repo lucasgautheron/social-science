@@ -21,6 +21,7 @@ from openalex.analysis.cluster_trends import (
     break_indices,
     build_parser,
     bump_multiplier,
+    bump_tau_prior,
     default_events_dir,
     laplace_log_evidence,
     load_cluster_series,
@@ -179,6 +180,17 @@ def test_break_design_is_flat_through_the_shift_year():
         break_indices(3)
 
 
+def test_bump_center_prior_covers_years_outside_the_window():
+    years = np.arange(2010, 2026)
+    mean, scale = bump_tau_prior(years)
+    assert mean == pytest.approx(0.5 * (2010 + 2025))
+    assert scale == pytest.approx(2025 - 2010)
+    future = 2025 + (2025 - 2010)
+    assert abs(future - mean) / scale == pytest.approx(1.5)
+    with pytest.raises(ValueError, match="span"):
+        bump_tau_prior(np.array([2020.0, 2020.0]))
+
+
 def test_shock_halves_each_half_life_and_the_bump_returns_to_the_baseline():
     assert shock_multiplier(0.0, 4.0) == pytest.approx(1.0)
     assert shock_multiplier(4.0, 4.0) == pytest.approx(0.5)
@@ -275,18 +287,33 @@ def test_trend_record_keeps_the_trend_on_a_tie_and_saves_every_family():
         break_year=2011,
         u_max=1.0,
     )
-    assert (
-        trend_record(
-            series,
-            time_mean=time_mean,
-            time_scale=time_scale,
-            trend=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
-            step=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
-            shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
-            bump=rising,
-        )["compatible"]
-        == BUMP_INCREASING
+    rising_row = trend_record(
+        series,
+        time_mean=time_mean,
+        time_scale=time_scale,
+        trend=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
+        step=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
+        shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
+        bump=rising,
     )
+    assert rising_row["compatible"] == BUMP_INCREASING
+    outside = fit(
+        {"intercept": [0.0], "amplitude": [1.0], "width": [8.0]},
+        log_evidence=0.0,
+        break_year=2031.25,
+        u_max=0.0,
+    )
+    outside_row = trend_record(
+        series,
+        time_mean=time_mean,
+        time_scale=time_scale,
+        trend=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
+        step=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
+        shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
+        bump=outside,
+    )
+    assert outside_row["bump_break_year"] == pytest.approx(2031.25)
+    assert outside_row["compatible"] == BUMP_INCREASING
     assert tied["log_bayes_factor"] == pytest.approx(0.0)
 
 

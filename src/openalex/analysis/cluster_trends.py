@@ -1,31 +1,33 @@
 """Binomial logistic curves with an unknown shift year.
 
 Each cluster-year count is a binomial proportion of that year's papers. Four
-curves compete. Each is scored at every interior year tau by its Laplace
-marginal likelihood, keeps the year with the highest evidence, and the
-reported curve is the family with the highest evidence. An exact tie prefers
-the earlier family: trend, then step, then shock, then bump. The reported
-class is trend increasing, trend decreasing, step, shock, bump increasing, or
-bump decreasing. Trend and bump take the majority sign of their posterior
-draws. Step and shock are not split by sign.
+curves compete, and the reported curve is the family with the highest Laplace
+evidence. An exact tie prefers the earlier family: trend, then step, then
+shock, then bump. The reported class is trend increasing, trend decreasing,
+step, shock, bump increasing, or bump decreasing. Trend and bump take the
+majority sign of their posterior draws. Step and shock are not split by sign.
 
     trend: logit p = intercept + beta * u
     step:  logit p = intercept + c * 1{year >= tau}
     shock: logit p = intercept + c * 1{year >= tau} * 2^(-(year - tau) / H)
     bump:  logit p = intercept + A * exp(-(year - tau)^2 / (2 w^2))
 
-u is standardized time since tau and is zero through tau, so the trend is the
-intercept until the shift year and a slope afterward. The step is a permanent
-level shift. The shock jumps by c at tau and then loses half of that jump
-every H calendar years, returning to the intercept. The bump is centered on
-tau. A positive amplitude is bump increasing and a negative amplitude is
-bump decreasing. The deviation returns to the intercept on both sides. H and
-w are in calendar years.
+Trend, step, and shock try every interior year and keep the year with the
+highest evidence. u is standardized time since that year and is zero through
+it, so the trend is the intercept until the shift and a slope afterward. The
+step is a permanent level shift. The shock jumps by c at tau and then loses
+half of that jump every H calendar years, returning to the intercept.
+
+The bump center is a continuous parameter. Its prior is normal, centered on
+the midpoint of the observed years, with standard deviation equal to their
+span, so the center may sit outside the window. A positive amplitude is bump
+increasing and a negative amplitude is bump decreasing. The deviation returns
+to the intercept on both sides. H and w are in calendar years. The reported
+bump year is the posterior mean of the center.
 
 Parallel sampling uses one process per worker. Each process compiles each
-curve once, swaps the counts and the shift year, and samples only the
-retained year. Chains stay inside the process, and BLAS threads are pinned
-to one.
+curve once, swaps the counts, and samples the retained shift. Chains stay
+inside the process, and BLAS threads are pinned to one.
 """
 
 from __future__ import annotations
@@ -86,6 +88,7 @@ JUMP_SIGMA = 1.0
 AMPLITUDE_SIGMA = 1.0
 HALF_LIFE_SIGMA = 10.0
 WIDTH_SIGMA = 10.0
+BUMP_TAU_SPAN = 1.0
 NUTS_SAMPLERS = ("pymc", "nutpie", "blackjax", "numpyro")
 TRENDS_CSV = "cluster_trends.csv"
 _REQUIRED_COLUMNS = ("level", "group", "year", "papers", "share")
@@ -182,7 +185,7 @@ class BreakFit:
     """Posterior of the retained break for one curve family."""
 
     log_evidence: float
-    break_year: int
+    break_year: float
     u_max: float
     parameters: Mapping[str, np.ndarray]
     divergences: int
@@ -309,11 +312,11 @@ class BreakDesign:
 
 
 def break_design(standardized_time: np.ndarray, years: np.ndarray, break_index: int) -> BreakDesign:
-    """Build the trend, step, shock, and bump covariates for one shift year.
+    """Build the trend, step, and shock covariates for one shift year.
 
     Standardized time since the shift is zero through that year. Calendar time
-    since the shift is zero before it as well. The bump is centered on the
-    shift year, so its calendar offset is negative before that year.
+    since the shift is zero before it as well. ``centered_years`` is calendar
+    time relative to the shift year.
     """
     time = np.asarray(standardized_time, dtype=np.float64)
     calendar = np.asarray(years, dtype=np.float64)
@@ -341,6 +344,24 @@ def shock_multiplier(elapsed_years: np.ndarray, half_life: float) -> np.ndarray:
     if half_life <= 0:
         raise ValueError("Half-life must be positive")
     return np.exp(-np.log(2.0) * elapsed / float(half_life))
+
+
+def bump_tau_prior(years: np.ndarray) -> tuple[float, float]:
+    """Return the normal prior mean and sd of the bump center.
+
+    The mean is the midpoint of the observed years. The sd is their span times
+    ``BUMP_TAU_SPAN``, so a center one window-width outside either end is 1.5
+    standard deviations from the middle when the scale is one span.
+    """
+    calendar = np.asarray(years, dtype=np.float64)
+    if calendar.size == 0:
+        raise ValueError("Years are required to place the bump center prior")
+    low = float(calendar.min())
+    high = float(calendar.max())
+    span = high - low
+    if span <= 0.0:
+        raise ValueError("Years must span more than one calendar year")
+    return 0.5 * (low + high), span * BUMP_TAU_SPAN
 
 
 def bump_multiplier(centered_years: np.ndarray, width: float) -> np.ndarray:
@@ -464,7 +485,7 @@ def trend_record(
         "trend_break_year": int(trend.break_year),
         "step_break_year": int(step.break_year),
         "shock_break_year": int(shock.break_year),
-        "bump_break_year": int(bump.break_year),
+        "bump_break_year": float(bump.break_year),
         "trend_log_evidence": evidences["trend"],
         "step_log_evidence": evidences["step"],
         "shock_log_evidence": evidences["shock"],
@@ -636,8 +657,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Fit a flat-then-linear trend, a level shift, a decaying shock, and a "
-            "Gaussian bump, each at its own shift year. The retained year maximizes "
-            "the Laplace evidence, and the preferred curve is the highest evidence."
+            "Gaussian bump. Trend, step, and shock keep the interior year with the "
+            "highest Laplace evidence. The bump center is continuous and may fall "
+            "outside the observed years. The preferred curve is the highest evidence."
         )
     )
     parser.add_argument("--clusters-dir", type=Path, default=Path("output/event_clusters"))
@@ -711,18 +733,18 @@ _CURVE_DATA = {
     "trend": ("since",),
     "step": ("after",),
     "shock": ("after", "elapsed_years"),
-    "bump": ("centered_years",),
 }
+_PROFILED_MODELS = ("trend", "step", "shock")
 _CURVE_PARAMETERS = {
     "trend": ("intercept", "beta"),
     "step": ("intercept", "c"),
     "shock": ("intercept", "c", "half_life"),
-    "bump": ("intercept", "amplitude", "width"),
+    "bump": ("intercept", "amplitude", "width", "tau"),
 }
 
 
 def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
-    """Compile each curve once, score every shift year, and sample the retained ones."""
+    """Compile each curve once, score its shift, and sample the retained fit."""
     _configure_worker_logging()
     pm, az = _import_pymc()
     if not task.groups:
@@ -734,7 +756,7 @@ def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
         "trend": _trend_model(pm, design.since, first_trials, first_successes),
         "step": _step_model(pm, design.after, first_trials, first_successes),
         "shock": _shock_model(pm, design.after, design.elapsed_years, first_trials, first_successes),
-        "bump": _bump_model(pm, design.centered_years, first_trials, first_successes),
+        "bump": _bump_model(pm, task.years, first_trials, first_successes),
     }
     evidence = {name: _LaplaceEvidence(model) for name, model in models.items()}
     rows = []
@@ -752,10 +774,42 @@ def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
                 task.years,
                 data_names=_CURVE_DATA[name],
             )
-            for name in MODEL_NAMES
+            for name in _PROFILED_MODELS
         }
+        _set_counts(pm, models["bump"], successes, trials)
+        try:
+            bump_log_evidence = float(evidence["bump"].log_evidence())
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Bump posterior mode is unidentified for level {task.level} group {group}"
+            ) from exc
         fits = {}
         for offset, name in enumerate(MODEL_NAMES):
+            if name == "bump":
+                inference = _sample_model(
+                    pm,
+                    models[name],
+                    draws=task.draws,
+                    tune=task.tune,
+                    chains=task.chains,
+                    seed=cluster_seed + offset,
+                    nuts_sampler=task.nuts_sampler,
+                )
+                center = np.asarray(inference.posterior["tau"].values, dtype=np.float64).ravel()
+                center_year = float(np.mean(center))
+                if not np.isfinite(center_year):
+                    raise RuntimeError(
+                        f"Bump center is unidentified for level {task.level} group {group}"
+                    )
+                fits[name] = _break_fit(
+                    az,
+                    inference,
+                    names=_CURVE_PARAMETERS[name],
+                    log_evidence=bump_log_evidence,
+                    break_year=center_year,
+                    u_max=0.0,
+                )
+                continue
             _set_curve_data(pm, models[name], successes, trials, retained[name].design, _CURVE_DATA[name])
             inference = _sample_model(
                 pm,
@@ -877,23 +931,35 @@ def _shock_model(pm, after: np.ndarray, elapsed_years: np.ndarray, trials: np.nd
     return model
 
 
-def _bump_model(pm, centered_years: np.ndarray, trials: np.ndarray, successes: np.ndarray):
+def _bump_model(pm, years: np.ndarray, trials: np.ndarray, successes: np.ndarray):
+    """Gaussian bump whose center is continuous and may leave the observed window."""
+    calendar = np.asarray(years, dtype=np.float64)
+    midpoint, scale = bump_tau_prior(calendar)
     with pm.Model() as model:
         observed, trial_totals = _binomial_data(pm, trials, successes)
-        centered = pm.Data("centered_years", np.asarray(centered_years, dtype=np.float64))
+        observed_years = pm.Data("years", calendar)
         intercept = pm.Normal("intercept", mu=0.0, sigma=INTERCEPT_SIGMA)
         amplitude = pm.Normal("amplitude", mu=0.0, sigma=AMPLITUDE_SIGMA)
         width = pm.HalfNormal("width", sigma=WIDTH_SIGMA)
-        weight = pm.math.exp(-pm.math.sqr(centered) / (2.0 * pm.math.sqr(width)))
+        tau = pm.Normal("tau", mu=midpoint, sigma=scale)
+        weight = pm.math.exp(-pm.math.sqr(observed_years - tau) / (2.0 * pm.math.sqr(width)))
         pm.Binomial("obs", n=trial_totals, logit_p=intercept + amplitude * weight, observed=observed)
     return model
 
 
+def _set_counts(pm, model, successes, trials) -> None:
+    with model:
+        pm.set_data(
+            {
+                "successes": np.asarray(successes, dtype=np.int64),
+                "trials": np.asarray(trials, dtype=np.int64),
+            }
+        )
+
+
 def _set_curve_data(pm, model, successes, trials, design: BreakDesign, data_names: Sequence[str]) -> None:
-    payload = {
-        "successes": np.asarray(successes, dtype=np.int64),
-        "trials": np.asarray(trials, dtype=np.int64),
-    }
+    _set_counts(pm, model, successes, trials)
+    payload = {}
     values = {
         "since": design.since,
         "after": design.after,
@@ -931,6 +997,7 @@ class _LaplaceEvidence:
 
     The log density and Hessian are compiled once. Later fits only change the
     binomial counts and the break design, then this reoptimizes the posterior mode.
+    Optimization starts at the model initial point, which is the prior mean.
     """
 
     def __init__(self, model) -> None:
@@ -943,11 +1010,10 @@ class _LaplaceEvidence:
         self._hessian = model.compile_d2logp(jacobian=True, negate_output=False)
         start = model.initial_point()
         free = [var.name for var in model.continuous_value_vars]
+        mapped = DictToArrayBijection.map({name: np.asarray(start[name]) for name in free})
         self._start = start
-        self._info = DictToArrayBijection.map(
-            {name: np.asarray(start[name]) for name in free}
-        ).point_map_info
-        self._dimension = len(free)
+        self._info = mapped.point_map_info
+        self._origin = np.asarray(mapped.data, dtype=np.float64).copy()
 
     def log_evidence(self) -> float:
         from scipy.optimize import minimize
@@ -960,7 +1026,7 @@ class _LaplaceEvidence:
 
         fitted = minimize(
             objective,
-            np.zeros(self._dimension),
+            self._origin,
             method="L-BFGS-B",
             jac=True,
         )
@@ -976,7 +1042,7 @@ class _LaplaceEvidence:
         return self._bijection.rmap(raveled, self._start)
 
 
-def _break_fit(az, inference, *, names: Sequence[str], log_evidence: float, break_year: int, u_max: float) -> BreakFit:
+def _break_fit(az, inference, *, names: Sequence[str], log_evidence: float, break_year: float, u_max: float) -> BreakFit:
     posterior = inference.posterior
     summary_kwargs = {"var_names": list(names), "kind": "all"}
     if "round_to" in inspect.signature(az.summary).parameters:
@@ -988,7 +1054,7 @@ def _break_fit(az, inference, *, names: Sequence[str], log_evidence: float, brea
     }
     return BreakFit(
         log_evidence=float(log_evidence),
-        break_year=int(break_year),
+        break_year=float(break_year),
         u_max=float(u_max),
         parameters=parameters,
         divergences=int(np.asarray(inference.sample_stats["diverging"]).sum()),
