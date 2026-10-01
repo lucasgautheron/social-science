@@ -15,7 +15,6 @@
     points: [],
     hovered: null,
     query: "",
-    baselines: { new: [], all: [] },
   };
   const measures = {
     new: {
@@ -23,6 +22,8 @@
       connected: "new_link_connected_count",
       disconnected: "new_link_disconnected_count",
       distribution: "new_link_distance_distribution",
+      baselineDistribution: "new_link_baseline_distance_distribution",
+      prefix: "new_link",
       yearly: "new_link_distance_by_year",
       label: "Average first-link distance",
       description: "first coauthorship links",
@@ -32,6 +33,8 @@
       connected: "all_link_connected_count",
       disconnected: "all_link_disconnected_count",
       distribution: "all_link_distance_distribution",
+      baselineDistribution: "all_link_baseline_distance_distribution",
+      prefix: "all_link",
       yearly: "all_link_distance_by_year",
       label: "Average distance across all paper links",
       description: "all coauthor-pair observations on cluster papers",
@@ -51,7 +54,21 @@
   }
 
   function formatDistance(value) {
+    if (value == null) return "—";
     return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+
+  function formatProbability(value) {
+    return value == null ? "—" : formatPercent(value);
+  }
+
+  function formatPValue(value) {
+    if (value == null) return "—";
+    return Number(value) < 0.001 ? "<0.001" : Number(value).toFixed(3);
+  }
+
+  function formatInterval(low, high, formatter = formatDistance) {
+    return low == null || high == null ? "—" : `[${formatter(low)}, ${formatter(high)}]`;
   }
 
   function selectedTypes() {
@@ -224,7 +241,7 @@
   function distributionChart(row) {
     const config = measures[state.measure];
     const selected = distributionMap(row[config.distribution], state.measure);
-    const baseline = new Map(state.baselines[state.measure]);
+    const baseline = distributionMap(row[config.baselineDistribution], state.measure);
     const maximumDistance = Math.max(0, ...selected.keys(), ...baseline.keys());
     const selectedTotal = [...selected.values()].reduce((total, count) => total + count, 0);
     const baselineTotal = [...baseline.values()].reduce((total, count) => total + count, 0);
@@ -322,18 +339,9 @@
   }
 
   function baselineLabel() {
-    return state.measure === "all" ? "All paper links" : "New links outside clusters";
-  }
-
-  function buildBaselines(rows) {
-    state.baselines.new = rows[0]?.outside_cluster_distance_distribution || [];
-    const pooled = new Map();
-    for (const row of rows) {
-      for (const [distance, count] of distributionMap(row.all_link_distance_distribution, "all")) {
-        pooled.set(distance, (pooled.get(distance) || 0) + count);
-      }
-    }
-    state.baselines.all = [...pooled.entries()].sort((left, right) => left[0] - right[0]);
+    return state.measure === "all"
+      ? "Year-matched links outside this cluster"
+      : "Year-matched new links outside clusters";
   }
 
   function show(row) {
@@ -356,9 +364,38 @@
       ["Mean distance", formatDistance(row[config.distance])],
       ["Connected", Number(row[config.connected]).toLocaleString()],
       ["Disconnected", Number(row[config.disconnected]).toLocaleString()],
+      ["Disconnected share", formatProbability(row[`${config.prefix}_disconnection_probability`])],
+      ["Matched baseline", formatProbability(row[`${config.prefix}_baseline_disconnection_probability`])],
+      ["Disconnect Δ", formatProbability(row[`${config.prefix}_disconnection_risk_difference`])],
+      ["Disconnect 95% CI", formatInterval(
+        row[`${config.prefix}_disconnection_ci_low`],
+        row[`${config.prefix}_disconnection_ci_high`],
+        formatProbability,
+      )],
+      ["Disconnect p", formatPValue(row[`${config.prefix}_disconnection_p_value`])],
+      ["Disconnect q", formatPValue(row[`${config.prefix}_disconnection_q_value`])],
+      ["Mean-hop Δ", formatDistance(row[`${config.prefix}_mean_distance_shift`])],
+      ["Mean-hop 95% CI", formatInterval(
+        row[`${config.prefix}_mean_distance_shift_ci_low`],
+        row[`${config.prefix}_mean_distance_shift_ci_high`],
+      )],
+      ["Wasserstein-1", formatDistance(row[`${config.prefix}_wasserstein_distance`])],
+      ["Wasserstein 95% CI", formatInterval(
+        row[`${config.prefix}_wasserstein_ci_low`],
+        row[`${config.prefix}_wasserstein_ci_high`],
+      )],
+      ["Distance p", formatPValue(row[`${config.prefix}_wasserstein_p_value`])],
+      ["Distance q", formatPValue(row[`${config.prefix}_wasserstein_q_value`])],
     ];
     if (state.measure === "all") {
       values.push(["Existing links", Number(row.all_link_existing_count).toLocaleString()]);
+      values.push(["Repeat share", formatProbability(row.all_link_repeat_probability)]);
+      values.push(["Repeat-share Δ", formatProbability(row.all_link_repeat_risk_difference)]);
+      values.push(["Repeat Δ 95% CI", formatInterval(
+        row.all_link_repeat_risk_difference_ci_low,
+        row.all_link_repeat_risk_difference_ci_high,
+        formatProbability,
+      )]);
     }
     for (const [label, value] of values) {
       const item = document.createElement("div");
@@ -586,7 +623,6 @@
         return;
       }
       state.rows = data.link_distances;
-      buildBaselines(state.rows);
       updateSummary();
       draw();
     })

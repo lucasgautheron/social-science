@@ -704,10 +704,38 @@ def load_link_distance_summary(
         "average_new_link_distance",
         "average_all_link_distance",
     )
+    comparison_suffixes = (
+        "disconnection_probability",
+        "baseline_disconnection_probability",
+        "disconnection_risk_difference",
+        "disconnection_ci_low",
+        "disconnection_ci_high",
+        "disconnection_p_value",
+        "disconnection_q_value",
+        "mean_distance_shift",
+        "mean_distance_shift_ci_low",
+        "mean_distance_shift_ci_high",
+        "wasserstein_distance",
+        "wasserstein_ci_low",
+        "wasserstein_ci_high",
+        "wasserstein_p_value",
+        "wasserstein_q_value",
+        "repeat_probability",
+        "baseline_repeat_probability",
+        "repeat_risk_difference",
+        "repeat_risk_difference_ci_low",
+        "repeat_risk_difference_ci_high",
+    )
+    comparison_fields = tuple(
+        f"{prefix}_{suffix}"
+        for prefix in ("new_link", "all_link")
+        for suffix in comparison_suffixes
+    )
     distribution_fields = (
         "new_link_distance_distribution",
         "all_link_distance_distribution",
-        "outside_cluster_distance_distribution",
+        "new_link_baseline_distance_distribution",
+        "all_link_baseline_distance_distribution",
     )
     yearly_distance_fields = (
         "new_link_distance_by_year",
@@ -744,6 +772,9 @@ def load_link_distance_summary(
             row.update({field: int(source[field]) for field in integer_fields})
             for field in distance_fields:
                 value = float(source[field])
+                row[field] = value if math.isfinite(value) else None
+            for field in comparison_fields:
+                value = float(source.get(field) or "nan")
                 row[field] = value if math.isfinite(value) else None
             for field in distribution_fields:
                 distribution = json.loads(source[field])

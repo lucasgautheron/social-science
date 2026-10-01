@@ -39,6 +39,7 @@ DEFAULT_GROUPED_BFS_MIN_TARGETS = 4
 DEFAULT_DISTANCE_WORKERS = 16
 DEFAULT_NO_CLUSTER_SAMPLE = 2_000
 DEFAULT_CLUSTER_SAMPLE = 2_000
+DEFAULT_BASELINE_SAMPLE = 2_000
 DEFAULT_SAMPLING_SEED = 0
 DEFAULT_CACHE_MB = 2048
 _FETCH_SIZE = 200_000
@@ -70,6 +71,7 @@ def build_new_links(
     distance_workers: int = DEFAULT_DISTANCE_WORKERS,
     no_cluster_sample: int = DEFAULT_NO_CLUSTER_SAMPLE,
     cluster_sample: int = DEFAULT_CLUSTER_SAMPLE,
+    baseline_sample: int = DEFAULT_BASELINE_SAMPLE,
     sampling_seed: int = DEFAULT_SAMPLING_SEED,
     sqlite_cache_mb: int = DEFAULT_CACHE_MB,
     resume: bool = False,
@@ -84,6 +86,7 @@ def build_new_links(
         distance_workers,
         no_cluster_sample,
         cluster_sample,
+        baseline_sample,
         sampling_seed,
         fetch_size,
     )
@@ -96,9 +99,9 @@ def build_new_links(
     manifest_path = output / "manifest.json"
 
     existing = _load_manifest(manifest_path) if resume and manifest_path.exists() else None
-    if existing is not None and int(existing.get("artifact_version", 0)) != 6:
+    if existing is not None and int(existing.get("artifact_version", 0)) != 7:
         raise ValueError(
-            "Existing output predates global per-cluster distance reservoirs. "
+            "Existing output predates year-matched cluster baselines. "
             "Use a new --output-dir."
         )
     if existing is not None and existing.get("distance_mode") != "exact":
@@ -124,6 +127,7 @@ def build_new_links(
         "max_event_pairs": max_event_pairs,
         "no_cluster_sample": no_cluster_sample,
         "cluster_sample": cluster_sample,
+        "baseline_sample": baseline_sample,
         "sampling_seed": sampling_seed,
         "to_year": to_year,
     }
@@ -179,7 +183,11 @@ def build_new_links(
     graph, parent, size, seen_keys = _restore_prior_graph(
         scratch, years, completed, int(author_ids.size)
     )
-    cluster_reservoirs, cluster_observation_population = _restore_cluster_reservoir(
+    (
+        cluster_reservoirs,
+        cluster_reservoir_years,
+        cluster_observation_population,
+    ) = _restore_cluster_reservoir(
         scratch,
         years,
         completed,
@@ -198,6 +206,7 @@ def build_new_links(
             sampling_stats,
             cluster_observations,
             cluster_reservoirs,
+            cluster_reservoir_years,
             cluster_observation_population,
             all_left,
             all_right,
@@ -216,9 +225,11 @@ def build_new_links(
             distance_workers,
             no_cluster_sample,
             cluster_sample,
+            baseline_sample,
             sampling_seed,
             int(cluster_labels.size),
             cluster_reservoirs,
+            cluster_reservoir_years,
             cluster_observation_population,
             seen_keys,
         )
@@ -230,6 +241,7 @@ def build_new_links(
         _save_cluster_reservoir(
             _reservoir_path(scratch, year),
             cluster_reservoirs,
+            cluster_reservoir_years,
             cluster_observation_population,
         )
 
@@ -267,6 +279,7 @@ def build_new_links(
     _save_cluster_reservoir(
         output / "cluster_distance_reservoir.npz",
         cluster_reservoirs,
+        cluster_reservoir_years,
         cluster_observation_population,
     )
     shutil.rmtree(scratch, ignore_errors=True)
@@ -329,6 +342,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CLUSTER_SAMPLE,
         help="Uniform distance samples retained independently per cluster and year.",
     )
+    parser.add_argument(
+        "--baseline-sample",
+        type=int,
+        default=DEFAULT_BASELINE_SAMPLE,
+        help="Uniform all-paper-link reference observations retained per year.",
+    )
     parser.add_argument("--sampling-seed", type=int, default=DEFAULT_SAMPLING_SEED)
     parser.add_argument("--sqlite-cache-mb", type=int, default=DEFAULT_CACHE_MB)
     parser.add_argument("--resume", action="store_true")
@@ -351,6 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         distance_workers=args.distance_workers,
         no_cluster_sample=args.no_cluster_sample,
         cluster_sample=args.cluster_sample,
+        baseline_sample=args.baseline_sample,
         sampling_seed=args.sampling_seed,
         sqlite_cache_mb=args.sqlite_cache_mb,
         resume=args.resume,
@@ -366,6 +386,7 @@ def _validate_options(
     distance_workers: int,
     no_cluster_sample: int,
     cluster_sample: int,
+    baseline_sample: int,
     sampling_seed: int,
     fetch_size: int,
 ) -> None:
@@ -383,6 +404,8 @@ def _validate_options(
         raise ValueError("--no-cluster-sample must be >= 0")
     if cluster_sample < 1:
         raise ValueError("--cluster-sample must be >= 1")
+    if baseline_sample < 1:
+        raise ValueError("--baseline-sample must be >= 1")
     if sampling_seed < 0:
         raise ValueError("--sampling-seed must be >= 0")
     if fetch_size < 1:
@@ -694,9 +717,11 @@ def _process_year(
     distance_workers: int,
     no_cluster_sample: int,
     cluster_sample: int,
+    baseline_sample: int,
     sampling_seed: int,
     cluster_count: int,
     cluster_reservoirs: list[np.ndarray],
+    cluster_reservoir_years: list[np.ndarray],
     cluster_observation_population: np.ndarray,
     seen_keys: np.ndarray,
 ) -> tuple[
@@ -704,6 +729,7 @@ def _process_year(
     dict[str, int | float],
     dict[str, int | float | None],
     dict[str, np.ndarray],
+    list[np.ndarray],
     list[np.ndarray],
     np.ndarray,
     np.ndarray,
@@ -769,7 +795,9 @@ def _process_year(
         cluster_observations,
         sampled_event_keys,
         sampled_event_clusters,
+        sampled_event_existing,
         kept_reservoirs,
+        kept_reservoir_years,
         cluster_observation_population,
     ) = _sample_cluster_observations(
         event_pair_keys,
@@ -782,7 +810,24 @@ def _process_year(
         sampling_seed,
         year,
         cluster_reservoirs,
+        cluster_reservoir_years,
         cluster_observation_population,
+    )
+    (
+        reference_keys,
+        reference_clusters,
+        reference_existing,
+        reference_new_connected,
+        reference_weight,
+    ) = _sample_all_link_reference(
+        event_pair_keys,
+        event_pair_clusters,
+        seen_keys,
+        new_keys,
+        new_connected,
+        baseline_sample,
+        sampling_seed,
+        year,
     )
     attributed = cluster_id >= 0
     cluster_observations["attributed_new_link_population"] = np.bincount(
@@ -795,7 +840,12 @@ def _process_year(
         cluster_id[attributed & ~new_connected], minlength=cluster_count
     ).astype(np.int64)
 
-    distance_keys = np.union1d(retained_keys, np.unique(sampled_event_keys))
+    sampled_new_event_keys = sampled_event_keys[~sampled_event_existing]
+    reference_distance_keys = reference_keys[reference_new_connected]
+    distance_keys = np.union1d(
+        retained_keys,
+        np.union1d(np.unique(sampled_new_event_keys), np.unique(reference_distance_keys)),
+    )
     distance_left, distance_right = _decode_pairs(distance_keys)
     all_distances, distance_stats = _distances(
         graph,
@@ -809,17 +859,35 @@ def _process_year(
     right = all_right[retained]
     retained_positions = np.searchsorted(distance_keys, retained_keys)
     distance = all_distances[retained_positions]
-    cluster_reservoirs = _finish_cluster_reservoir(
+    cluster_reservoirs, cluster_reservoir_years = _finish_cluster_reservoir(
         kept_reservoirs,
+        kept_reservoir_years,
         sampled_event_keys,
         sampled_event_clusters,
+        sampled_event_existing,
         distance_keys,
         all_distances,
         cluster_count,
+        year,
     )
-    cluster_observations["new_connected_distance_sum"] = _accepted_distance_sums(
+    reference_distances = np.full(reference_keys.size, DISCONNECTED, dtype=np.int32)
+    reference_distances[reference_existing] = 1
+    if np.any(reference_new_connected):
+        reference_positions = np.searchsorted(
+            distance_keys, reference_keys[reference_new_connected]
+        )
+        reference_distances[reference_new_connected] = all_distances[
+            reference_positions
+        ]
+    cluster_observations["reference_cluster_id"] = reference_clusters
+    cluster_observations["reference_distance"] = reference_distances
+    cluster_observations["reference_sampling_weight"] = np.full(
+        reference_keys.size, reference_weight, dtype=np.float64
+    )
+    cluster_observations["connected_distance_sum"] = _accepted_distance_sums(
         sampled_event_keys,
         sampled_event_clusters,
+        sampled_event_existing,
         distance_keys,
         all_distances,
         cluster_count,
@@ -836,6 +904,7 @@ def _process_year(
         sampling_stats,
         cluster_observations,
         cluster_reservoirs,
+        cluster_reservoir_years,
         cluster_observation_population,
         all_left,
         all_right,
@@ -1048,6 +1117,58 @@ def _attribute_clusters(
     return result
 
 
+def _sample_all_link_reference(
+    event_keys: np.ndarray,
+    event_clusters: np.ndarray,
+    seen_keys: np.ndarray,
+    new_keys: np.ndarray,
+    new_connected: np.ndarray,
+    sample_size: int,
+    sampling_seed: int,
+    year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Sample all cluster-paper pair observations for a yearly reference pool."""
+    population = int(event_keys.size)
+    retained_size = min(sample_size, population)
+    if retained_size == population:
+        retained = np.arange(population, dtype=np.int64)
+    elif retained_size:
+        rng = np.random.default_rng(
+            np.random.SeedSequence([sampling_seed, int(year), 3])
+        )
+        retained = rng.choice(
+            population, size=retained_size, replace=False, shuffle=False
+        )
+    else:
+        retained = np.empty(0, dtype=np.int64)
+    if retained.size == 0:
+        return (
+            np.empty(0, dtype=np.uint64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=bool),
+            np.empty(0, dtype=bool),
+            0.0,
+        )
+    sampled_keys = event_keys[retained]
+    prior_positions = np.searchsorted(seen_keys, sampled_keys)
+    existing = prior_positions < seen_keys.size
+    existing[existing] &= seen_keys[prior_positions[existing]] == sampled_keys[existing]
+    new_positions = np.searchsorted(new_keys, sampled_keys)
+    is_new = new_positions < new_keys.size
+    is_new[is_new] &= new_keys[new_positions[is_new]] == sampled_keys[is_new]
+    if not np.all(existing | is_new):
+        raise RuntimeError("Reference pair is absent from both prior and new edges")
+    sampled_new_connected = np.zeros(retained.size, dtype=bool)
+    sampled_new_connected[is_new] = new_connected[new_positions[is_new]]
+    return (
+        sampled_keys,
+        event_clusters[retained],
+        existing,
+        sampled_new_connected,
+        population / retained.size,
+    )
+
+
 def _sample_cluster_observations(
     event_keys: np.ndarray,
     event_clusters: np.ndarray,
@@ -1059,11 +1180,14 @@ def _sample_cluster_observations(
     sampling_seed: int,
     year: int,
     cluster_reservoirs: list[np.ndarray],
+    cluster_reservoir_years: list[np.ndarray],
     cluster_observation_population: np.ndarray,
 ) -> tuple[
     dict[str, np.ndarray],
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    list[np.ndarray],
     list[np.ndarray],
     np.ndarray,
 ]:
@@ -1093,21 +1217,24 @@ def _sample_cluster_observations(
     sampled_parts: list[np.ndarray] = []
     sampled_cluster_parts: list[np.ndarray] = []
     kept_reservoirs: list[np.ndarray] = []
+    kept_reservoir_years: list[np.ndarray] = []
     accepted_counts = np.zeros(cluster_count, dtype=np.int64)
+    connected_records = known | new_connected_records
     updated_population = (
         cluster_observation_population.astype(np.int64, copy=True)
+        + existing
         + connected_new
     )
     for cluster in range(cluster_count):
         candidates = np.flatnonzero(
-            new_connected_records & (event_clusters == cluster)
+            connected_records & (event_clusters == cluster)
         )
         previous_population = int(cluster_observation_population[cluster])
-        new_population = int(candidates.size)
-        total_population = previous_population + new_population
+        current_population = int(candidates.size)
+        total_population = previous_population + current_population
         target_size = min(cluster_sample, total_population)
         if total_population <= cluster_sample:
-            accepted_new = new_population
+            accepted_new = current_population
         else:
             rng = np.random.default_rng(
                 np.random.SeedSequence(
@@ -1116,7 +1243,7 @@ def _sample_cluster_observations(
             )
             accepted_new = int(
                 rng.hypergeometric(
-                    ngood=new_population,
+                    ngood=current_population,
                     nbad=previous_population,
                     nsample=target_size,
                 )
@@ -1133,6 +1260,7 @@ def _sample_cluster_observations(
             [sampling_seed, int(year), 2, cluster, 1],
         )
         kept_reservoirs.append(cluster_reservoirs[cluster][old_indices])
+        kept_reservoir_years.append(cluster_reservoir_years[cluster][old_indices])
         sampled_parts.append(accepted)
         sampled_cluster_parts.append(
             np.full(accepted_new, cluster, dtype=np.int32)
@@ -1142,22 +1270,26 @@ def _sample_cluster_observations(
     if sampled_parts:
         sampled_indices = np.concatenate(sampled_parts)
         sampled_clusters = np.concatenate(sampled_cluster_parts)
+        sampled_existing = known[sampled_indices]
     else:
         sampled_indices = np.empty(0, dtype=np.int64)
         sampled_clusters = np.empty(0, dtype=np.int32)
+        sampled_existing = np.empty(0, dtype=bool)
     observations = {
         "connected_pair_observations": existing + connected_new,
         "disconnected_pair_observations": disconnected,
         "existing_pair_observations": existing,
         "new_connected_pair_observations": connected_new,
-        "reservoir_new_acceptances": accepted_counts,
+        "reservoir_acceptances": accepted_counts,
         "total_pair_observations": totals,
     }
     return (
         observations,
         event_keys[sampled_indices],
         sampled_clusters,
+        sampled_existing,
         kept_reservoirs,
+        kept_reservoir_years,
         updated_population,
     )
 
@@ -1165,22 +1297,25 @@ def _sample_cluster_observations(
 def _accepted_distance_sums(
     sampled_keys: np.ndarray,
     sampled_clusters: np.ndarray,
+    sampled_existing: np.ndarray,
     distance_keys: np.ndarray,
     distances: np.ndarray,
     cluster_count: int,
 ) -> np.ndarray:
     """Sum distances of this year's reservoir acceptances.
 
-    Those acceptances are a simple random sample of the year's connected new
-    pair observations, so the sum divided by the acceptance count estimates
-    that year's mean.
+    Those acceptances are a simple random sample of the year's connected pair
+    observations, so the sum divided by the acceptance count estimates that
+    year's mean.
     """
     sums = np.zeros(cluster_count, dtype=np.float64)
     if sampled_keys.size == 0:
         return sums
-    positions = np.searchsorted(distance_keys, sampled_keys)
-    sampled_distances = distances[positions]
-    if np.any(sampled_distances < 0):
+    sampled_distances = np.ones(sampled_keys.size, dtype=np.int32)
+    sampled_new = ~sampled_existing
+    positions = np.searchsorted(distance_keys, sampled_keys[sampled_new])
+    sampled_distances[sampled_new] = distances[positions]
+    if np.any(sampled_distances < 1):
         raise RuntimeError("Connected cluster observation has no finite distance")
     np.add.at(sums, sampled_clusters, sampled_distances)
     return sums
@@ -1188,20 +1323,25 @@ def _accepted_distance_sums(
 
 def _finish_cluster_reservoir(
     kept_reservoirs: list[np.ndarray],
+    kept_reservoir_years: list[np.ndarray],
     sampled_keys: np.ndarray,
     sampled_clusters: np.ndarray,
+    sampled_existing: np.ndarray,
     distance_keys: np.ndarray,
     distances: np.ndarray,
     cluster_count: int,
-) -> list[np.ndarray]:
+    year: int,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
     if sampled_keys.size:
-        positions = np.searchsorted(distance_keys, sampled_keys)
-        sampled_distances = distances[positions]
-        if np.any(sampled_distances < 0):
+        sampled_distances = np.ones(sampled_keys.size, dtype=np.int32)
+        sampled_new = ~sampled_existing
+        positions = np.searchsorted(distance_keys, sampled_keys[sampled_new])
+        sampled_distances[sampled_new] = distances[positions]
+        if np.any(sampled_distances < 1):
             raise RuntimeError("Connected cluster observation has no finite distance")
     else:
         sampled_distances = np.empty(0, dtype=np.int32)
-    return [
+    reservoirs = [
         np.concatenate(
             (
                 kept_reservoirs[cluster],
@@ -1210,6 +1350,20 @@ def _finish_cluster_reservoir(
         ).astype(np.int32, copy=False)
         for cluster in range(cluster_count)
     ]
+    reservoir_years = [
+        np.concatenate(
+            (
+                kept_reservoir_years[cluster],
+                np.full(
+                    np.count_nonzero(sampled_clusters == cluster),
+                    year,
+                    dtype=np.int32,
+                ),
+            )
+        ).astype(np.int32, copy=False)
+        for cluster in range(cluster_count)
+    ]
+    return reservoirs, reservoir_years
 
 
 def _distances(
@@ -1648,10 +1802,11 @@ def _restore_cluster_reservoir(
     completed: set[int],
     cluster_count: int,
     cluster_sample: int,
-) -> tuple[list[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
     completed_years = [year for year in years if year in completed]
     if not completed_years:
         return (
+            [np.empty(0, dtype=np.int32) for _ in range(cluster_count)],
             [np.empty(0, dtype=np.int32) for _ in range(cluster_count)],
             np.zeros(cluster_count, dtype=np.int64),
         )
@@ -1663,6 +1818,7 @@ def _restore_cluster_reservoir(
     with np.load(path, allow_pickle=False) as payload:
         offsets = payload["offsets"].astype(np.int64, copy=False)
         distances = payload["distances"].astype(np.int32, copy=False)
+        reservoir_years = payload["years"].astype(np.int32, copy=False)
         population = payload["population"].astype(np.int64, copy=False)
     if offsets.shape != (cluster_count + 1,) or population.shape != (cluster_count,):
         raise RuntimeError("Cluster reservoir does not align with cluster metadata")
@@ -1670,13 +1826,19 @@ def _restore_cluster_reservoir(
         distances[offsets[cluster] : offsets[cluster + 1]].copy()
         for cluster in range(cluster_count)
     ]
+    years_by_cluster = [
+        reservoir_years[offsets[cluster] : offsets[cluster + 1]].copy()
+        for cluster in range(cluster_count)
+    ]
+    if reservoir_years.shape != distances.shape:
+        raise RuntimeError("Cluster reservoir years do not align with distances")
     expected_sizes = np.minimum(population, cluster_sample)
     if not np.array_equal(
         np.asarray([values.size for values in reservoirs], dtype=np.int64),
         expected_sizes,
     ):
         raise RuntimeError("Cluster reservoir sample sizes do not match populations")
-    return reservoirs, population.copy()
+    return reservoirs, years_by_cluster, population.copy()
 
 
 def _encode_pairs(left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -1731,7 +1893,7 @@ def _fresh_manifest(
 ) -> dict:
     return {
         **config,
-        "artifact_version": 6,
+        "artifact_version": 7,
         "author_count": int(author_ids.size),
         "cluster_level": None,
         "cluster_metadata": "cluster_metadata.npz",
@@ -1753,8 +1915,8 @@ def _fresh_manifest(
         "no_cluster": int(NO_CLUSTER),
         "sampling_design": (
             "year-stratified simple random samples without replacement for no-cluster "
-            "links and each attributed cluster; one global reservoir sample per "
-            "cluster for connected new paper-pair observations"
+            "links, each attributed cluster, and all-paper-link references; one global "
+            "year-labelled reservoir per cluster for all connected paper-pair observations"
         ),
         "sampling_stats": {},
         "stored_link_counts": {},
@@ -1868,8 +2030,14 @@ def _save_cluster_year(path: Path, observations: dict[str, np.ndarray]) -> None:
 def _save_cluster_reservoir(
     path: Path,
     reservoirs: Sequence[np.ndarray],
+    reservoir_years: Sequence[np.ndarray],
     population: np.ndarray,
 ) -> None:
+    if len(reservoirs) != len(reservoir_years) or any(
+        distances.size != years.size
+        for distances, years in zip(reservoirs, reservoir_years, strict=True)
+    ):
+        raise ValueError("Cluster reservoir years do not align with distances")
     sizes = np.asarray([values.size for values in reservoirs], dtype=np.int64)
     offsets = np.empty(sizes.size + 1, dtype=np.int64)
     offsets[0] = 0
@@ -1879,10 +2047,16 @@ def _save_cluster_reservoir(
         if reservoirs
         else np.empty(0, dtype=np.int32)
     )
+    years = (
+        np.concatenate(reservoir_years).astype(np.int32, copy=False)
+        if reservoir_years
+        else np.empty(0, dtype=np.int32)
+    )
     _save_year(
         path,
         {
             "distances": distances,
+            "years": years,
             "offsets": offsets,
             "population": population.astype(np.int64, copy=False),
         },

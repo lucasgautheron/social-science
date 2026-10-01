@@ -165,7 +165,9 @@ openalex new-links \
 All new links are added to the cumulative graph. Results retain simple random
 samples of up to 2,000 no-cluster links per year and 2,000 links per
 attributed cluster and year; change these with `--no-cluster-sample` and
-`--cluster-sample`, and reproduce them with `--sampling-seed`. They are
+`--cluster-sample`. A separate sample of up to 2,000 cluster-paper pair
+observations per year supplies all-link reference distributions; change it
+with `--baseline-sample`. Reproduce every sample with `--sampling-seed`. They are
 partitioned as `years/<year>.npz`, with int32 `author_i` and `author_j` indices
 into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 `sampling_weight`. Distance `-1` means the authors were disconnected. Cluster
@@ -173,7 +175,8 @@ into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 first-year link. Use `sampling_weight` when estimating totals. Exact
 population/sample counts and inclusion probabilities are in `manifest.json`.
 Event artifacts produced before article-id incidence sidecars were added must
-be regenerated.
+be regenerated. New-link artifacts before version 7 lack year-matched
+reference samples and must also be rebuilt.
 
 Both `network` and `new-links` skip papers with more than 16 authors by
 default; change this with `--max-authors`. Exact distances use bidirectional
@@ -190,17 +193,37 @@ distance:
 ```bash
 openalex visualize-new-links \
   --new-links-dir output/new_links \
-  --output-dir output/new_link_visualizations
+  --output-dir output/new_link_visualizations \
+  --bootstrap-replicates 500 \
+  --permutation-replicates 1000
 ```
 
 This writes separate scatter plots for first links and for all coauthor-pair
 observations on cluster papers. In the latter, pairs already linked before the
-paper contribute distance zero. Connected new observations use one uniform
+paper contribute distance one. All connected observations use one uniform
 reservoir of up to `--cluster-sample` observations per cluster across all
 years. Exact connected denominators and reservoir-weighted distance sums keep
 the plotted means design-unbiased. (The first-link output above remains sampled
 per cluster and year.) Disconnected pairs are excluded from both means and
-reported separately in `cluster_link_distance_summary.csv`. Points are gray;
+reported separately in `cluster_link_distance_summary.csv`.
+
+Each cluster receives its own year-matched reference. First-link references
+use no-cluster links; all-link references use cluster-paper observations from
+the other clusters (leave-one-cluster-out). Within-year reference
+distributions are post-stratified to the selected cluster's edge-year mix, so
+the comparison does not inherit the corpus-wide year distribution. The output
+reports disconnection risk separately from finite connected distances and
+reports repeat-collaboration share separately for all links.
+
+Finite-distribution effects include the signed mean-hop shift and
+Wasserstein-1 distance. Uncertainty uses year-stratified nonparametric
+bootstrap intervals; year-stratified permutation tests produce Monte Carlo
+p-values, with Benjamini-Hochberg q-values across clusters. Set
+`--inference-seed` for reproducible inference; `--inference-workers` controls
+the parallel cluster comparisons (default 8). These are year-adjusted
+descriptive comparisons, not causal cluster effects: author seniority,
+network degree, team composition, and other cluster-specific factors remain
+possible confounders. Points are gray;
 within each of four size quantiles, the most positive and negative residuals
 from a regression on log paper count are highlighted in red and labeled with
 the cluster's highest-frequency keyword.
@@ -230,8 +253,9 @@ measures from `visualize-new-links`. Its points use one neutral style rather
 than the static plots' residual highlights; hovering a point shows the cluster,
 its share-of-papers curve by year, the mean connected distance by year for the
 selected measure, and its discrete connected-link
-distance distribution (0, 1, 2, ...) overlaid with the sampling-weighted
-distribution of new links outside every cluster (`cluster_id == -1`). The
+distance distribution (1, 2, ...) overlaid with that cluster's year-matched
+reference. The details also report disconnection and distribution effect
+sizes with FDR-adjusted q-values. The
 cluster search matches labels, member keywords, and cluster ids, and filters
 the scatter points immediately.
 

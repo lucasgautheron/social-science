@@ -24,6 +24,10 @@ from openalex.analysis.new_links import (
 )
 from openalex.cli import COMMANDS
 from openalex.visualizations.new_links import (
+    _benjamini_hochberg,
+    _compare_distributions,
+    _integer_histogram,
+    _resample_histogram,
     _residual_highlights,
     build_cluster_link_plots,
 )
@@ -212,6 +216,8 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
     assert 20 not in author_ids
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_version"] == 7
+    assert manifest["baseline_sample"] == 2_000
     assert manifest["completed_years"] == [2019, 2020, 2021]
     assert manifest["clustered_link_counts"]["2020"] == 1
     assert manifest["hyperauthored_papers"]["2021"] == 1
@@ -231,22 +237,26 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert stats["connected_pair_observations"].tolist() == [2, 1]
         assert stats["disconnected_pair_observations"].tolist() == [0, 0]
         assert stats["new_connected_pair_observations"].tolist() == [2, 1]
-        assert stats["reservoir_new_acceptances"].tolist() == [2, 1]
-        assert stats["new_connected_distance_sum"].tolist() == [4, 2]
+        assert stats["reservoir_acceptances"].tolist() == [2, 1]
+        assert stats["connected_distance_sum"].tolist() == [4, 2]
         assert stats["existing_pair_observations"].tolist() == [0, 0]
+        assert stats["reference_cluster_id"].tolist() == [0, 1, 0]
+        assert stats["reference_distance"].tolist() == [2, 2, 2]
+        assert stats["reference_sampling_weight"].tolist() == [1, 1, 1]
     with np.load(output / "cluster_years" / "2021.npz", allow_pickle=False) as stats:
         assert stats["connected_pair_observations"].tolist() == [1, 0]
         assert stats["disconnected_pair_observations"].tolist() == [2, 3]
         assert stats["new_connected_pair_observations"].tolist() == [0, 0]
-        assert stats["reservoir_new_acceptances"].tolist() == [0, 0]
-        assert stats["new_connected_distance_sum"].tolist() == [0, 0]
+        assert stats["reservoir_acceptances"].tolist() == [1, 0]
+        assert stats["connected_distance_sum"].tolist() == [1, 0]
         assert stats["existing_pair_observations"].tolist() == [1, 0]
     with np.load(
         output / "cluster_distance_reservoir.npz", allow_pickle=False
     ) as reservoir:
-        assert reservoir["population"].tolist() == [2, 1]
-        assert reservoir["offsets"].tolist() == [0, 2, 3]
-        assert reservoir["distances"].tolist() == [2, 2, 2]
+        assert reservoir["population"].tolist() == [3, 1]
+        assert reservoir["offsets"].tolist() == [0, 3, 4]
+        assert reservoir["distances"].tolist() == [2, 2, 1, 2]
+        assert reservoir["years"].tolist() == [2020, 2020, 2021, 2020]
     assert not (output / "scratch").exists()
 
 
@@ -417,6 +427,12 @@ def test_network_commands_default_to_sixteen_authors():
     assert (
         build_new_links_parser()
         .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .baseline_sample
+        == 2_000
+    )
+    assert (
+        build_new_links_parser()
+        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
         .distance_workers
         == 16
     )
@@ -460,7 +476,11 @@ def test_cluster_paper_observations_use_reproducible_global_reservoirs():
         np.empty(0, dtype=np.int32),
         np.empty(0, dtype=np.int32),
     ]
-    observations, keys, clusters, kept, populations = (
+    empty_reservoir_years = [
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+    ]
+    observations, keys, clusters, existing, kept, kept_years, populations = (
         _sample_cluster_observations(
             event_keys,
             event_clusters,
@@ -472,23 +492,31 @@ def test_cluster_paper_observations_use_reproducible_global_reservoirs():
             sampling_seed=13,
             year=2020,
             cluster_reservoirs=empty_reservoirs,
+            cluster_reservoir_years=empty_reservoir_years,
             cluster_observation_population=np.zeros(2, dtype=np.int64),
         )
     )
     assert observations["new_connected_pair_observations"].tolist() == [20, 6]
-    assert observations["reservoir_new_acceptances"].tolist() == [5, 5]
+    assert observations["reservoir_acceptances"].tolist() == [5, 5]
     assert populations.tolist() == [20, 6]
     assert np.bincount(clusters, minlength=2).tolist() == [5, 5]
 
-    reservoirs = _finish_cluster_reservoir(
+    reservoirs, reservoir_years = _finish_cluster_reservoir(
         kept,
+        kept_years,
         keys,
         clusters,
+        existing,
         np.unique(keys),
         np.full(np.unique(keys).size, 2, dtype=np.int32),
         cluster_count=2,
+        year=2020,
     )
     assert [values.tolist() for values in reservoirs] == [[2] * 5, [2] * 5]
+    assert [values.tolist() for values in reservoir_years] == [
+        [2020] * 5,
+        [2020] * 5,
+    ]
 
     second_keys = event_keys + 100
     first_result = _sample_cluster_observations(
@@ -502,6 +530,7 @@ def test_cluster_paper_observations_use_reproducible_global_reservoirs():
         sampling_seed=13,
         year=2021,
         cluster_reservoirs=reservoirs,
+        cluster_reservoir_years=reservoir_years,
         cluster_observation_population=populations,
     )
     second_result = _sample_cluster_observations(
@@ -515,30 +544,106 @@ def test_cluster_paper_observations_use_reproducible_global_reservoirs():
         sampling_seed=13,
         year=2021,
         cluster_reservoirs=reservoirs,
+        cluster_reservoir_years=reservoir_years,
         cluster_observation_population=populations,
     )
-    for first, second in zip(first_result[1:3], second_result[1:3], strict=True):
+    for first, second in zip(first_result[1:4], second_result[1:4], strict=True):
         assert np.array_equal(first, second)
-    for first, second in zip(first_result[3], second_result[3], strict=True):
+    for first, second in zip(first_result[4], second_result[4], strict=True):
         assert np.array_equal(first, second)
-    assert np.array_equal(first_result[4], second_result[4])
+    for first, second in zip(first_result[5], second_result[5], strict=True):
+        assert np.array_equal(first, second)
+    assert np.array_equal(first_result[6], second_result[6])
 
-    _, new_keys, new_clusters, kept, populations = first_result
-    reservoirs = _finish_cluster_reservoir(
-        kept,
+    (
+        _,
         new_keys,
         new_clusters,
+        new_existing,
+        kept,
+        kept_years,
+        populations,
+    ) = first_result
+    reservoirs, reservoir_years = _finish_cluster_reservoir(
+        kept,
+        kept_years,
+        new_keys,
+        new_clusters,
+        new_existing,
         np.unique(new_keys),
         np.full(np.unique(new_keys).size, 2, dtype=np.int32),
         cluster_count=2,
+        year=2021,
     )
     assert populations.tolist() == [40, 12]
     assert [values.size for values in reservoirs] == [5, 5]
+    assert all(values.size == 5 for values in reservoir_years)
     estimated_sums = [
         population / values.size * values.sum()
         for population, values in zip(populations, reservoirs, strict=True)
     ]
     assert estimated_sums == pytest.approx([80, 24])
+
+
+def test_year_matched_nonparametric_comparison_is_reproducible():
+    cluster = [
+        {-1: 1.0, 2: 9.0},
+        {-1: 9.0, 4: 1.0},
+    ]
+    reference = [
+        {-1: 5.0, 3: 5.0},
+        {-1: 1.0, 5: 9.0},
+    ]
+    first = _compare_distributions(
+        cluster,
+        reference,
+        np.array([9, 1], dtype=np.int64),
+        np.array([1, 9], dtype=np.int64),
+        bootstrap_replicates=99,
+        permutation_replicates=99,
+        seed_components=[17, 0, 0],
+    )
+    second = _compare_distributions(
+        cluster,
+        reference,
+        np.array([9, 1], dtype=np.int64),
+        np.array([1, 9], dtype=np.int64),
+        bootstrap_replicates=99,
+        permutation_replicates=99,
+        seed_components=[17, 0, 0],
+    )
+
+    assert first.baseline_histogram == pytest.approx({3: 9.0, 5: 1.0})
+    assert first.disconnection_probability == pytest.approx(0.5)
+    assert first.baseline_disconnection_probability == pytest.approx(0.3)
+    assert first.disconnection_risk_difference == pytest.approx(0.2)
+    assert first.mean_distance_shift == pytest.approx(-1.0)
+    assert first.wasserstein_distance == pytest.approx(1.0)
+    assert first.disconnection_ci == second.disconnection_ci
+    assert first.wasserstein_ci == second.wasserstein_ci
+    assert first.disconnection_p_value == second.disconnection_p_value
+    assert first.wasserstein_p_value == second.wasserstein_p_value
+    assert _benjamini_hochberg([0.01, 0.03, 0.2]).tolist() == pytest.approx(
+        [0.03, 0.045, 0.2]
+    )
+
+
+def test_inference_uses_exact_rates_and_actual_draw_counts():
+    comparison = _compare_distributions(
+        [{-1: 1.0, 2: 1.0}],
+        [{-1: 50.0, 3: 50.0}],
+        np.array([99], dtype=np.int64),
+        np.array([1], dtype=np.int64),
+        bootstrap_replicates=199,
+        permutation_replicates=99,
+        seed_components=[23, 0, 0],
+    )
+
+    assert comparison.disconnection_risk_difference == pytest.approx(-0.49)
+    assert comparison.disconnection_ci[1] < 0
+    rng = np.random.default_rng(3)
+    assert sum(_resample_histogram(rng, {2: 1_250.0, 3: 1_250.0}).values()) == 2_500
+    assert sum(_integer_histogram({2: 2_500.0, 3: 2_500.0}).values()) == 5_000
 
 
 def test_unsampled_links_still_grow_the_cumulative_graph(tmp_path):
@@ -622,7 +727,14 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     create_event_artifacts(events, clusters)
     build_new_links(database, events, clusters, links, max_authors=2)
 
-    summary = build_cluster_link_plots(links, plots, dpi=50)
+    summary = build_cluster_link_plots(
+        links,
+        plots,
+        dpi=50,
+        bootstrap_replicates=29,
+        permutation_replicates=29,
+        inference_seed=7,
+    )
 
     with summary.open(newline="", encoding="utf-8") as handle:
         rows = {int(row["cluster_id"]): row for row in csv.DictReader(handle)}
@@ -631,7 +743,7 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert float(rows[0]["average_all_link_distance"]) == pytest.approx(5 / 3)
     assert int(rows[0]["all_link_existing_count"]) == 1
     assert int(rows[0]["all_link_new_connected_count"]) == 2
-    assert int(rows[0]["all_link_distance_sample_count"]) == 2
+    assert int(rows[0]["all_link_distance_sample_count"]) == 3
     assert int(rows[0]["all_link_disconnected_count"]) == 2
     assert json.loads(rows[0]["new_link_distance_distribution"]) == [[2, 1.0]]
     assert json.loads(rows[0]["new_link_distance_by_year"]) == [[2020, 2.0]]
@@ -643,9 +755,15 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
         [1, 1.0],
         [2, 2.0],
     ]
-    assert json.loads(rows[0]["outside_cluster_distance_distribution"]) == [
+    assert json.loads(rows[0]["new_link_baseline_distance_distribution"]) == [
         [3, 1.0]
     ]
+    assert json.loads(rows[0]["all_link_baseline_distance_distribution"]) == []
+    assert float(rows[0]["new_link_mean_distance_shift"]) == pytest.approx(-1)
+    assert float(rows[0]["new_link_wasserstein_distance"]) == pytest.approx(1)
+    assert 0 <= float(rows[0]["new_link_wasserstein_p_value"]) <= 1
+    assert 0 <= float(rows[0]["new_link_wasserstein_q_value"]) <= 1
+    assert float(rows[0]["all_link_repeat_probability"]) == pytest.approx(1 / 3)
     assert float(rows[1]["average_all_link_distance"]) == pytest.approx(2)
     assert int(rows[1]["all_link_disconnected_count"]) == 3
     assert rows[0]["label"] == "alpha"
