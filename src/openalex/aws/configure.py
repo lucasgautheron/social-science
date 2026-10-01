@@ -434,11 +434,11 @@ def command_setup(args: argparse.Namespace) -> int:
     for field in ("key_name", "security_group_id", "subnet_id"):
         if getattr(args, field) is None:
             setattr(args, field, prior_state.get(field))
-    args.iam_instance_profile = (
-        args.iam_instance_profile
-        or prior_state.get("iam_instance_profile")
-        or DEFAULT_IAM_INSTANCE_PROFILE
-    )
+    if args.iam_instance_profile is None:
+        if "iam_instance_profile" in prior_state:
+            args.iam_instance_profile = prior_state["iam_instance_profile"]
+        else:
+            args.iam_instance_profile = DEFAULT_IAM_INSTANCE_PROFILE
     prefix = normalize_prefix(args.prefix)
     db_key = args.db_s3_key or prefixed_key(prefix, "input/articles.db")
     repo_url = normalize_repo_url(

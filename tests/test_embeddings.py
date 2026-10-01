@@ -177,6 +177,52 @@ def test_embedding_runtime_uses_one_worker_per_visible_gpu(monkeypatch):
     assert encode_batch_size == 256
 
 
+def test_multi_gpu_encoding_assigns_one_persistent_executor_per_gpu(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "articles.db"
+    output = tmp_path / "embeddings"
+    write_corpus(database)
+    initialized_devices = []
+
+    class ImmediateFuture:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def result(self):
+            return np.asarray(
+                [[float(len(text)), 0.0] for text in self.texts],
+                dtype=np.float32,
+            )
+
+    class RecordingExecutor:
+        def __init__(self, **kwargs):
+            initialized_devices.append(kwargs["initargs"][1])
+
+        def submit(self, _function, texts):
+            return ImmediateFuture(texts)
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(
+        embeddings_module,
+        "_detect_accelerator_devices",
+        lambda: ["cuda:0", "cuda:1"],
+    )
+    monkeypatch.setattr(
+        embeddings_module, "ProcessPoolExecutor", RecordingExecutor
+    )
+
+    manifest = build_embeddings(database, output, batch_size=2)
+
+    assert initialized_devices == ["cuda:0", "cuda:1"]
+    assert manifest["device"] == "cuda"
+    assert manifest["workers"] == 2
+    assert manifest["encode_batch_size"] == 256
+    assert manifest["complete"] is True
+
+
 def test_resume_fills_holes_in_a_partial_legacy_database(tmp_path):
     database = tmp_path / "articles.db"
     output = tmp_path / "embeddings"

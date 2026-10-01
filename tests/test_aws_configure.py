@@ -118,6 +118,7 @@ def test_gpu_setup_preserves_legacy_cpu_worker(tmp_path, monkeypatch):
     assert state["workers"]["cpu"]["instance_id"] == "i-01814639b39ec1d72"
     assert state["workers"]["gpu"]["instance_id"] == "i-gpu"
     assert state["workers"]["gpu"]["instance_type"] == "g6.8xlarge"
+    assert state["workers"]["gpu"]["iam_instance_profile"] is None
     assert state["instance_id"] == "i-01814639b39ec1d72"
     assert state["bucket"] == "lucas-epistemic-bubbles"
     assert state["prefix"] == "social-science"
