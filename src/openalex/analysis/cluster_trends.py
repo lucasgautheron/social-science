@@ -22,10 +22,11 @@ half of that jump every H calendar years, returning to the intercept.
 
 The bump center is a continuous parameter. Its prior is normal, centered on
 the midpoint of the observed years, with standard deviation equal to their
-span, so the center may sit outside the window. A positive amplitude is bump
-increasing and a negative amplitude is bump decreasing. The deviation returns
-to the intercept on both sides. H and w are in calendar years. The reported
-bump year is the posterior mean of the center.
+span, so the center may sit outside the window. The deviation returns to the
+intercept on both sides. Bump increasing means the last observed year is on
+the climbing side of that hill or slump, and bump decreasing means it is on
+the falling side. H and w are in calendar years. The reported bump year is
+the posterior mean of the center.
 
 Parallel sampling uses one process per worker. Each process compiles each
 curve once, swaps the counts, and samples the retained shift. Chains stay
@@ -387,6 +388,24 @@ def signed_labels(values: np.ndarray, positive: str, negative: str) -> np.ndarra
     return labels
 
 
+def bump_phase_labels(amplitude: np.ndarray, center: np.ndarray, year: float) -> np.ndarray:
+    """Label each bump draw by the slope at ``year``.
+
+    A positive slope is the climb toward a hill or out of a slump. A negative
+    slope is the fall off a hill or into a slump. A draw sitting exactly on
+    its extremum counts as climbing.
+    """
+    height = np.asarray(amplitude, dtype=np.float64).ravel()
+    location = np.asarray(center, dtype=np.float64).ravel()
+    if height.size == 0 or location.size == 0:
+        raise ValueError("Posterior draws are empty")
+    if location.size == 1 and height.size != 1:
+        location = np.broadcast_to(location, height.shape)
+    if height.shape != location.shape:
+        raise ValueError("Amplitude and bump-center draws must have the same shape")
+    return signed_labels(height * (location - float(year)), BUMP_INCREASING, BUMP_DECREASING)
+
+
 def laplace_log_evidence(log_joint: float, information: np.ndarray) -> float:
     """Laplace approximation of a marginal likelihood.
 
@@ -439,8 +458,8 @@ def _reported_type(winner: str, shares: Mapping[str, Mapping[str, float]]) -> st
     if winner == "trend":
         shape = _majority(shares["trend"], TREND_SHAPES)
         return TREND_INCREASING if shape == INCREASING else TREND_DECREASING
-    shape = _majority(shares["bump"], BUMP_SHAPES)
-    return BUMP_INCREASING if shape == INVERTED_U else BUMP_DECREASING
+    phase = _majority(shares["bump_phase"], (BUMP_INCREASING, BUMP_DECREASING))
+    return phase
 
 
 def trend_record(
@@ -487,6 +506,11 @@ def trend_record(
         shares["bump"] = _class_share(
             signed_labels(bump.parameters["amplitude"], INVERTED_U, U_SHAPE),
             BUMP_SHAPES,
+        )
+        centers = bump.parameters["tau"] if "tau" in bump.parameters else [bump.break_year]
+        shares["bump_phase"] = _class_share(
+            bump_phase_labels(bump.parameters["amplitude"], centers, float(series.years.max())),
+            (BUMP_INCREASING, BUMP_DECREASING),
         )
         compatible = _reported_type(winner, shares)
         runner_up = max(evidences[name] for name in MODEL_NAMES if name != winner)

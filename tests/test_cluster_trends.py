@@ -22,6 +22,7 @@ from openalex.analysis.cluster_trends import (
     break_indices,
     build_parser,
     bump_multiplier,
+    bump_phase_labels,
     bump_tau_prior,
     default_events_dir,
     laplace_log_evidence,
@@ -203,6 +204,18 @@ def test_shock_halves_each_half_life_and_the_bump_returns_to_the_baseline():
         DECREASING,
         INCREASING,
     ]
+    labels = bump_phase_labels(
+        np.array([1.0, 1.0, -1.0, -1.0, 1.0]),
+        np.array([2020.0, 2010.0, 2020.0, 2010.0, 2015.0]),
+        2015.0,
+    )
+    assert labels.tolist() == [
+        BUMP_INCREASING,
+        BUMP_DECREASING,
+        BUMP_DECREASING,
+        BUMP_INCREASING,
+        BUMP_INCREASING,
+    ]
 
 
 def test_laplace_evidence_and_equal_prior_model_probabilities():
@@ -281,7 +294,7 @@ def test_trend_record_keeps_the_trend_on_a_tie_and_saves_every_family():
         time_scale=time_scale,
         **curves(trend=-4.0, step=-4.0, shock=-4.0, bump=0.0),
     )
-    assert bump["compatible"] == BUMP_DECREASING
+    assert bump["compatible"] == BUMP_INCREASING
     rising = fit(
         {"intercept": [0.0], "amplitude": [1.0], "width": [3.0]},
         log_evidence=0.0,
@@ -297,7 +310,7 @@ def test_trend_record_keeps_the_trend_on_a_tie_and_saves_every_family():
         shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
         bump=rising,
     )
-    assert rising_row["compatible"] == BUMP_INCREASING
+    assert rising_row["compatible"] == BUMP_DECREASING
     outside = fit(
         {"intercept": [0.0], "amplitude": [1.0], "width": [8.0]},
         log_evidence=0.0,
