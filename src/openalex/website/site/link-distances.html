@@ -34,6 +34,14 @@
               <input id="cluster-search" type="search" placeholder="Keyword or cluster…" autocomplete="off">
             </label>
             <p id="summary" class="summary">Loading cluster distances…</p>
+            <div class="type-filter" role="group" aria-label="Cluster type">
+              <button type="button" data-cluster-type="trend increasing" aria-pressed="true"><i></i>Trend increasing</button>
+              <button type="button" data-cluster-type="trend decreasing" aria-pressed="true"><i></i>Trend decreasing</button>
+              <button type="button" data-cluster-type="step" aria-pressed="true"><i></i>Step</button>
+              <button type="button" data-cluster-type="shock" aria-pressed="true"><i></i>Shock</button>
+              <button type="button" data-cluster-type="bump increasing" aria-pressed="true"><i></i>Bump increasing</button>
+              <button type="button" data-cluster-type="bump decreasing" aria-pressed="true"><i></i>Bump decreasing</button>
+            </div>
           </div>
           <div class="scatter-frame">
             <svg id="link-scatter" role="img" aria-label="Clusters by paper count and average link distance"></svg>

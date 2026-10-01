@@ -153,6 +153,10 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         '1,gamma,2,nan,0,3,3.0,4,3,1,7,[],"[[0,1],[3,3]]","[[2,20],[3,5]]"\n',
         encoding="utf-8",
     )
+    (clusters_dir / "cluster_trends.csv").write_text(
+        "level,group,compatible\n0,0,shock\n1,1,step\n",
+        encoding="utf-8",
+    )
 
     summary = build_website(
         event_dir,
@@ -176,15 +180,30 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         [3, 5.0],
     ]
     assert second["average_new_link_distance"] is None
+    assert first["cluster_type"] == "shock"
+    assert second["cluster_type"] is None
     script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
     assert "scatter-point" in script
     assert "Connected-distance distribution" in script
     assert "New links outside clusters" in script
+    assert "All paper links" in script
     assert "All clusters" not in script
     assert "filteredRows()" in script
     assert "new_link_highlighted" not in script
     page = (site_dir / "link-distances.html").read_text(encoding="utf-8")
     assert 'id="cluster-search"' in page
+    for cluster_type in (
+        "trend increasing",
+        "trend decreasing",
+        "step",
+        "shock",
+        "bump increasing",
+        "bump decreasing",
+    ):
+        assert f'data-cluster-type="{cluster_type}"' in page
+    assert "matchesType" in script
+    assert "data-type" in script
+    assert "observableRows()" in script
 
 
 def test_cluster_list_counts_documents_once(tmp_path):

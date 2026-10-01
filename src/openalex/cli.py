@@ -11,6 +11,7 @@ COMMANDS = {
     "build-reference-index": "openalex.db.build_reference_index",
     "build-website": "openalex.website.build",
     "cluster-events": "openalex.analysis.cluster_events",
+    "cluster-trends": "openalex.analysis.cluster_trends",
     "compile": "openalex.db.compile",
     "compile-snapshot": "openalex.db.compile_from_snapshot",
     "download": "openalex.imports.download",

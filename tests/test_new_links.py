@@ -626,14 +626,14 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
         rows = {int(row["cluster_id"]): row for row in csv.DictReader(handle)}
     assert int(rows[0]["paper_count"]) == 6
     assert float(rows[0]["average_new_link_distance"]) == pytest.approx(2)
-    assert float(rows[0]["average_all_link_distance"]) == pytest.approx(4 / 3)
+    assert float(rows[0]["average_all_link_distance"]) == pytest.approx(5 / 3)
     assert int(rows[0]["all_link_existing_count"]) == 1
     assert int(rows[0]["all_link_new_connected_count"]) == 2
     assert int(rows[0]["all_link_distance_sample_count"]) == 2
     assert int(rows[0]["all_link_disconnected_count"]) == 2
     assert json.loads(rows[0]["new_link_distance_distribution"]) == [[2, 1.0]]
     assert json.loads(rows[0]["all_link_distance_distribution"]) == [
-        [0, 1.0],
+        [1, 1.0],
         [2, 2.0],
     ]
     assert json.loads(rows[0]["outside_cluster_distance_distribution"]) == [

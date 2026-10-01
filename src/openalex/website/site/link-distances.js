@@ -7,6 +7,7 @@
   const summary = document.querySelector("#summary");
   const search = document.querySelector("#cluster-search");
   const tabs = [...document.querySelectorAll("[data-measure]")];
+  const typeButtons = [...document.querySelectorAll("[data-cluster-type]")];
   const NS = "http://www.w3.org/2000/svg";
   const state = {
     rows: [],
@@ -51,6 +52,18 @@
     return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
   }
 
+  function selectedTypes() {
+    return new Set(
+      typeButtons
+        .filter((button) => button.getAttribute("aria-pressed") === "true")
+        .map((button) => button.dataset.clusterType),
+    );
+  }
+
+  function typeFilterIsOpen() {
+    return selectedTypes().size === typeButtons.length;
+  }
+
   function matchesQuery(row) {
     if (!state.query) return true;
     const haystack = [
@@ -62,13 +75,19 @@
     return haystack.includes(state.query);
   }
 
+  function matchesType(row) {
+    if (typeFilterIsOpen()) return true;
+    return selectedTypes().has(row.cluster_type);
+  }
+
   function filteredRows() {
-    return state.rows.filter(matchesQuery);
+    return state.rows.filter((row) => matchesQuery(row) && matchesType(row));
   }
 
   function updateSummary() {
     const visible = filteredRows().length;
-    const count = state.query
+    const narrowed = Boolean(state.query) || !typeFilterIsOpen();
+    const count = narrowed
       ? `${visible.toLocaleString()} of ${state.rows.length.toLocaleString()} clusters`
       : `${state.rows.length.toLocaleString()} clusters`;
     summary.textContent = `${count} · ${measures[state.measure].description}`;
@@ -145,7 +164,7 @@
 
   function distributionChart(row) {
     const config = measures[state.measure];
-    const selected = new Map((row[config.distribution] || []).map(([distance, count]) => [Number(distance), Number(count)]));
+    const selected = distributionMap(row[config.distribution], state.measure);
     const baseline = new Map(state.baselines[state.measure]);
     const maximumDistance = Math.max(0, ...selected.keys(), ...baseline.keys());
     const selectedTotal = [...selected.values()].reduce((total, count) => total + count, 0);
@@ -229,15 +248,33 @@
     chart.append(maximum, xLabel);
     chart.setAttribute(
       "aria-label",
-      `Connected-distance distribution for ${row.label}, compared with new links outside clusters`,
+      `Connected-distance distribution for ${row.label}, compared with ${baselineLabel()}`,
     );
     return chart;
   }
 
+  function distributionMap(pairs, measure) {
+    const counts = new Map();
+    for (const [distance, count] of pairs || []) {
+      const shown = measure === "all" && Number(distance) === 0 ? 1 : Number(distance);
+      counts.set(shown, (counts.get(shown) || 0) + Number(count));
+    }
+    return counts;
+  }
+
+  function baselineLabel() {
+    return state.measure === "all" ? "All paper links" : "New links outside clusters";
+  }
+
   function buildBaselines(rows) {
-    const baseline = rows[0]?.outside_cluster_distance_distribution || [];
-    state.baselines.new = baseline;
-    state.baselines.all = baseline;
+    state.baselines.new = rows[0]?.outside_cluster_distance_distribution || [];
+    const pooled = new Map();
+    for (const row of rows) {
+      for (const [distance, count] of distributionMap(row.all_link_distance_distribution, "all")) {
+        pooled.set(distance, (pooled.get(distance) || 0) + count);
+      }
+    }
+    state.baselines.all = [...pooled.entries()].sort((left, right) => left[0] - right[0]);
   }
 
   function show(row) {
@@ -249,6 +286,10 @@
     eyebrow.textContent = `Cluster ${row.cluster_id}`;
     const heading = document.createElement("h2");
     heading.textContent = row.label;
+    const type = document.createElement("p");
+    type.className = "cluster-type";
+    type.dataset.type = row.cluster_type || "";
+    type.textContent = row.cluster_type || "Unclassified";
     const stats = document.createElement("div");
     stats.className = "link-stats";
     const values = [
@@ -275,10 +316,11 @@
     distanceTitle.textContent = "Connected-distance distribution";
     const legend = document.createElement("div");
     legend.className = "distance-legend";
-    legend.innerHTML = "<span><i class=\"cluster-swatch\"></i>Selected cluster</span><span><i class=\"baseline-swatch\"></i>New links outside clusters</span>";
+    legend.innerHTML = `<span><i class="cluster-swatch"></i>Selected cluster</span><span><i class="baseline-swatch"></i>${baselineLabel()}</span>`;
     details.append(
       eyebrow,
       heading,
+      type,
       stats,
       chartTitle,
       lineChart(row.yearly || []),
@@ -321,29 +363,33 @@
     return result;
   }
 
+  function observableRows() {
+    const config = measures[state.measure];
+    return state.rows.filter((row) => row.paper_count > 0 && Number.isFinite(row[config.distance]));
+  }
+
   function draw() {
     const rect = svg.getBoundingClientRect();
     const width = Math.max(520, rect.width);
     const height = Math.max(380, rect.height);
     const padding = { left: 72, right: 28, top: 26, bottom: 62 };
     const config = measures[state.measure];
+    const domain = observableRows();
     const rows = filteredRows().filter((row) => row.paper_count > 0 && Number.isFinite(row[config.distance]));
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.replaceChildren();
     state.points = [];
-    if (!rows.length) {
+    if (!domain.length) {
       const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
-      message.textContent = state.query
-        ? "No matching clusters have connected distance observations"
-        : "No clusters have connected distance observations";
+      message.textContent = "No clusters have connected distance observations";
       svg.append(message);
       return;
     }
 
-    const minLog = Math.log10(Math.min(...rows.map((row) => row.paper_count)));
-    const maxLog = Math.log10(Math.max(...rows.map((row) => row.paper_count)));
-    const minDistance = Math.min(0, ...rows.map((row) => row[config.distance]));
-    const maxDistance = Math.max(...rows.map((row) => row[config.distance]));
+    const minLog = Math.log10(Math.min(...domain.map((row) => row.paper_count)));
+    const maxLog = Math.log10(Math.max(...domain.map((row) => row.paper_count)));
+    const minDistance = Math.min(0, ...domain.map((row) => row[config.distance]));
+    const maxDistance = Math.max(...domain.map((row) => row[config.distance]));
     const x = (count) => padding.left + ((Math.log10(count) - minLog) / Math.max(0.1, maxLog - minLog)) * (width - padding.left - padding.right);
     const y = (distance) => height - padding.bottom - ((distance - minDistance) / Math.max(1, maxDistance - minDistance)) * (height - padding.top - padding.bottom);
 
@@ -361,7 +407,8 @@
     const lastPower = Math.floor(maxLog);
     const xTicks = [];
     for (let power = firstPower; power <= lastPower; power += 1) xTicks.push(10 ** power);
-    if (!xTicks.length || xTicks[0] > Math.min(...rows.map((row) => row.paper_count)) * 2) xTicks.unshift(Math.min(...rows.map((row) => row.paper_count)));
+    const smallest = Math.min(...domain.map((row) => row.paper_count));
+    if (!xTicks.length || xTicks[0] > smallest * 2) xTicks.unshift(smallest);
     for (const value of xTicks) {
       const px = x(value);
       grid.append(svgNode("line", { x1: px, y1: padding.top, x2: px, y2: height - padding.bottom }));
@@ -388,6 +435,11 @@
     axes.append(xLabel, yLabel);
 
     const marks = svgNode("g");
+    if (!rows.length) {
+      const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
+      message.textContent = "No matching clusters have connected distance observations";
+      marks.append(message);
+    }
     for (const row of rows) {
       const point = { row, x: x(row.paper_count), y: y(row[config.distance]) };
       state.points.push(point);
@@ -398,7 +450,8 @@
         r: row === state.hovered ? 7 : 5,
         tabindex: 0,
         "data-cluster-id": row.cluster_id,
-        "aria-label": `${row.label}: ${Number(row.paper_count).toLocaleString()} papers, mean distance ${formatDistance(row[config.distance])}`,
+        "data-type": row.cluster_type || "",
+        "aria-label": `${row.label}, ${row.cluster_type || "unclassified"}: ${Number(row.paper_count).toLocaleString()} papers, mean distance ${formatDistance(row[config.distance])}`,
       });
       circle.addEventListener("focus", () => {
         show(row);
@@ -421,7 +474,9 @@
       show(point.row);
     }
     tooltip.hidden = false;
-    tooltip.textContent = point.row.label;
+    tooltip.textContent = point.row.cluster_type
+      ? `${point.row.label} · ${point.row.cluster_type}`
+      : point.row.label;
     tooltip.style.left = `${point.x + 12}px`;
     tooltip.style.top = `${point.y - 10}px`;
   }
@@ -442,10 +497,19 @@
   }
   search.addEventListener("input", () => {
     state.query = search.value.trim().toLocaleLowerCase();
-    if (state.hovered && !matchesQuery(state.hovered)) clearSelection();
+    if (state.hovered && (!matchesQuery(state.hovered) || !matchesType(state.hovered))) clearSelection();
     updateSummary();
     draw();
   });
+  for (const button of typeButtons) {
+    button.addEventListener("click", () => {
+      const pressed = button.getAttribute("aria-pressed") === "true";
+      button.setAttribute("aria-pressed", String(!pressed));
+      if (state.hovered && !matchesType(state.hovered)) clearSelection();
+      updateSummary();
+      draw();
+    });
+  }
 
   fetch("data.json")
     .then((response) => {

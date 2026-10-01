@@ -585,6 +585,7 @@ def _prepare_cluster_list(
         "member_positions": member_positions,
         "indices": indices,
         "descendants": member_positions,
+        "level": int(clustered["level"]),
     }
 
 
@@ -644,9 +645,34 @@ def build_cluster_list(
     return _cluster_rows(prepared, yearly_counts, papers_by_year, total_documents)
 
 
+def load_cluster_types(clusters_dir: str | Path, level: int) -> dict[int, str]:
+    """Read the six-way class of each cluster at one hierarchy level.
+
+    Missing ``cluster_trends.csv`` means no classes are available. The class
+    is the ``compatible`` column written by cluster-trends.
+    """
+    path = Path(clusters_dir).expanduser().resolve() / "cluster_trends.csv"
+    if not path.is_file():
+        return {}
+    types: dict[int, str] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"level", "group", "compatible"}
+        if reader.fieldnames is None or not required <= set(reader.fieldnames):
+            raise ValueError(
+                f"{path} must contain columns level, group, and compatible"
+            )
+        for row in reader:
+            if int(row["level"]) != level:
+                continue
+            types[int(row["group"])] = row["compatible"]
+    return types
+
+
 def load_link_distance_summary(
     visualizations_dir: str | Path,
     clusters: Sequence[Mapping[str, Any]] | None,
+    cluster_types: Mapping[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Load new-link scatter data and attach each cluster's temporal series."""
     path = (
@@ -699,6 +725,9 @@ def load_link_distance_summary(
                 "label": source["label"],
                 "keywords": [] if cluster is None else list(cluster["keywords"]),
                 "yearly": [] if cluster is None else list(cluster["yearly"]),
+                "cluster_type": None
+                if cluster_types is None
+                else cluster_types.get(cluster_id),
             }
             row.update({field: int(source[field]) for field in integer_fields})
             for field in distance_fields:
@@ -849,11 +878,19 @@ def build_website(
             papers_by_year,
             total_documents,
         )
-    link_distances = (
-        load_link_distance_summary(new_link_visualizations_dir, cluster_list)
-        if new_link_visualizations_dir is not None
-        else None
-    )
+    link_distances = None
+    if new_link_visualizations_dir is not None:
+        cluster_types = None
+        if clusters_dir is not None and prepared_clusters is not None:
+            cluster_types = load_cluster_types(
+                clusters_dir,
+                int(prepared_clusters["level"]),
+            )
+        link_distances = load_link_distance_summary(
+            new_link_visualizations_dir,
+            cluster_list,
+            cluster_types,
+        )
     payload = {
         "meta": {
             "processed_papers": processed,

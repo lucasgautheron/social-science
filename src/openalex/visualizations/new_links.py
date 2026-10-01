@@ -141,10 +141,11 @@ def build_cluster_link_plots(
                     float(count) * weight
                 )
         if all_existing[cluster]:
-            all_distance_histograms[cluster][0] += float(all_existing[cluster])
+            # An existing coauthorship is already an edge, so its distance is 1.
+            all_distance_histograms[cluster][1] += float(all_existing[cluster])
 
     average_new = _safe_average(new_distance_sum, new_connected)
-    average_all = _safe_average(all_distance_sum, all_connected)
+    average_all = _safe_average(all_distance_sum + all_existing, all_connected)
     new_selection = _residual_highlights(paper_counts, average_new)
     all_selection = _residual_highlights(paper_counts, average_all)
     rows = _summary_rows(
@@ -188,7 +189,7 @@ def build_cluster_link_plots(
         labels,
         all_selection,
         title="Event-cluster size and average distance across all paper links",
-        y_label="Average link distance (connected only; existing links = 0)",
+        y_label="Average link distance (connected only; existing links = 1)",
         dpi=dpi,
     )
     logger.info("Wrote cluster-link visualizations to %s", output)

@@ -142,10 +142,47 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  flex-wrap: wrap;
+  gap: .7rem 1rem;
   padding: .8rem 1rem;
   border-bottom: 1px solid var(--line);
 }
+.type-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem;
+  width: 100%;
+}
+.type-filter button {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .28rem .6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: .72rem;
+  font-weight: 700;
+}
+.type-filter button[aria-pressed="false"] { opacity: .45; }
+.type-filter button[aria-pressed="true"] { color: var(--ink); }
+.type-filter i { width: .55rem; height: .55rem; border-radius: 50%; background: #9aa7a4; }
+.type-filter button[data-cluster-type="trend increasing"] i,
+.scatter-point[data-type="trend increasing"] { background: #1f6aa5; fill: #1f6aa5; }
+.type-filter button[data-cluster-type="trend decreasing"] i,
+.scatter-point[data-type="trend decreasing"] { background: #c4533a; fill: #c4533a; }
+.type-filter button[data-cluster-type="step"] i,
+.scatter-point[data-type="step"] { background: #c48a12; fill: #c48a12; }
+.type-filter button[data-cluster-type="shock"] i,
+.scatter-point[data-type="shock"] { background: #6c3483; fill: #6c3483; }
+.type-filter button[data-cluster-type="bump increasing"] i,
+.scatter-point[data-type="bump increasing"] { background: #0e8a6a; fill: #0e8a6a; }
+.type-filter button[data-cluster-type="bump decreasing"] i,
+.scatter-point[data-type="bump decreasing"] { background: #d4760a; fill: #d4760a; }
 .plot-toolbar .summary { margin: 0; text-align: right; }
 .plot-tabs { display: flex; gap: .25rem; padding: .2rem; border-radius: .7rem; background: #edf1ef; }
 .plot-tabs button {
@@ -207,14 +244,22 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
   transition: fill 120ms ease, fill-opacity 120ms ease;
 }
 .scatter-point:hover, .scatter-point:focus, .scatter-point.active {
-  fill: var(--accent);
   fill-opacity: 1;
+  stroke: var(--ink);
+  stroke-width: 2;
   outline: none;
 }
 .scatter-tooltip { white-space: nowrap; }
 .scatter-hint { z-index: 1; }
 .link-details { background: #fff; }
 .link-details > .empty p:last-child { line-height: 1.55; }
+.cluster-type {
+  margin: .35rem 0 0;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 750;
+  text-transform: capitalize;
+}
 .link-stats {
   display: grid;
   grid-template-columns: 1fr 1fr;

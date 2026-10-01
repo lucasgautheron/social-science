@@ -34,6 +34,11 @@ embeddings = [
 ]
 parquet = ["pandas>=2.2", "pyarrow>=17"]
 aws = ["boto3>=1.35"]
+trends = [
+  "arviz>=0.19",
+  "numpy>=1.26",
+  "pymc>=5.16",
+]
 website = ["numpy>=1.26", "scipy>=1.13"]
 dev = ["pytest>=8.3", "ruff>=0.8"]
 
