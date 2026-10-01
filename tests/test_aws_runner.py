@@ -348,6 +348,8 @@ class ArtifactTests(unittest.TestCase):
             command=aws_run.pipeline_command(args),
         )
         self.assertIn("GPU_WORKER=1", script)
+        self.assertIn("X-aws-ec2-metadata-token", script)
+        self.assertIn("INSTANCE_ID=i-123", script)
         self.assertIn("nvidia-smi", script)
         self.assertIn("torch.cuda.is_available()", script)
         self.assertIn("WORKER=gpu", script)
@@ -577,6 +579,54 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("process: running", output)
         self.assertEqual(ssm.commands[0]["InstanceIds"], ["i-runner"])
         self.assertIn("LINES=8", ssm.commands[0]["Parameters"]["commands"][0])
+
+    def test_live_status_falls_back_to_the_run_worker_instance(self):
+        args = aws_run.build_parser().parse_args(
+            ["status", "--worker", "gpu", "--run-id", "gpu-run", "--live"]
+        )
+        state = {
+            "bucket": "bucket",
+            "prefix": "project",
+            "region": "us-east-1",
+            "default_worker": "cpu",
+            "instance_id": "i-cpu",
+            "workers": {
+                "cpu": {"instance_id": "i-cpu", "instance_type": "i4i.8xlarge"},
+                "gpu": {"instance_id": "i-gpu", "instance_type": "g6.8xlarge"},
+            },
+        }
+        queried = []
+
+        class Session:
+            def client(self, _name):
+                return object()
+
+        with (
+            mock.patch.object(aws_run, "load_state", return_value=state),
+            mock.patch.object(aws_run, "boto3_session", return_value=Session()),
+            mock.patch.object(
+                aws_run,
+                "get_s3_json",
+                return_value={
+                    "run_id": "gpu-run",
+                    "worker": "gpu",
+                    "instance_id": "",
+                    "instance_type": "g6.8xlarge",
+                    "scratch_dir": "/scratch",
+                },
+            ),
+            mock.patch.object(
+                aws_run,
+                "fetch_live_status",
+                side_effect=lambda _session, selected, _status, _run_id, **_kwargs: (
+                    queried.append(selected["instance_id"]) or "process: running"
+                ),
+            ),
+            mock.patch.object(aws_run, "require_boto3", return_value=(None, Exception)),
+        ):
+            self.assertEqual(aws_run.command_status(args), 0)
+
+        self.assertEqual(queried, ["i-gpu"])
 
     def test_download_preserves_structure(self):
         artifact = {

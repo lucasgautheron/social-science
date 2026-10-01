@@ -555,6 +555,25 @@ show_log stderr.log
 """
 
 
+def _configured_instance_id(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _live_worker_state(
+    state: Dict[str, Any],
+    status: Dict[str, Any],
+    worker: str | None,
+) -> Dict[str, Any]:
+    """Use the run's worker when the synced status has no instance id."""
+    worker_name = status.get("worker") or worker
+    if not worker_name:
+        return state
+    try:
+        return effective_state(state, str(worker_name))
+    except SystemExit:
+        return state
+
+
 def fetch_live_status(
     session,
     state: Dict[str, Any],
@@ -564,7 +583,9 @@ def fetch_live_status(
     timeout: int,
 ) -> str:
     """Fetch process and console information directly from the worker through SSM."""
-    instance_id = status.get("instance_id") or state.get("instance_id")
+    instance_id = _configured_instance_id(status.get("instance_id")) or _configured_instance_id(
+        state.get("instance_id")
+    )
     if not instance_id:
         raise SystemExit("No instance_id is configured; cannot query live worker status.")
 
@@ -724,7 +745,17 @@ PIPELINE_COMMAND={q(command)}
 INSTALL_DEPS={q("1" if not args.skip_dependency_install else "0")}
 FORCE_DB_DOWNLOAD={q("1" if args.force_db_download else "0")}
 INPUT_ARTIFACTS_JSON={q(inputs_json)}
-INSTANCE_ID="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+INSTANCE_ID=""
+IMDS_TOKEN="$(curl -fsS --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)"
+if [ -n "$IMDS_TOKEN" ]; then
+  INSTANCE_ID="$(curl -fsS --max-time 2 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+fi
+if [ -z "$INSTANCE_ID" ]; then
+  INSTANCE_ID="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+fi
+if [ -z "$INSTANCE_ID" ]; then
+  INSTANCE_ID={q(state.get("instance_id") or "")}
+fi
 export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND INPUT_ARTIFACTS_JSON WORKER INSTANCE_TYPE
 
 WORK_DIR="${{SCRATCH_DIR}}/runs/${{RUN_ID}}"
@@ -784,6 +815,8 @@ if os.path.exists(path):
     except Exception:
         prior = {{}}
 payload["started_at"] = prior.get("started_at", payload["updated_at"])
+if not payload.get("instance_id"):
+    payload["instance_id"] = prior.get("instance_id") or ""
 payload["command"] = prior.get("command", os.environ.get("PIPELINE_COMMAND", ""))
 payload["inputs"] = prior.get(
     "inputs", json.loads(os.environ.get("INPUT_ARTIFACTS_JSON", "[]"))
@@ -1454,7 +1487,7 @@ def command_status(args: argparse.Namespace) -> int:
             print("\n==> live worker status <==")
             live_output = fetch_live_status(
                 session,
-                state,
+                _live_worker_state(state, status, args.worker),
                 status,
                 run_id,
                 lines=args.lines,
