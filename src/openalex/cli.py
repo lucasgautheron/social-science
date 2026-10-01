@@ -22,6 +22,7 @@ COMMANDS = {
     "network": "openalex.analysis.network",
     "new-links": "openalex.analysis.new_links",
     "random-order": "openalex.db.random_order",
+    "topics": "openalex.analysis.topics",
     "vacuum": "openalex.db.vacuum",
     "visualize-new-links": "openalex.visualizations.new_links",
 }

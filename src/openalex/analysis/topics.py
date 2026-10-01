@@ -1,0 +1,506 @@
+"""Assign BERTopic topics to articles with precomputed text embeddings."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from urllib.parse import quote
+
+import numpy as np
+
+from openalex.analysis.embeddings import DEFAULT_MODEL, EmbeddingStore
+
+logger = logging.getLogger(__name__)
+
+ARTIFACT_VERSION = 1
+DEFAULT_OUTPUT_DIR = Path("output/topics")
+DEFAULT_SAMPLE_SIZE = 100_000
+_SQLITE_IN_LIMIT = 900
+
+TopicModelFactory = Callable[..., object]
+
+
+def _topic_model_factory(
+    *,
+    random_seed: int,
+    min_cluster_size: int,
+    n_neighbors: int,
+    min_dist: float,
+    metric: str,
+    umap_components: int,
+    use_keybert_representation: bool,
+    embedding_model_name: str,
+):
+    try:
+        from bertopic import BERTopic
+        from bertopic.representation import KeyBERTInspired
+        from hdbscan import HDBSCAN
+        from sklearn.feature_extraction.text import CountVectorizer
+        from umap import UMAP
+    except ImportError as exc:
+        raise RuntimeError(
+            "Topic-modeling support is not installed. Run "
+            "`python -m pip install -e '.[topics]'`."
+        ) from exc
+
+    umap_model = UMAP(
+        n_neighbors=n_neighbors,
+        n_components=umap_components,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=random_seed,
+        low_memory=True,
+        verbose=True,
+    )
+    hdbscan_model = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        prediction_data=True,
+    )
+    vectorizer_model = CountVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
+        max_features=10_000,
+    )
+    representation_model = KeyBERTInspired() if use_keybert_representation else None
+    return BERTopic(
+        embedding_model=embedding_model_name,
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
+        vectorizer_model=vectorizer_model,
+        representation_model=representation_model,
+        nr_topics="auto",
+        calculate_probabilities=True,
+        verbose=True,
+    )
+
+
+def assign_topics(
+    db_path: str | Path,
+    embeddings_path: str | Path,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    *,
+    sample_size: int | None = DEFAULT_SAMPLE_SIZE,
+    random_seed: int = 42,
+    min_cluster_size: int = 50,
+    n_neighbors: int = 15,
+    min_dist: float = 0.0,
+    metric: str = "cosine",
+    umap_components: int = 10,
+    outlier_threshold: float = 0.1,
+    hierarchy: bool = True,
+    visualizations: bool = True,
+    save_model: bool = True,
+    model_factory: TopicModelFactory = _topic_model_factory,
+) -> dict[str, object]:
+    """Fit BERTopic and write article assignments plus topic metadata."""
+    if sample_size is not None and sample_size < 1:
+        raise ValueError("--sample-size must be >= 1 or 'all'")
+    if min_cluster_size < 2:
+        raise ValueError("--min-cluster-size must be >= 2")
+    if n_neighbors < 2:
+        raise ValueError("--n-neighbors must be >= 2")
+    if umap_components < 2:
+        raise ValueError("--umap-components must be >= 2")
+    if not 0 <= outlier_threshold <= 1:
+        raise ValueError("--outlier-threshold must be between 0 and 1")
+
+    source = Path(db_path).expanduser().resolve()
+    output = Path(output_dir).expanduser().resolve()
+    store = EmbeddingStore(embeddings_path)
+    if store.manifest and not bool(store.manifest.get("complete")):
+        raise ValueError(
+            f"Embedding artifact is incomplete: {store.manifest_path}. "
+            "Resume the embedding run before assigning topics."
+        )
+    if output == source or source.is_relative_to(output):
+        raise ValueError("--output-dir must not contain the source database")
+    if _output_exists(output):
+        raise FileExistsError(
+            f"{output} already contains topic results. Use a new --output-dir."
+        )
+
+    selected_ids = select_article_ids(store.article_ids(), sample_size, random_seed)
+    article_ids, documents, embeddings = load_topic_inputs(source, store, selected_ids)
+    if not article_ids:
+        raise ValueError("No articles have both embeddings and source documents")
+    if len(article_ids) < min_cluster_size:
+        raise ValueError(
+            f"Only {len(article_ids)} aligned articles are available, fewer than "
+            f"min_cluster_size={min_cluster_size}"
+        )
+
+    topic_model = model_factory(
+        embedding_model_name=str(store.manifest.get("model", DEFAULT_MODEL)),
+        random_seed=random_seed,
+        min_cluster_size=min_cluster_size,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric=metric,
+        umap_components=umap_components,
+        use_keybert_representation=True,
+    )
+    original_topics, probabilities = topic_model.fit_transform(documents, embeddings)
+    original_topics = np.asarray(original_topics, dtype=np.int64)
+
+    if np.any(original_topics == -1):
+        reduced_topics = np.asarray(
+            topic_model.reduce_outliers(
+                documents,
+                original_topics.tolist(),
+                strategy="embeddings",
+                embeddings=embeddings,
+                threshold=outlier_threshold,
+            ),
+            dtype=np.int64,
+        )
+    else:
+        reduced_topics = original_topics.copy()
+    if reduced_topics.shape != original_topics.shape:
+        raise ValueError("BERTopic returned a misaligned topic assignment")
+    if not np.array_equal(reduced_topics, original_topics):
+        topic_model.update_topics(documents, topics=reduced_topics.tolist())
+    assignment_probabilities = topic_probabilities(probabilities, reduced_topics)
+
+    output.mkdir(parents=True, exist_ok=True)
+    topic_info = topic_model.get_topic_info()
+    labels = topic_labels(topic_info)
+    classifications_path = output / "article_topic_classifications.csv"
+    _write_classifications(
+        classifications_path,
+        article_ids,
+        reduced_topics,
+        assignment_probabilities,
+        labels,
+    )
+    topic_list_path = output / "topic_list.csv"
+    topic_records = _write_topic_list(topic_list_path, topic_info, reduced_topics)
+    detailed_path = output / "detailed_topics.csv"
+    _write_detailed_topics(detailed_path, topic_model, topic_records)
+
+    files = [
+        classifications_path.name,
+        topic_list_path.name,
+        detailed_path.name,
+    ]
+    if hierarchy:
+        hierarchical_topics = topic_model.hierarchical_topics(documents)
+        hierarchy_path = output / "topic_hierarchy.csv"
+        hierarchical_topics.to_csv(hierarchy_path, index=False)
+        files.append(hierarchy_path.name)
+        if visualizations:
+            figure = topic_model.visualize_hierarchy(
+                hierarchical_topics=hierarchical_topics
+            )
+            hierarchy_html = output / "topic_hierarchy.html"
+            figure.write_html(hierarchy_html)
+            files.append(hierarchy_html.name)
+
+    if visualizations:
+        visualizations_to_write = [
+            ("topic_words.html", topic_model.visualize_barchart(top_k_topics=20)),
+            ("intertopic_distance.html", topic_model.visualize_topics()),
+        ]
+        probability_values = (
+            np.asarray(probabilities) if probabilities is not None else np.empty(0)
+        )
+        if probability_values.ndim == 2 and len(probability_values):
+            visualizations_to_write.append(
+                (
+                    "topic_distribution_sample.html",
+                    topic_model.visualize_distribution(probability_values[0]),
+                )
+            )
+        for filename, figure in visualizations_to_write:
+            figure.write_html(output / filename)
+            files.append(filename)
+
+    if save_model:
+        model_path = output / "bertopic_model"
+        topic_model.save(model_path, serialization="pickle")
+        files.append(model_path.name)
+
+    unique_topics = sorted({int(topic) for topic in reduced_topics if int(topic) != -1})
+    outliers = int(np.count_nonzero(reduced_topics == -1))
+    manifest = {
+        "artifact_version": ARTIFACT_VERSION,
+        "article_assignments": classifications_path.name,
+        "articles": len(article_ids),
+        "embedding_artifact": str(Path(embeddings_path).expanduser().resolve()),
+        "embedding_manifest_sha256": _manifest_digest(store.manifest_path),
+        "files": files,
+        "hierarchy": hierarchy,
+        "min_cluster_size": min_cluster_size,
+        "min_dist": min_dist,
+        "n_neighbors": n_neighbors,
+        "outlier_threshold": outlier_threshold,
+        "outliers": outliers,
+        "random_seed": random_seed,
+        "sample_size": sample_size,
+        "source_database": str(source),
+        "topics": len(unique_topics),
+        "umap_components": umap_components,
+        "umap_metric": metric,
+        "visualizations": visualizations,
+    }
+    _atomic_json(output / "manifest.json", manifest)
+    return manifest
+
+
+def select_article_ids(
+    available_ids: Sequence[int],
+    sample_size: int | None,
+    random_seed: int,
+) -> list[int]:
+    """Return a deterministic sorted sample of available article IDs."""
+    ids = np.asarray(available_ids, dtype=np.int64)
+    if sample_size is None or sample_size >= len(ids):
+        return sorted(int(article_id) for article_id in ids)
+    rng = np.random.default_rng(random_seed)
+    chosen = rng.choice(ids, size=sample_size, replace=False)
+    return sorted(int(article_id) for article_id in chosen)
+
+
+def load_topic_inputs(
+    database: Path,
+    store: EmbeddingStore,
+    selected_ids: Sequence[int],
+) -> tuple[list[int], list[str], np.ndarray]:
+    """Load documents and embeddings in exactly the same article order."""
+    documents_by_id: dict[int, str] = {}
+    with _connect_readonly(database) as connection:
+        for chunk in _chunks(selected_ids, _SQLITE_IN_LIMIT):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""
+                SELECT a.article_id, a.title, ab.abstract
+                FROM articles a
+                JOIN abstracts ab ON ab.article_id = a.article_id
+                WHERE a.article_id IN ({placeholders})
+                """,
+                list(chunk),
+            )
+            for article_id, title, abstract in rows:
+                documents_by_id[int(article_id)] = _article_text(title, abstract)
+
+    embeddings_by_id = store.get_embeddings_batch(selected_ids)
+    article_ids = [
+        article_id
+        for article_id in selected_ids
+        if article_id in documents_by_id and article_id in embeddings_by_id
+    ]
+    documents = [documents_by_id[article_id] for article_id in article_ids]
+    if article_ids:
+        embeddings = np.vstack([embeddings_by_id[article_id] for article_id in article_ids])
+    else:
+        embeddings = np.empty((0, store.dimension or 0), dtype=np.float32)
+    return article_ids, documents, embeddings
+
+
+def topic_probabilities(probabilities, topics: np.ndarray) -> np.ndarray:
+    """Return one confidence per final assignment."""
+    if probabilities is None:
+        return np.full(len(topics), np.nan, dtype=float)
+    values = np.asarray(probabilities, dtype=float)
+    if values.ndim == 1:
+        if values.shape != topics.shape:
+            raise ValueError("BERTopic probabilities do not align with assignments")
+        return values
+    if values.ndim != 2 or values.shape[0] != len(topics):
+        raise ValueError("BERTopic probabilities do not align with assignments")
+    result = np.empty(len(topics), dtype=float)
+    for index, topic in enumerate(topics):
+        result[index] = (
+            values[index, int(topic)]
+            if 0 <= int(topic) < values.shape[1]
+            else np.nan
+        )
+    return result
+
+
+def topic_labels(topic_info) -> dict[int, str]:
+    labels: dict[int, str] = {-1: "Outlier"}
+    for row in topic_info.to_dict("records"):
+        labels[int(row["Topic"])] = str(row.get("Name", row["Topic"]))
+    return labels
+
+
+def _write_classifications(
+    path: Path,
+    article_ids: Sequence[int],
+    topics: np.ndarray,
+    probabilities: np.ndarray,
+    labels: dict[int, str],
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["article_id", "topic", "probability", "topic_label"],
+        )
+        writer.writeheader()
+        for article_id, topic, probability in zip(
+            article_ids, topics, probabilities, strict=True
+        ):
+            writer.writerow(
+                {
+                    "article_id": int(article_id),
+                    "topic": int(topic),
+                    "probability": "" if np.isnan(probability) else float(probability),
+                    "topic_label": labels.get(int(topic), f"Topic {int(topic)}"),
+                }
+            )
+
+
+def _write_topic_list(path: Path, topic_info, topics: np.ndarray) -> list[dict]:
+    records = topic_info.to_dict("records")
+    counts = {
+        int(topic): int(count)
+        for topic, count in zip(*np.unique(topics, return_counts=True), strict=True)
+    }
+    normalized = []
+    for row in records:
+        normalized_row = dict(row)
+        normalized_row["Count"] = counts.get(int(row["Topic"]), 0)
+        normalized.append(normalized_row)
+    fieldnames = list(normalized[0]) if normalized else ["Topic", "Count", "Name"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(normalized)
+    return normalized
+
+
+def _write_detailed_topics(path: Path, topic_model, topic_records: Sequence[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["Topic", "Count", "Name", "Top_Words"]
+        )
+        writer.writeheader()
+        for row in topic_records:
+            topic = int(row["Topic"])
+            if topic == -1:
+                continue
+            words = topic_model.get_topic(topic) or []
+            writer.writerow(
+                {
+                    "Topic": topic,
+                    "Count": int(row.get("Count", 0)),
+                    "Name": row.get("Name", f"Topic {topic}"),
+                    "Top_Words": "; ".join(
+                        f"{word}:{float(score):.3f}" for word, score in words[:20]
+                    ),
+                }
+            )
+
+
+def _article_text(title: object, abstract: object) -> str:
+    title_text = "" if title is None else str(title)
+    abstract_text = "" if abstract is None else str(abstract)
+    return f"{title_text} . {abstract_text}".strip()
+
+
+def _connect_readonly(database: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(database.resolve()))}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def _chunks(values: Sequence[int], size: int):
+    for start in range(0, len(values), size):
+        yield list(values[start : start + size])
+
+
+def _manifest_digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def _output_exists(output: Path) -> bool:
+    if not output.exists():
+        return False
+    return any(output.iterdir()) if output.is_dir() else True
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _sample_size(value: str) -> int | None:
+    if value.lower() == "all":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("sample size must be an integer or 'all'") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("sample size must be >= 1")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Assign BERTopic topics using a text-embedding artifact."
+    )
+    parser.add_argument("--db-path", type=Path, default=Path("articles.db"))
+    parser.add_argument(
+        "--embeddings-dir",
+        type=Path,
+        default=Path("output/embeddings"),
+        help="Embedding artifact directory or legacy embeddings database.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--sample-size", type=_sample_size, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--min-cluster-size", type=int, default=50)
+    parser.add_argument("--n-neighbors", type=int, default=15)
+    parser.add_argument("--min-dist", type=float, default=0.0)
+    parser.add_argument("--metric", default="cosine")
+    parser.add_argument("--umap-components", type=int, default=10)
+    parser.add_argument("--outlier-threshold", type=float, default=0.1)
+    parser.add_argument("--no-hierarchy", action="store_true")
+    parser.add_argument("--no-visualizations", action="store_true")
+    parser.add_argument("--no-save-model", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    args = build_parser().parse_args(argv)
+    manifest = assign_topics(
+        args.db_path,
+        args.embeddings_dir,
+        args.output_dir,
+        sample_size=args.sample_size,
+        random_seed=args.random_seed,
+        min_cluster_size=args.min_cluster_size,
+        n_neighbors=args.n_neighbors,
+        min_dist=args.min_dist,
+        metric=args.metric,
+        umap_components=args.umap_components,
+        outlier_threshold=args.outlier_threshold,
+        hierarchy=not args.no_hierarchy,
+        visualizations=not args.no_visualizations,
+        save_model=not args.no_save_model,
+    )
+    print(json.dumps(manifest, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

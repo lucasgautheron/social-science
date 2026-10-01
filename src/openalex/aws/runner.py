@@ -15,6 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
+from .workers import (
+    DEFAULT_WORKER,
+    WORKER_CHOICES,
+    effective_state,
+    normalize_state,
+)
+
 DEFAULT_STATE_PATH = ".aws_runner_state.json"
 DEFAULT_LAST_RUN_PATH = ".aws_runner_last_run.json"
 DEFAULT_SCRATCH_DIR = "/mnt/aws-runner"
@@ -102,7 +109,7 @@ def load_state(path: str) -> Dict[str, Any]:
     state_path = Path(path)
     if not state_path.exists():
         raise SystemExit(f"State file not found: {state_path}. Run openalex-aws setup first.")
-    return load_json(state_path)
+    return normalize_state(load_json(state_path))[0]
 
 
 def run_prefix(state: Dict[str, Any], run_id: str) -> str:
@@ -246,7 +253,13 @@ def make_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
 
-def latest_run_id_from_s3(s3, bucket: str, prefix: str) -> Optional[str]:
+def latest_run_id_from_s3(
+    s3,
+    bucket: str,
+    prefix: str,
+    *,
+    worker: str | None = None,
+) -> Optional[str]:
     paginator = s3.get_paginator("list_objects_v2")
     newest: Optional[Tuple[datetime, str]] = None
     for page in paginator.paginate(Bucket=bucket, Prefix=prefixed_key(prefix, "runs/")):
@@ -254,6 +267,10 @@ def latest_run_id_from_s3(s3, bucket: str, prefix: str) -> Optional[str]:
             key = item["Key"]
             if not key.endswith("/status.json"):
                 continue
+            if worker is not None:
+                status = get_s3_json(s3, bucket, key, require_boto3()[1]) or {}
+                if status.get("worker") != worker:
+                    continue
             run_id = key.rsplit("/", 2)[-2]
             candidate = (item["LastModified"], run_id)
             if newest is None or candidate[0] > newest[0]:
@@ -264,16 +281,47 @@ def latest_run_id_from_s3(s3, bucket: str, prefix: str) -> Optional[str]:
 def resolve_run_id(args: argparse.Namespace, s3=None, state: Optional[Dict[str, Any]] = None) -> str:
     if args.run_id:
         return args.run_id
+    worker = getattr(args, "worker", None)
     last_run_path = Path(args.last_run_path)
     if last_run_path.exists():
         last = load_json(last_run_path)
+        if worker:
+            by_worker = last.get("by_worker", {})
+            worker_run = by_worker.get(worker, {}) if isinstance(by_worker, dict) else {}
+            if worker_run.get("run_id"):
+                return worker_run["run_id"]
+        if last.get("last_run_id"):
+            return last["last_run_id"]
         if last.get("run_id"):
             return last["run_id"]
     if s3 is not None and state is not None:
-        latest = latest_run_id_from_s3(s3, state["bucket"], state["prefix"])
+        latest = latest_run_id_from_s3(
+            s3,
+            state["bucket"],
+            state["prefix"],
+            worker=worker,
+        )
         if latest:
             return latest
     raise SystemExit("No run id supplied and no previous run was found.")
+
+
+def record_last_run(path: Path, run_id: str, worker: str) -> None:
+    existing = load_json(path) if path.exists() else {}
+    updated_at = utc_now()
+    by_worker = existing.get("by_worker")
+    if not isinstance(by_worker, dict):
+        by_worker = {}
+    by_worker[worker] = {"run_id": run_id, "updated_at": updated_at}
+    write_json(
+        path,
+        {
+            "last_run_id": run_id,
+            "last_worker": worker,
+            "by_worker": by_worker,
+            "updated_at": updated_at,
+        },
+    )
 
 
 def artifact_output_prefix(state: Dict[str, Any], run_id: str) -> str:
@@ -622,6 +670,9 @@ def build_remote_runner_script(
     run_s3_prefix = run_prefix(state, run_id)
     region = args.region or state.get("region") or ""
     notification_topic_arn = state.get("notification_topic_arn") or ""
+    worker = str(state.get("worker") or getattr(args, "worker", DEFAULT_WORKER))
+    instance_type = str(state.get("instance_type") or "")
+    gpu_worker = worker == "gpu"
     needs_input_db = not args.no_database
     db_s3_uri = args.db_s3_uri or state.get("db_s3_uri")
     repo_url = args.repo_url or state.get("repo_url")
@@ -649,6 +700,9 @@ export HOME="${{HOME:-/root}}"
 export PATH="$HOME/.local/bin:$PATH"
 RUN_ID={q(run_id)}
 PIPELINE={q(command_name)}
+WORKER={q(worker)}
+INSTANCE_TYPE={q(instance_type)}
+GPU_WORKER={q("1" if gpu_worker else "0")}
 BUCKET={q(bucket)}
 RUN_S3_PREFIX={q(run_s3_prefix)}
 AWS_REGION={q(region)}
@@ -667,7 +721,7 @@ INSTALL_DEPS={q("1" if not args.skip_dependency_install else "0")}
 FORCE_DB_DOWNLOAD={q("1" if args.force_db_download else "0")}
 INPUT_ARTIFACTS_JSON={q(inputs_json)}
 INSTANCE_ID="$(curl -fsS --max-time 2 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
-export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND INPUT_ARTIFACTS_JSON
+export BUCKET RUN_S3_PREFIX PIPELINE_COMMAND INPUT_ARTIFACTS_JSON WORKER INSTANCE_TYPE
 
 WORK_DIR="${{SCRATCH_DIR}}/runs/${{RUN_ID}}"
 RUN_DIR="${{WORK_DIR}}/work"
@@ -688,13 +742,13 @@ write_status() {{
   local status="$1"
   local message="$2"
   local exit_code="${{3:-}}"
-  python3 - "$STATUS_FILE" "$RUN_ID" "$PIPELINE" "$status" "$message" "$INSTANCE_ID" "$RUN_S3_PREFIX" "$exit_code" "$SCRATCH_DIR" <<'PY'
+  python3 - "$STATUS_FILE" "$RUN_ID" "$PIPELINE" "$status" "$message" "$INSTANCE_ID" "$RUN_S3_PREFIX" "$exit_code" "$SCRATCH_DIR" "$WORKER" "$INSTANCE_TYPE" <<'PY'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-path, run_id, pipeline, status, message, instance_id, run_s3_prefix, exit_code, scratch_dir = sys.argv[1:10]
+path, run_id, pipeline, status, message, instance_id, run_s3_prefix, exit_code, scratch_dir, worker, instance_type = sys.argv[1:12]
 payload = {{
     "run_id": run_id,
     "pipeline": pipeline,
@@ -702,6 +756,8 @@ payload = {{
     "message": message,
     "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     "instance_id": instance_id,
+    "instance_type": instance_type,
+    "worker": worker,
     "pid": None,
     "scratch_dir": scratch_dir,
     "s3_status_uri": f"s3://{{os.environ['BUCKET']}}/{{run_s3_prefix}}/status.json",
@@ -840,6 +896,7 @@ install_python_deps() {{
   local fingerprint
   fingerprint="$(python3 - "$REPO_DIR" <<'PY'
 import hashlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -853,6 +910,8 @@ digest = hashlib.sha256()
 digest.update(revision.encode())
 digest.update(b"\\0")
 digest.update((repo / "pyproject.toml").read_bytes())
+digest.update(b"\\0")
+digest.update(os.environ.get("WORKER", "").encode())
 print(digest.hexdigest())
 PY
 )"
@@ -861,7 +920,7 @@ PY
     return
   fi
   python -m pip install --upgrade pip >>"$LAUNCHER_LOG" 2>&1
-  python -m pip install -e "$REPO_DIR[analysis,website,parquet,aws,download]" >>"$LAUNCHER_LOG" 2>&1
+  python -m pip install -e "$REPO_DIR[analysis,website,parquet,aws,download,embeddings,topics]" >>"$LAUNCHER_LOG" 2>&1
   printf '%s\\n' "$fingerprint" > "$VENV_DIR/.openalex-install"
   python3 - <<'PY' >>"$LAUNCHER_LOG" 2>&1 || true
 import nltk
@@ -871,6 +930,21 @@ for resource in ("punkt", "punkt_tab", "wordnet", "omw-1.4"):
     except Exception as exc:
         print(f"nltk download failed for {{resource}}: {{exc}}")
 PY
+}}
+
+validate_worker_runtime() {{
+  if [ "$GPU_WORKER" != "1" ]; then
+    return
+  fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPU worker has no nvidia-smi; verify the configured NVIDIA DLAMI." >>"$LAUNCHER_LOG"
+    return 1
+  fi
+  nvidia-smi >>"$LAUNCHER_LOG" 2>&1
+  if ! python -c 'import torch; raise SystemExit(not torch.cuda.is_available())' >>"$LAUNCHER_LOG" 2>&1; then
+    echo "GPU worker PyTorch cannot access CUDA; verify the DLAMI and torch installation." >>"$LAUNCHER_LOG"
+    return 1
+  fi
 }}
 
 sync_repo() {{
@@ -1049,6 +1123,12 @@ on_error() {{
   write_status "running" "Installing Python dependencies"
   sync_artifacts
   install_python_deps
+  sync_artifacts
+
+  CURRENT_STEP="validating worker runtime"
+  write_status "running" "Validating worker runtime"
+  sync_artifacts
+  validate_worker_runtime
   sync_artifacts
 
   if [ -n "$SNAPSHOT_S3_URI" ]; then
@@ -1258,6 +1338,8 @@ def initial_status(
         "started_at": utc_now(),
         "updated_at": utc_now(),
         "instance_id": state.get("instance_id"),
+        "instance_type": state.get("instance_type"),
+        "worker": state.get("worker", getattr(args, "worker", DEFAULT_WORKER)),
         "command_id": command_id,
         "command": command,
         "branch": args.branch,
@@ -1273,7 +1355,8 @@ def initial_status(
 
 
 def command_submit(args: argparse.Namespace) -> int:
-    state = load_state(args.state_path)
+    project_state = load_state(args.state_path)
+    state = effective_state(project_state, args.worker)
     session = boto3_session(args, state)
     s3 = session.client("s3")
     run_id = args.run_id or make_run_id()
@@ -1309,7 +1392,7 @@ def command_submit(args: argparse.Namespace) -> int:
     status["message"] = "SSM command accepted; remote runner is starting"
     status["updated_at"] = utc_now()
     put_s3_json(s3, bucket, f"{prefix}/status.json", status)
-    write_json(Path(args.last_run_path), {"run_id": run_id, "updated_at": utc_now()})
+    record_last_run(Path(args.last_run_path), run_id, args.worker)
 
     print(f"Submitted command as run_id={run_id}")
     print(f"Status: {status['s3_status_uri']}")
@@ -1324,7 +1407,9 @@ def print_status(status: Dict[str, Any]) -> None:
     print(f"message: {status.get('message')}")
     print(f"updated_at: {status.get('updated_at')}")
     print(f"pipeline: {status.get('pipeline')}")
+    print(f"worker: {status.get('worker')}")
     print(f"instance_id: {status.get('instance_id')}")
+    print(f"instance_type: {status.get('instance_type')}")
     if status.get("pid"):
         print(f"pid: {status.get('pid')}")
     if status.get("exit_code") is not None:
@@ -1501,12 +1586,26 @@ def command_download(args: argparse.Namespace) -> int:
 
 
 def command_cancel(args: argparse.Namespace) -> int:
-    state = load_state(args.state_path)
-    session = boto3_session(args, state)
+    project_state = load_state(args.state_path)
+    session = boto3_session(args, project_state)
     s3 = session.client("s3")
-    run_id = resolve_run_id(args, s3=s3, state=state)
-    status_key = f"{run_prefix(state, run_id)}/status.json"
-    status = get_s3_json(s3, state["bucket"], status_key, require_boto3()[1]) or {}
+    run_id = resolve_run_id(args, s3=s3, state=project_state)
+    status_key = f"{run_prefix(project_state, run_id)}/status.json"
+    status = get_s3_json(
+        s3,
+        project_state["bucket"],
+        status_key,
+        require_boto3()[1],
+    ) or {}
+    worker_name = status.get("worker") or args.worker or DEFAULT_WORKER
+    try:
+        state = effective_state(project_state, str(worker_name))
+    except SystemExit:
+        state = dict(project_state)
+    instance_id = status.get("instance_id") or state.get("instance_id")
+    if not instance_id:
+        raise SystemExit(f"Run {run_id} has no target instance.")
+    state["instance_id"] = instance_id
     scratch_dir = args.scratch_dir or status.get("scratch_dir") or DEFAULT_SCRATCH_DIR
     pid_file = f"{scratch_dir.rstrip('/')}/runs/{run_id}/pid"
     cancel_script = f"""set -Eeuo pipefail
@@ -1523,7 +1622,7 @@ else
 fi
 """
     if args.executor == "ssm":
-        command_id = send_ssm_command(session, state["instance_id"], cancel_script, f"cancel-{run_id}")
+        command_id = send_ssm_command(session, instance_id, cancel_script, f"cancel-{run_id}")
     else:
         command_id = send_ssh_command(session, state, args, cancel_script)
     status.update(
@@ -1535,7 +1634,7 @@ fi
             "cancel_command_id": command_id,
         }
     )
-    put_s3_json(s3, state["bucket"], status_key, status)
+    put_s3_json(s3, project_state["bucket"], status_key, status)
     print(f"Cancellation requested for {run_id}; command_id={command_id}")
     return 0
 
@@ -1549,6 +1648,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 def add_artifact_args(parser: argparse.ArgumentParser) -> None:
     add_common_args(parser)
+    parser.add_argument("--worker", choices=WORKER_CHOICES, default=None)
     parser.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
     parser.add_argument(
         "--refresh",
@@ -1574,6 +1674,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = subparsers.add_parser("submit", help="Submit a remote pipeline run and return immediately.")
     add_common_args(submit)
+    submit.add_argument("--worker", choices=WORKER_CHOICES, default=DEFAULT_WORKER)
     submit.add_argument("--run-id", default=None, help="Explicit run id. Defaults to a timestamped id.")
     submit.add_argument("--branch", default=DEFAULT_BRANCH, help="Git branch to checkout before running.")
     submit.add_argument("--commit", default=None, help="Specific commit SHA to checkout instead of the branch head.")
@@ -1615,6 +1716,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="Print S3 status and optionally query the worker live.")
     add_common_args(status)
+    status.add_argument("--worker", choices=WORKER_CHOICES, default=None)
     status.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
     status_output = status.add_mutually_exclusive_group()
     status_output.add_argument("--json", action="store_true", help="Print raw S3 status JSON.")
@@ -1639,6 +1741,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     logs = subparsers.add_parser("logs", help="Print the latest synced run logs from S3.")
     add_common_args(logs)
+    logs.add_argument("--worker", choices=WORKER_CHOICES, default=None)
     logs.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
     logs.add_argument("--lines", type=int, default=100, help="Number of trailing lines to print. Use 0 for all.")
     logs.add_argument("--stderr", action="store_true", help="Show stderr.log instead of stdout.log.")
@@ -1667,6 +1770,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cancel = subparsers.add_parser("cancel", help="Request cancellation of a running remote pipeline.")
     add_common_args(cancel)
+    cancel.add_argument("--worker", choices=WORKER_CHOICES, default=None)
     cancel.add_argument("--run-id", default=None, help="Run id. Defaults to the latest local/S3 run.")
     cancel.add_argument("--scratch-dir", default=None, help="Remote scratch directory override.")
     cancel.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor for the cancel request.")

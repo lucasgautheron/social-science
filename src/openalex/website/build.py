@@ -709,6 +709,10 @@ def load_link_distance_summary(
         "all_link_distance_distribution",
         "outside_cluster_distance_distribution",
     )
+    yearly_distance_fields = (
+        "new_link_distance_by_year",
+        "all_link_distance_by_year",
+    )
     rows: list[dict[str, Any]] = []
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -746,6 +750,12 @@ def load_link_distance_summary(
                 row[field] = [
                     [int(distance), float(count)]
                     for distance, count in distribution
+                ]
+            for field in yearly_distance_fields:
+                raw = source.get(field) or "[]"
+                row[field] = [
+                    {"year": int(year), "distance": float(distance)}
+                    for year, distance in json.loads(raw)
                 ]
             rows.append(row)
     return rows

@@ -6,20 +6,35 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from .workers import (
+    CPU_AMI_PARAMETER,
+    CPU_INSTANCE_TYPE,
+    DEFAULT_WORKER,
+    GPU_AMI_PARAMETER,
+    GPU_INSTANCE_TYPE,
+    WORKER_CHOICES,
+    normalize_state,
+    profile,
+    require_worker,
+    set_worker,
+    worker_state,
+)
+
 DEFAULT_STATE_PATH = ".aws_runner_state.json"
 DEFAULT_PREFIX = "openalex"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_BUCKET = "lucas-epistemic-bubbles"
 DEFAULT_REPO_URL = "https://github.com/lucasgautheron/social-science.git"
-DEFAULT_INSTANCE_TYPE = "i4i.8xlarge"
+DEFAULT_INSTANCE_TYPE = CPU_INSTANCE_TYPE
 DEFAULT_IAM_INSTANCE_PROFILE = "openalex-ec2-runner-profile"
-DEFAULT_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+DEFAULT_AMI_PARAMETER = CPU_AMI_PARAMETER
 DEFAULT_ROOT_VOLUME_GB = 200
 STATE_S3_KEY = "state/aws_runner_state.json"
 
@@ -146,21 +161,30 @@ def upload_state(s3, bucket: str, prefix: str, state: Dict[str, Any]) -> None:
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
 
 
-def resolve_ami_id(session, explicit_ami_id: Optional[str]) -> str:
+def resolve_ami_id(
+    session,
+    explicit_ami_id: Optional[str],
+    ami_parameter: str = DEFAULT_AMI_PARAMETER,
+) -> str:
     if explicit_ami_id:
         return explicit_ami_id
     ssm = session.client("ssm")
-    response = ssm.get_parameter(Name=DEFAULT_AMI_PARAMETER)
+    response = ssm.get_parameter(Name=ami_parameter)
     ami_id = response["Parameter"]["Value"]
-    print(f"Using latest Amazon Linux 2023 AMI from SSM parameter: {ami_id}")
+    print(f"Using AMI {ami_id} from SSM parameter {ami_parameter}.")
     return ami_id
 
 
-def tag_specifications(project: str, prefix: str) -> Iterable[Dict[str, Any]]:
+def tag_specifications(
+    project: str,
+    prefix: str,
+    worker: str = DEFAULT_WORKER,
+) -> Iterable[Dict[str, Any]]:
     tags = [
-        {"Key": "Name", "Value": f"{project}-pipeline-runner"},
+        {"Key": "Name", "Value": f"{project}-pipeline-runner-{worker}"},
         {"Key": "Project", "Value": project},
         {"Key": "PipelinePrefix", "Value": prefix},
+        {"Key": "WorkerRole", "Value": worker},
         {"Key": "ManagedBy", "Value": "openalex-aws"},
     ]
     return [{"ResourceType": resource, "Tags": tags} for resource in ("instance", "volume")]
@@ -194,7 +218,13 @@ def create_instance(session, args: argparse.Namespace, ami_id: str) -> str:
         "InstanceType": args.instance_type,
         "MinCount": 1,
         "MaxCount": 1,
-        "TagSpecifications": list(tag_specifications(args.project, normalize_prefix(args.prefix))),
+        "TagSpecifications": list(
+            tag_specifications(
+                args.project,
+                normalize_prefix(args.prefix),
+                args.worker,
+            )
+        ),
         "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/xvda",
@@ -228,10 +258,28 @@ def create_instance(session, args: argparse.Namespace, ami_id: str) -> str:
 def load_local_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"State file not found: {path}. Run setup first, or pass --state-path.")
-    return load_json(path)
+    return normalize_state(load_json(path))[0]
 
 
-def active_running_runs(s3, bucket: str, prefix: str) -> list[str]:
+def backup_legacy_state(path: Path) -> Optional[Path]:
+    if not path.exists():
+        return None
+    _state, migrated = normalize_state(load_json(path))
+    if not migrated:
+        return None
+    backup = path.with_suffix(path.suffix + ".v1.bak")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    return backup
+
+
+def active_running_runs(
+    s3,
+    bucket: str,
+    prefix: str,
+    *,
+    instance_ids: set[str] | None = None,
+) -> list[str]:
     runs_prefix = prefixed_key(prefix, "runs/")
     paginator = s3.get_paginator("list_objects_v2")
     running: list[str] = []
@@ -242,7 +290,13 @@ def active_running_runs(s3, bucket: str, prefix: str) -> list[str]:
                 continue
             obj = s3.get_object(Bucket=bucket, Key=key)
             status = json.loads(obj["Body"].read().decode("utf-8"))
-            if status.get("status") == "running":
+            if (
+                status.get("status") == "running"
+                and (
+                    instance_ids is None
+                    or status.get("instance_id") in instance_ids
+                )
+            ):
                 running.append(status.get("run_id") or key.split("/")[-2])
     return running
 
@@ -313,6 +367,7 @@ def grant_notification_publish(iam, instance_profile: str, topic_arn: str) -> st
 
 def command_notifications(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
+    backup = backup_legacy_state(state_path)
     state = load_local_state(state_path)
     args.region = args.region or state["region"]
     session = boto3_session(args)
@@ -335,10 +390,19 @@ def command_notifications(args: argparse.Namespace) -> int:
         subscription_arn = subscription.get("SubscriptionArn", "PendingConfirmation")
         print(f"Reusing SNS email subscription: {subscription_arn}")
 
-    instance_profile = state.get("iam_instance_profile")
-    if not instance_profile:
-        raise SystemExit("No IAM instance profile is configured for the worker.")
-    role_name = grant_notification_publish(iam, str(instance_profile), topic_arn)
+    instance_profiles = {
+        str(worker.get("iam_instance_profile"))
+        for worker in state.get("workers", {}).values()
+        if isinstance(worker, dict) and worker.get("iam_instance_profile")
+    }
+    if not instance_profiles and state.get("iam_instance_profile"):
+        instance_profiles.add(str(state["iam_instance_profile"]))
+    if not instance_profiles:
+        raise SystemExit("No IAM instance profile is configured for any worker.")
+    role_names = sorted(
+        grant_notification_publish(iam, instance_profile, topic_arn)
+        for instance_profile in instance_profiles
+    )
 
     state.update(
         {
@@ -349,7 +413,9 @@ def command_notifications(args: argparse.Namespace) -> int:
     )
     write_json(state_path, state)
     upload_state(s3, state["bucket"], state["prefix"], state)
-    print(f"Worker role {role_name!r} can publish run notifications.")
+    print(f"Worker roles {', '.join(repr(name) for name in role_names)} can publish notifications.")
+    if backup is not None:
+        print(f"Backed up legacy state to {backup}.")
     if subscription_arn == "PendingConfirmation":
         print(f"Confirm the subscription using the email AWS sent to {args.email}.")
     else:
@@ -359,17 +425,37 @@ def command_notifications(args: argparse.Namespace) -> int:
 
 def command_setup(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
+    raw_state: Dict[str, Any] = load_json(state_path) if state_path.exists() else {}
+    prior_state, migrated = normalize_state(raw_state)
+    args.region = args.region or prior_state.get("region") or DEFAULT_REGION
+    args.bucket = args.bucket or prior_state.get("bucket") or DEFAULT_BUCKET
+    args.prefix = args.prefix or prior_state.get("prefix") or DEFAULT_PREFIX
+    args.project = args.project or prior_state.get("project") or "openalex"
+    for field in ("key_name", "security_group_id", "subnet_id"):
+        if getattr(args, field) is None:
+            setattr(args, field, prior_state.get(field))
+    args.iam_instance_profile = (
+        args.iam_instance_profile
+        or prior_state.get("iam_instance_profile")
+        or DEFAULT_IAM_INSTANCE_PROFILE
+    )
     prefix = normalize_prefix(args.prefix)
     db_key = args.db_s3_key or prefixed_key(prefix, "input/articles.db")
-    repo_url = normalize_repo_url(args.repo_url or default_repo_url())
+    repo_url = normalize_repo_url(
+        args.repo_url or prior_state.get("repo_url") or default_repo_url()
+    )
+    worker_profile = profile(args.worker)
+    args.instance_type = args.instance_type or worker_profile["instance_type"]
+    ami_parameter = str(worker_profile["ami_parameter"])
 
     summary = {
+        "worker": args.worker,
         "region": args.region,
         "bucket": args.bucket,
         "prefix": prefix,
         "instance_type": args.instance_type,
         "iam_instance_profile": args.iam_instance_profile,
-        "ami_id": args.ami_id or f"SSM:{DEFAULT_AMI_PARAMETER}",
+        "ami_id": args.ami_id or f"SSM:{ami_parameter}",
         "root_volume_gb": args.root_volume_gb,
         "db_s3_uri": None if args.skip_db_upload else s3_uri(args.bucket, db_key),
         "repo_url": repo_url,
@@ -392,23 +478,42 @@ def command_setup(args: argparse.Namespace) -> int:
         upload_file(s3, Path(args.db_path), args.bucket, db_key, args.overwrite_db, client_error)
         db_s3_uri = s3_uri(args.bucket, db_key)
 
-    prior_state: Dict[str, Any] = load_json(state_path) if state_path.exists() else {}
-    if prior_state and existing_instance_is_reusable(ec2, prior_state):
-        instance_id = prior_state["instance_id"]
-        print(f"Reusing existing instance {instance_id}.")
+    prior_worker = worker_state(prior_state, args.worker)
+    if prior_worker and existing_instance_is_reusable(ec2, prior_worker):
+        if (
+            prior_worker.get("instance_type")
+            and prior_worker["instance_type"] != args.instance_type
+        ):
+            raise SystemExit(
+                f"The {args.worker} worker {prior_worker['instance_id']} uses "
+                f"{prior_worker['instance_type']}, not {args.instance_type}. "
+                f"Destroy it explicitly before changing its instance type."
+            )
+        instance_id = prior_worker["instance_id"]
+        print(f"Reusing existing {args.worker} worker {instance_id}.")
     elif args.no_launch:
-        instance_id = prior_state.get("instance_id")
-        print("Skipping EC2 launch because --no-launch was set.")
+        instance_id = prior_worker.get("instance_id")
+        print(f"Skipping {args.worker} EC2 launch because --no-launch was set.")
     else:
-        ami_id = resolve_ami_id(session, args.ami_id)
+        ami_id = resolve_ami_id(session, args.ami_id, ami_parameter)
         instance_id = create_instance(session, args, ami_id)
 
     state = {
         **prior_state,
+        "schema_version": 2,
+        "default_worker": DEFAULT_WORKER,
         "region": args.region,
         "bucket": args.bucket,
         "prefix": prefix,
         "project": args.project,
+        "repo_url": repo_url,
+        "db_s3_uri": db_s3_uri or prior_state.get("db_s3_uri"),
+        "state_s3_uri": s3_uri(args.bucket, prefixed_key(prefix, STATE_S3_KEY)),
+        "updated_at": utc_now(),
+    }
+    state.setdefault("created_at", utc_now())
+    worker = {
+        **prior_worker,
         "instance_id": instance_id,
         "instance_type": args.instance_type,
         "key_name": args.key_name,
@@ -416,14 +521,23 @@ def command_setup(args: argparse.Namespace) -> int:
         "subnet_id": args.subnet_id,
         "iam_instance_profile": args.iam_instance_profile,
         "ami_id": args.ami_id,
+        "ami_parameter": ami_parameter,
         "root_volume_gb": args.root_volume_gb,
-        "repo_url": repo_url,
-        "db_s3_uri": db_s3_uri or prior_state.get("db_s3_uri"),
-        "state_s3_uri": s3_uri(args.bucket, prefixed_key(prefix, STATE_S3_KEY)),
         "updated_at": utc_now(),
     }
-    state.setdefault("created_at", utc_now())
+    worker.setdefault("created_at", utc_now())
+    if instance_id:
+        instance = describe_instance(ec2, instance_id)
+        worker["last_known_state"] = (
+            instance.get("State", {}).get("Name") if instance else "unknown"
+        )
+        worker["last_known_state_at"] = utc_now()
+    set_worker(state, args.worker, worker)
 
+    if migrated:
+        backup = backup_legacy_state(state_path)
+        if backup is not None:
+            print(f"Backed up legacy state to {backup}.")
     write_json(state_path, state)
     upload_state(s3, args.bucket, prefix, state)
     print(f"Wrote state to {state_path} and {state['state_s3_uri']}.")
@@ -431,69 +545,199 @@ def command_setup(args: argparse.Namespace) -> int:
 
 
 def command_start(args: argparse.Namespace) -> int:
-    state = load_local_state(Path(args.state_path))
+    state_path = Path(args.state_path)
+    backup = backup_legacy_state(state_path)
+    state = load_local_state(state_path)
     args.region = args.region or state["region"]
     session = boto3_session(args)
     ec2 = session.client("ec2")
-    instance_id = state["instance_id"]
+    worker = require_worker(state, args.worker)
+    instance_id = worker["instance_id"]
     instance = describe_instance(ec2, instance_id)
     state_name = instance.get("State", {}).get("Name") if instance else "unknown"
     if state_name == "running":
-        print(f"Instance {instance_id} is already running.")
+        print(f"{args.worker} worker {instance_id} is already running.")
+        _persist_worker_state(state_path, state, args.worker, worker, state_name, session)
         return 0
-    print(f"Starting instance {instance_id}...")
+    print(f"Starting {args.worker} worker {instance_id}...")
     ec2.start_instances(InstanceIds=[instance_id])
     if args.wait:
         ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
-        print(f"Instance {instance_id} is running.")
+        state_name = "running"
+        print(f"{args.worker} worker {instance_id} is running.")
+    else:
+        state_name = "pending"
+    _persist_worker_state(state_path, state, args.worker, worker, state_name, session)
+    if backup is not None:
+        print(f"Backed up legacy state to {backup}.")
     return 0
 
 
 def command_pause(args: argparse.Namespace) -> int:
-    state = load_local_state(Path(args.state_path))
+    state_path = Path(args.state_path)
+    backup = backup_legacy_state(state_path)
+    state = load_local_state(state_path)
     args.region = args.region or state["region"]
     session = boto3_session(args)
     ec2 = session.client("ec2")
-    instance_id = state["instance_id"]
+    worker = require_worker(state, args.worker)
+    instance_id = worker["instance_id"]
     print(
-        "Stopping the instance. The fast /mnt instance-store corpus cache will be lost; "
+        f"Stopping the {args.worker} worker. "
+        "The fast /mnt instance-store corpus cache will be lost; "
         "S3 data is retained and will repopulate the cache after restart."
     )
     ec2.stop_instances(InstanceIds=[instance_id])
     if args.wait:
         ec2.get_waiter("instance_stopped").wait(InstanceIds=[instance_id])
-        print(f"Instance {instance_id} is stopped.")
+        state_name = "stopped"
+        print(f"{args.worker} worker {instance_id} is stopped.")
+    else:
+        state_name = "stopping"
+    _persist_worker_state(state_path, state, args.worker, worker, state_name, session)
+    if backup is not None:
+        print(f"Backed up legacy state to {backup}.")
+    return 0
+
+
+def _persist_worker_state(
+    state_path: Path,
+    state: Dict[str, Any],
+    worker_name: str,
+    worker: Dict[str, Any],
+    state_name: str,
+    session,
+) -> None:
+    updated = {
+        **worker,
+        "last_known_state": state_name,
+        "last_known_state_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+    state["updated_at"] = utc_now()
+    set_worker(state, worker_name, updated)
+    write_json(state_path, state)
+    upload_state(session.client("s3"), state["bucket"], state["prefix"], state)
+
+
+def command_workers(args: argparse.Namespace) -> int:
+    state_path = Path(args.state_path)
+    backup = backup_legacy_state(state_path)
+    state = load_local_state(state_path)
+    args.region = args.region or state["region"]
+    session = boto3_session(args)
+    ec2 = session.client("ec2")
+
+    for worker_name in WORKER_CHOICES:
+        worker = worker_state(state, worker_name)
+        instance_id = worker.get("instance_id")
+        if not instance_id:
+            print(f"{worker_name}: not configured")
+            continue
+        instance = describe_instance(ec2, instance_id)
+        state_name = (
+            instance.get("State", {}).get("Name") if instance else "not-found"
+        )
+        updated = {
+            **worker,
+            "last_known_state": state_name,
+            "last_known_state_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+        set_worker(state, worker_name, updated)
+        print(
+            f"{worker_name}: {instance_id} "
+            f"{worker.get('instance_type', 'unknown')} {state_name}"
+        )
+
+    state["updated_at"] = utc_now()
+    write_json(state_path, state)
+    upload_state(
+        session.client("s3"),
+        state["bucket"],
+        state["prefix"],
+        state,
+    )
+    if backup is not None:
+        print(f"Backed up legacy state to {backup}.")
     return 0
 
 
 def command_destroy(args: argparse.Namespace) -> int:
-    state = load_local_state(Path(args.state_path))
+    state_path = Path(args.state_path)
+    backup = backup_legacy_state(state_path)
+    state = load_local_state(state_path)
     args.region = args.region or state["region"]
     session = boto3_session(args)
     s3 = session.client("s3")
     ec2 = session.client("ec2")
     bucket = state["bucket"]
     prefix = state["prefix"]
-    running = active_running_runs(s3, bucket, prefix)
+    if args.delete_s3 and not args.all_workers:
+        raise SystemExit("--delete-s3 requires --all-workers")
+
+    worker_names = (
+        list(WORKER_CHOICES)
+        if args.all_workers
+        else [args.worker]
+    )
+    selected = {
+        worker_name: worker_state(state, worker_name)
+        for worker_name in worker_names
+    }
+    if not args.all_workers:
+        require_worker(state, args.worker)
+    instance_ids = {
+        str(worker["instance_id"])
+        for worker in selected.values()
+        if worker.get("instance_id")
+    }
+    running = active_running_runs(
+        s3,
+        bucket,
+        prefix,
+        instance_ids=instance_ids,
+    )
     if running and not args.force:
         raise SystemExit(f"Refusing to destroy while runs are marked running: {', '.join(running)}. Pass --force to override.")
 
-    instance_id = state.get("instance_id")
-    if instance_id:
-        print(f"Terminating instance {instance_id}...")
+    for worker_name, worker in selected.items():
+        instance_id = worker.get("instance_id")
+        if not instance_id:
+            continue
+        print(f"Terminating {worker_name} worker {instance_id}...")
         ec2.terminate_instances(InstanceIds=[instance_id])
         if args.wait:
             ec2.get_waiter("instance_terminated").wait(InstanceIds=[instance_id])
-            print(f"Instance {instance_id} is terminated.")
+            state_name = "terminated"
+            print(f"{worker_name} worker {instance_id} is terminated.")
+        else:
+            state_name = "shutting-down"
+        set_worker(
+            state,
+            worker_name,
+            {
+                **worker,
+                "destroyed_at": utc_now(),
+                "last_known_state": state_name,
+                "last_known_state_at": utc_now(),
+                "updated_at": utc_now(),
+            },
+        )
 
     if args.delete_s3:
         print(f"Deleting S3 objects under {s3_uri(bucket, prefix + '/')}...")
         delete_s3_prefix(s3, bucket, prefix)
     else:
         print(f"Leaving S3 data intact under {s3_uri(bucket, prefix + '/')}.")
+        state["updated_at"] = utc_now()
+        upload_state(s3, bucket, prefix, state)
 
-    state["destroyed_at"] = utc_now()
-    write_json(Path(args.state_path), state)
+    if args.all_workers:
+        state["destroyed_at"] = utc_now()
+    write_json(state_path, state)
+    if backup is not None:
+        print(f"Backed up legacy state to {backup}.")
     return 0
 
 
@@ -509,18 +753,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup = subparsers.add_parser("setup", help="Create/verify S3 resources, upload DB, and launch/reuse EC2.")
     add_common_args(setup)
-    setup.set_defaults(region=DEFAULT_REGION)
-    setup.add_argument("--bucket", default=DEFAULT_BUCKET, help="S3 bucket for inputs, state, logs, and outputs.")
-    setup.add_argument("--prefix", default=DEFAULT_PREFIX, help="S3 key prefix for this project.")
-    setup.add_argument("--project", default="openalex", help="Tag/name prefix for AWS resources.")
+    setup.add_argument(
+        "--bucket",
+        default=None,
+        help=f"S3 bucket. Existing state wins; new projects default to {DEFAULT_BUCKET}.",
+    )
+    setup.add_argument(
+        "--prefix",
+        default=None,
+        help=f"S3 key prefix. Existing state wins; new projects default to {DEFAULT_PREFIX}.",
+    )
+    setup.add_argument(
+        "--project",
+        default=None,
+        help="Tag/name prefix. Existing state wins; new projects default to openalex.",
+    )
     setup.add_argument("--db-path", default="articles.db", help="Local SQLite database path to upload.")
     setup.add_argument("--db-s3-key", default=None, help="Explicit S3 key for the SQLite database.")
     setup.add_argument("--skip-db-upload", action="store_true", help="Do not upload the SQLite database during setup.")
     setup.add_argument("--overwrite-db", action="store_true", help="Replace an existing uploaded SQLite database.")
     setup.add_argument("--repo-url", default=None, help="GitHub repository URL that the EC2 worker should clone.")
-    setup.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE, help="EC2 instance type.")
-    setup.add_argument("--ami-id", default=None, help="AMI ID. Defaults to latest Amazon Linux 2023 via SSM.")
-    setup.add_argument("--iam-instance-profile", default=DEFAULT_IAM_INSTANCE_PROFILE, help="IAM instance profile name/ARN with SSM and S3 access.")
+    setup.add_argument("--worker", choices=WORKER_CHOICES, default=DEFAULT_WORKER)
+    setup.add_argument(
+        "--instance-type",
+        default=None,
+        help=(
+            f"EC2 override. Defaults: cpu={DEFAULT_INSTANCE_TYPE}, "
+            f"gpu={GPU_INSTANCE_TYPE}."
+        ),
+    )
+    setup.add_argument(
+        "--ami-id",
+        default=None,
+        help=(
+            "AMI override. CPU defaults to Amazon Linux 2023; GPU defaults "
+            f"to the latest DLAMI from {GPU_AMI_PARAMETER}."
+        ),
+    )
+    setup.add_argument(
+        "--iam-instance-profile",
+        default=None,
+        help=(
+            "IAM instance profile name/ARN with SSM and S3 access. "
+            f"Defaults to existing state or {DEFAULT_IAM_INSTANCE_PROFILE}."
+        ),
+    )
     setup.add_argument("--key-name", default=None, help="Optional EC2 key pair name.")
     setup.add_argument("--security-group-id", default=None, help="Optional security group ID.")
     setup.add_argument("--subnet-id", default=None, help="Optional subnet ID.")
@@ -531,13 +808,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = subparsers.add_parser("start", help="Start the configured EC2 instance.")
     add_common_args(start)
+    start.add_argument("--worker", choices=WORKER_CHOICES, default=DEFAULT_WORKER)
     start.add_argument("--wait", action="store_true", help="Wait until the instance reaches running state.")
     start.set_defaults(func=command_start)
 
     pause = subparsers.add_parser("pause", help="Stop the configured EC2 instance without deleting S3 data.")
     add_common_args(pause)
+    pause.add_argument("--worker", choices=WORKER_CHOICES, default=DEFAULT_WORKER)
     pause.add_argument("--wait", action="store_true", help="Wait until the instance reaches stopped state.")
     pause.set_defaults(func=command_pause)
+
+    workers = subparsers.add_parser(
+        "workers",
+        help="List configured CPU/GPU workers and persist legacy state migration.",
+    )
+    add_common_args(workers)
+    workers.set_defaults(func=command_workers)
 
     notifications = subparsers.add_parser(
         "notifications",
@@ -549,6 +835,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     destroy = subparsers.add_parser("destroy", help="Terminate EC2 resources and optionally delete S3 artifacts.")
     add_common_args(destroy)
+    destroy.add_argument("--worker", choices=WORKER_CHOICES, default=DEFAULT_WORKER)
+    destroy.add_argument(
+        "--all-workers",
+        action="store_true",
+        help="Terminate every configured worker.",
+    )
     destroy.add_argument("--force", action="store_true", help="Destroy even if a run is marked running.")
     destroy.add_argument("--delete-s3", action="store_true", help="Delete objects under the configured S3 prefix.")
     destroy.add_argument("--wait", action="store_true", help="Wait until the instance reaches terminated state.")

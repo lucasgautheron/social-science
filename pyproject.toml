@@ -26,11 +26,16 @@ analysis = [
 download = ["pyalex>=0.18"]
 embeddings = [
   "numpy>=1.26",
-  "pandas>=2.2",
   "sentence-transformers>=3.3",
-  "sqlalchemy>=2.0",
   "torch>=2.3",
-  "tqdm>=4.66",
+]
+topics = [
+  "bertopic>=0.17",
+  "hdbscan>=0.8.40",
+  "pandas>=2.2",
+  "plotly>=5.24",
+  "scikit-learn>=1.5",
+  "umap-learn>=0.5.7",
 ]
 parquet = ["pandas>=2.2", "pyarrow>=17"]
 aws = ["boto3>=1.35"]

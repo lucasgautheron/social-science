@@ -817,6 +817,13 @@ def _process_year(
         all_distances,
         cluster_count,
     )
+    cluster_observations["new_connected_distance_sum"] = _accepted_distance_sums(
+        sampled_event_keys,
+        sampled_event_clusters,
+        distance_keys,
+        all_distances,
+        cluster_count,
+    )
     return (
         {
             "author_i": left,
@@ -1153,6 +1160,30 @@ def _sample_cluster_observations(
         kept_reservoirs,
         updated_population,
     )
+
+
+def _accepted_distance_sums(
+    sampled_keys: np.ndarray,
+    sampled_clusters: np.ndarray,
+    distance_keys: np.ndarray,
+    distances: np.ndarray,
+    cluster_count: int,
+) -> np.ndarray:
+    """Sum distances of this year's reservoir acceptances.
+
+    Those acceptances are a simple random sample of the year's connected new
+    pair observations, so the sum divided by the acceptance count estimates
+    that year's mean.
+    """
+    sums = np.zeros(cluster_count, dtype=np.float64)
+    if sampled_keys.size == 0:
+        return sums
+    positions = np.searchsorted(distance_keys, sampled_keys)
+    sampled_distances = distances[positions]
+    if np.any(sampled_distances < 0):
+        raise RuntimeError("Connected cluster observation has no finite distance")
+    np.add.at(sums, sampled_clusters, sampled_distances)
+    return sums
 
 
 def _finish_cluster_reservoir(

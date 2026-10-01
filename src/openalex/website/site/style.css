@@ -183,6 +183,8 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .scatter-point[data-type="bump increasing"] { background: #0e8a6a; fill: #0e8a6a; }
 .type-filter button[data-cluster-type="bump decreasing"] i,
 .scatter-point[data-type="bump decreasing"] { background: #d4760a; fill: #d4760a; }
+.type-filter button[data-cluster-type="bump unknown"] i,
+.scatter-point[data-type="bump unknown"] { background: #6b7280; fill: #6b7280; }
 .plot-toolbar .summary { margin: 0; text-align: right; }
 .plot-tabs { display: flex; gap: .25rem; padding: .2rem; border-radius: .7rem; background: #edf1ef; }
 .plot-tabs button {

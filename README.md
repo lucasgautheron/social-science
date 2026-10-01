@@ -16,12 +16,58 @@ Heavy sentence-transformer support is separate:
 python -m pip install -e '.[embeddings]'
 ```
 
+Install BERTopic support separately when assigning topics:
+
+```bash
+python -m pip install -e '.[topics]'
+```
+
 List commands with `openalex --help`, then inspect any command directly:
 
 ```bash
 openalex events --help
 openalex build-website --help
 ```
+
+## Text embeddings and topics
+
+Build local multilingual MiniLM embeddings from each article's title and
+abstract. The corpus is opened read-only; vectors and their versioned manifest
+are written to a separate, resumable artifact directory:
+
+```bash
+openalex embeddings \
+  --db-path /path/to/articles.db \
+  --output-dir output/embeddings \
+  --resume
+```
+
+CPU embedding uses 32 persistent worker processes by default. Each worker owns
+one model and one PyTorch thread; encoded chunks are committed to SQLite and
+checkpointed in order instead of retaining a whole source batch. Change CPU
+parallelism with `--workers`. GPU inference uses one process, for example
+`--workers 1 --device cuda --encode-batch-size 256`.
+
+`output/embeddings/embeddings.db` supports exact retrieval by article ID.
+`manifest.json` records the model, dimension, text format, and completion
+state. The artifact can be staged for a remote run with
+`openalex-aws submit --input output/embeddings -- ...`.
+
+Assign BERTopic topics from those embeddings:
+
+```bash
+openalex topics \
+  --db-path /path/to/articles.db \
+  --embeddings-dir output/embeddings \
+  --output-dir output/topics
+```
+
+The default deterministic sample contains up to 100,000 articles; pass
+`--sample-size all` for every embedded article. Results include per-article
+assignments, topic labels and words, a hierarchy, HTML visualizations, the
+saved BERTopic model, and a manifest tied to the embedding artifact. Use
+`--no-hierarchy`, `--no-visualizations`, or `--no-save-model` to omit optional
+outputs.
 
 ## Corpus and event pipeline
 
@@ -180,8 +226,9 @@ that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year. `link-distances.html` interactively
 plots cluster paper count on a logarithmic x-axis against the two mean-distance
 measures from `visualize-new-links`. Its points use one neutral style rather
-than the static plots' residual highlights; hovering a point shows the cluster
-and its share-of-papers curve by year, followed by its discrete connected-link
+than the static plots' residual highlights; hovering a point shows the cluster,
+its share-of-papers curve by year, the mean connected distance by year for the
+selected measure, and its discrete connected-link
 distance distribution (0, 1, 2, ...) overlaid with the sampling-weighted
 distribution of new links outside every cluster (`cluster_id == -1`). The
 cluster search matches labels, member keywords, and cluster ids, and filters
@@ -219,21 +266,59 @@ OPENALEX_CLUSTER_TRENDS=output/event_clusters/cluster_trends.csv \
 
 ## AWS
 
-Provision once:
+Provision the default CPU worker once:
 
 ```bash
-openalex-aws setup --db-path /path/to/articles.db
+openalex-aws setup --worker cpu --db-path /path/to/articles.db
 ```
 
-Run any installed command by placing it after `--`:
+The CPU profile is the existing `i4i.8xlarge`. An existing flat state file is
+backed up and migrated without changing its instance ID. Provision the optional
+L4 profile independently; this keeps the CPU instance, whether running or
+stopped:
 
 ```bash
-openalex-aws submit -- openalex events --output-dir output/events
+openalex-aws setup --worker gpu --skip-db-upload
+openalex-aws workers
+```
+
+The GPU profile defaults to `g6.8xlarge` and AWS's current Amazon Linux 2023
+NVIDIA-driver DLAMI. `workers` lists both instance IDs and their live states.
+Lifecycle commands affect only the selected worker:
+
+```bash
+openalex-aws start --worker gpu --wait
+openalex-aws pause --worker gpu --wait
+openalex-aws start --worker cpu --wait
+```
+
+Run any installed command by placing it after `--`. CPU is the default worker:
+
+```bash
+openalex-aws submit --worker cpu -- openalex events --output-dir output/events
 openalex-aws status
 openalex-aws logs
 openalex-aws artifacts
 openalex-aws download
 ```
+
+Run embeddings on the L4 with one CUDA process:
+
+```bash
+openalex-aws submit --worker gpu -- openalex embeddings \
+  --db-path articles.db \
+  --output-dir output/embeddings \
+  --workers 1 \
+  --device cuda \
+  --encode-batch-size 256 \
+  --resume
+```
+
+Every run records its worker, instance ID, and instance type. Live status,
+artifact refresh, and cancellation therefore continue to target the original
+instance even after another worker is selected. The local last-run file retains
+the latest run globally and per worker; pass `--worker cpu` or `--worker gpu`
+to inspect that worker's latest run.
 
 `download` writes artifacts into the local `output/` directory by default,
 preserving their paths. It asks for confirmation when the destination already

@@ -1,456 +1,672 @@
+"""Build and read article text-embedding artifacts.
+
+The source corpus is always opened read-only. Embeddings are written to a
+separate SQLite database so long runs can resume without modifying the corpus.
+"""
+
+from __future__ import annotations
+
 import argparse
+import json
 import logging
-import multiprocessing as mp
+import os
 import pickle
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
-import pandas as pd
-import torch
-from sentence_transformers import SentenceTransformer
-from sqlalchemy import create_engine, text
-from tqdm import tqdm
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+ARTIFACT_VERSION = 1
+DEFAULT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_OUTPUT_DIR = Path("output/embeddings")
+DEFAULT_WORKERS = 32
+DEFAULT_CPU_ENCODE_BATCH_SIZE = 32
+DEFAULT_GPU_ENCODE_BATCH_SIZE = 256
+DATABASE_NAME = "embeddings.db"
+TEXT_FORMAT = "{title} . {abstract}"
+_SQLITE_IN_LIMIT = 900
 
-class TextEmbeddingProcessor:
-    def __init__(self, embeddings_db_path="embeddings.db", source_db_url=None,
-                 batch_size=1000, n_workers=None, use_multiprocessing=True):
-        self.embeddings_db_path = embeddings_db_path
-        self.source_db_url = source_db_url
-        self.batch_size = batch_size
-        self.n_workers = n_workers or max(1, mp.cpu_count() - 1)
-        self.use_multiprocessing = use_multiprocessing
-        self.embedding_dim = 384  # Dimension for paraphrase-multilingual-MiniLM-L12-v2
+EncoderFactory = Callable[[str, str | None], object]
 
-        # Store database URL (don't create engine in __init__)
-        self.source_db_url = source_db_url
-        self.source_db_url = source_db_url
+_worker_encoder = None
+_worker_encode_batch_size = 32
 
-        # Configure PyTorch threads for better CPU utilization
-        if not use_multiprocessing:
-            torch.set_num_threads(mp.cpu_count())
 
-        # Initialize model (will be recreated in each process if using multiprocessing)
-        if not use_multiprocessing:
-            self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+def _sentence_transformer(model_name: str, device: str | None = None):
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Embedding support is not installed. Run "
+            "`python -m pip install -e '.[embeddings]'`."
+        ) from exc
+    kwargs = {"device": device} if device else {}
+    return SentenceTransformer(model_name, **kwargs)
 
-        # Initialize embeddings database
-        self._init_database()
 
-        # Cursor-based pagination state
-        self.last_random_rank = None
+def _init_worker(model_name: str, device: str | None, encode_batch_size: int) -> None:
+    global _worker_encoder, _worker_encode_batch_size
+    import torch
 
-    def _init_database(self):
-        """Initialize SQLite database with embeddings table"""
-        Path(self.embeddings_db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    _worker_encoder = _sentence_transformer(model_name, device)
+    _worker_encode_batch_size = encode_batch_size
 
-        # Create table if it doesn't exist
-        cursor.execute('''
-                       CREATE TABLE IF NOT EXISTS embeddings
-                       (
-                           id
-                           INTEGER
-                           PRIMARY
-                           KEY,
-                           article_id
-                           TEXT
-                           UNIQUE,
-                           embedding
-                           BLOB,
-                           processed_at
-                           TIMESTAMP
-                           DEFAULT
-                           CURRENT_TIMESTAMP
-                       )
-                       ''')
 
-        # Create index for faster lookups
-        cursor.execute('''
-                       CREATE INDEX IF NOT EXISTS idx_article_id ON embeddings(article_id)
-                       ''')
+def _encode_worker(texts: list[str]) -> np.ndarray:
+    if _worker_encoder is None:
+        raise RuntimeError("Embedding worker was not initialized")
+    return np.asarray(
+        _worker_encoder.encode(
+            texts,
+            batch_size=_worker_encode_batch_size,
+            show_progress_bar=False,
+        ),
+        dtype=np.float32,
+    )
 
-        conn.commit()
-        conn.close()
 
-    def _get_processed_ids(self):
-        """Get set of already processed article IDs"""
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
+def _detect_accelerator_devices() -> list[str]:
+    """Return visible accelerator devices in preferred execution order."""
+    try:
+        import torch
+    except ImportError:
+        return []
+    if torch.cuda.is_available():
+        return [f"cuda:{index}" for index in range(torch.cuda.device_count())]
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return ["mps"]
+    return []
 
-        cursor.execute("SELECT article_id FROM embeddings")
-        processed_ids = {str(row[0]) for row in cursor.fetchall()}
 
-        conn.close()
-        return processed_ids
+def _resolve_runtime(
+    device: str | None,
+    workers: int | None,
+    encode_batch_size: int | None,
+) -> tuple[str, list[str], int, int]:
+    """Resolve automatic CPU, single-accelerator, or multi-GPU execution."""
+    requested = (device or "auto").lower()
+    detected = (
+        []
+        if requested == "cpu"
+        else _detect_accelerator_devices()
+    )
+    if requested == "auto":
+        devices = detected or ["cpu"]
+    elif requested == "cpu":
+        devices = ["cpu"]
+    elif requested == "cuda":
+        devices = [value for value in detected if value.startswith("cuda:")]
+        if not devices:
+            raise RuntimeError("CUDA was requested but no CUDA GPU is available")
+    elif requested.startswith("cuda:"):
+        if requested not in detected:
+            raise RuntimeError(f"{requested} was requested but is not available")
+        devices = [requested]
+    elif requested == "mps":
+        if "mps" not in detected:
+            raise RuntimeError("MPS was requested but is not available")
+        devices = ["mps"]
+    else:
+        devices = [device or requested]
 
-    def _process_batch_worker(self, batch_data):
-        """Worker function for multiprocessing - processes a single batch"""
-        texts, article_ids = batch_data
+    accelerated = devices[0] != "cpu"
+    if workers is None:
+        resolved_workers = len(devices) if accelerated else DEFAULT_WORKERS
+    else:
+        if workers < 1:
+            raise ValueError("--workers must be >= 1")
+        resolved_workers = workers
 
-        # Each worker creates its own model instance
-        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    if accelerated:
+        if resolved_workers > len(devices):
+            raise ValueError(
+                f"--workers={resolved_workers} exceeds the {len(devices)} "
+                f"available accelerator device(s)"
+            )
+        devices = devices[:resolved_workers]
+    else:
+        devices = ["cpu"] * resolved_workers
 
-        try:
-            embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
-            return list(zip(article_ids, embeddings))
-        except Exception as e:
-            logger.error(f"Error in worker process: {e}")
-            return []
+    if encode_batch_size is None:
+        resolved_batch_size = (
+            DEFAULT_GPU_ENCODE_BATCH_SIZE
+            if any(value.startswith("cuda:") for value in devices)
+            else DEFAULT_CPU_ENCODE_BATCH_SIZE
+        )
+    else:
+        if encode_batch_size < 1:
+            raise ValueError("--encode-batch-size must be >= 1")
+        resolved_batch_size = encode_batch_size
 
-    def _save_embeddings_batch(self, batch_data):
-        """Save a batch of embeddings to database"""
-        if not batch_data:  # Skip empty batches
-            return
+    runtime_device = (
+        "cuda"
+        if len(devices) > 1 and all(value.startswith("cuda:") for value in devices)
+        else devices[0]
+    )
+    return runtime_device, devices, resolved_workers, resolved_batch_size
 
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
 
-        # Prepare data for insertion
-        insert_data = []
-        for article_id, embedding in batch_data:
-            # Serialize embedding as bytes
-            embedding_blob = pickle.dumps(embedding.astype(np.float32))
-            # Ensure article_id is a string
-            article_id_str = str(article_id)
-            insert_data.append((article_id_str, embedding_blob))
+def article_text(title: object, abstract: object) -> str:
+    """Return the exact text supplied to the embedding model."""
+    title_text = "" if title is None else str(title)
+    abstract_text = "" if abstract is None else str(abstract)
+    return f"{title_text} . {abstract_text}".strip()
 
-        # Insert batch
-        cursor.executemany('''
-            INSERT OR REPLACE INTO embeddings (article_id, embedding)
-            VALUES (:article_id, :embedding)
-        ''', [{'article_id': aid, 'embedding': emb} for aid, emb in insert_data])
 
-        conn.commit()
-        conn.close()
+def encode_embedding(value: np.ndarray) -> bytes:
+    """Serialize a float32 vector in the legacy-compatible representation."""
+    vector = np.asarray(value, dtype=np.float32)
+    if vector.ndim != 1:
+        raise ValueError(f"Embedding must be one-dimensional, got {vector.shape}")
+    return pickle.dumps(vector, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def _encode_texts_parallel(self, texts, article_ids):
-        """Parallelize only the model encoding part"""
-        # Calculate chunk size for parallel processing
-        chunk_size = max(1, len(texts) // self.n_workers)
 
-        # Split texts into chunks (keep article_ids aligned)
-        text_chunks = []
-        id_chunks = []
-        for i in range(0, len(texts), chunk_size):
-            text_chunks.append(texts[i:i + chunk_size])
-            id_chunks.append(article_ids[i:i + chunk_size])
+def decode_embedding(value: bytes, *, dimension: int | None = None) -> np.ndarray:
+    """Deserialize and validate an embedding BLOB."""
+    try:
+        vector = np.asarray(pickle.loads(value), dtype=np.float32)
+    except Exception as exc:
+        raise ValueError("Invalid embedding BLOB") from exc
+    if vector.ndim != 1:
+        raise ValueError(f"Embedding must be one-dimensional, got {vector.shape}")
+    if dimension is not None and vector.shape != (dimension,):
+        raise ValueError(
+            f"Embedding has dimension {vector.size}, expected {dimension}"
+        )
+    return vector
 
-        # Process chunks in parallel - only the encoding part
-        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-            futures = [executor.submit(self._encode_chunk_worker, chunk_texts)
-                       for chunk_texts in text_chunks]
 
-            # Collect embeddings and pair with article_ids
-            all_results = []
-            for i, future in enumerate(futures):
-                chunk_embeddings = future.result()
-                chunk_ids = id_chunks[i]
-                # Zip embeddings with their corresponding article_ids
-                chunk_results = list(zip(chunk_ids, chunk_embeddings))
-                all_results.extend(chunk_results)
+class EmbeddingStore:
+    """Read embeddings from a manifest artifact or a legacy database file."""
 
-            return all_results
+    def __init__(self, path: str | Path):
+        source = Path(path).expanduser().resolve()
+        self.root = source if source.is_dir() else source.parent
+        self.manifest_path = self.root / "manifest.json"
+        self.manifest = _read_json(self.manifest_path) if self.manifest_path.is_file() else {}
+        if source.is_dir():
+            database_name = self.manifest.get("database", DATABASE_NAME)
+            self.database_path = source / str(database_name)
+        else:
+            self.database_path = source
+        if not self.database_path.is_file():
+            raise FileNotFoundError(f"Embedding database not found: {self.database_path}")
+        version = self.manifest.get("artifact_version")
+        if version is not None and int(version) != ARTIFACT_VERSION:
+            raise ValueError(
+                f"Unsupported embedding artifact version {version}; expected {ARTIFACT_VERSION}"
+            )
+        dimension = self.manifest.get("dimension")
+        self.dimension = int(dimension) if dimension is not None else None
 
-    def _encode_chunk_worker(self, texts):
-        """Worker function that only does the embedding encoding"""
-        # Each worker creates its own model instance
-        model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    def _connect(self) -> sqlite3.Connection:
+        return _connect_readonly(self.database_path)
 
-        try:
-            embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
-            return embeddings
-        except Exception as e:
-            logger.error(f"Error in encoding worker: {e}")
-            return []
+    def count(self) -> int:
+        with self._connect() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
 
-    def _encode_texts_sequential(self, texts, article_ids):
-        """Sequential processing using single model instance"""
-        try:
-            embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False)
-            return list(zip(article_ids, embeddings))
-        except Exception as e:
-            logger.error(f"Error processing texts: {e}")
-            return []
+    def article_ids(self) -> list[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT article_id FROM embeddings ORDER BY CAST(article_id AS INTEGER)"
+            )
+            return [int(row[0]) for row in rows]
 
-    def get_total_records(self) -> int:
-        """Get total number of records to process"""
-        query = """
-                SELECT COUNT(*) as total
-                FROM articles a
-                         JOIN abstracts ab ON a.article_id = ab.article_id \
+    def get_embedding(self, article_id: int | str) -> np.ndarray | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT embedding FROM embeddings WHERE article_id = ?",
+                (str(article_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return decode_embedding(row[0], dimension=self.dimension)
+
+    def get_embeddings_batch(
+        self, article_ids: Iterable[int | str]
+    ) -> dict[int, np.ndarray]:
+        ids = [int(article_id) for article_id in article_ids]
+        found: dict[int, np.ndarray] = {}
+        with self._connect() as connection:
+            for chunk in _chunks(ids, _SQLITE_IN_LIMIT):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT article_id, embedding FROM embeddings "
+                    f"WHERE article_id IN ({placeholders})",
+                    [str(article_id) for article_id in chunk],
+                )
+                for article_id, blob in rows:
+                    found[int(article_id)] = decode_embedding(
+                        blob, dimension=self.dimension
+                    )
+        return found
+
+
+def build_embeddings(
+    db_path: str | Path,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    *,
+    model_name: str = DEFAULT_MODEL,
+    batch_size: int = 1000,
+    encode_batch_size: int | None = None,
+    workers: int | None = None,
+    device: str | None = None,
+    resume: bool = False,
+    encoder=None,
+    encoder_factory: EncoderFactory = _sentence_transformer,
+) -> dict[str, object]:
+    """Encode every article with an abstract into a resumable artifact."""
+    if batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if encoder is not None:
+        if workers not in {None, 1}:
+            raise ValueError("An injected encoder can only be used with workers=1")
+        if encode_batch_size is not None and encode_batch_size < 1:
+            raise ValueError("--encode-batch-size must be >= 1")
+        runtime_device = device or "injected"
+        execution_devices = [runtime_device]
+        workers = 1
+        encode_batch_size = encode_batch_size or DEFAULT_CPU_ENCODE_BATCH_SIZE
+    else:
+        (
+            runtime_device,
+            execution_devices,
+            workers,
+            encode_batch_size,
+        ) = _resolve_runtime(device, workers, encode_batch_size)
+    logger.info(
+        "Embedding runtime: device=%s workers=%s encode_batch_size=%s",
+        runtime_device,
+        workers,
+        encode_batch_size,
+    )
+
+    source = Path(db_path).expanduser().resolve()
+    output = Path(output_dir).expanduser().resolve()
+    if output == source or source.is_relative_to(output):
+        raise ValueError("--output-dir must not contain the source database")
+    database = output / DATABASE_NAME
+    manifest_path = output / "manifest.json"
+    config = {
+        "artifact_version": ARTIFACT_VERSION,
+        "database": DATABASE_NAME,
+        "model": model_name,
+        "text_format": TEXT_FORMAT,
+        "source_database": str(source),
+        "source_size": source.stat().st_size,
+        "encode_batch_size": encode_batch_size,
+        "device": runtime_device,
+    }
+
+    existing = _read_json(manifest_path) if manifest_path.is_file() else None
+    if not resume and (database.exists() or manifest_path.exists()):
+        raise FileExistsError(
+            f"{output} already contains embeddings. Use --resume or a new --output-dir."
+        )
+    if resume and existing is not None:
+        _validate_resume(existing, config)
+    if resume and database.exists() and existing is None:
+        logger.warning("Resuming a legacy embedding database without a manifest")
+
+    output.mkdir(parents=True, exist_ok=True)
+    _initialize_database(database)
+    stored_count, last_article_id = _embedding_progress(database)
+    dimension = (
+        int(existing["dimension"])
+        if existing is not None and existing.get("dimension") is not None
+        else _stored_dimension(database)
+    )
+    total = _source_count(source)
+    manifest = {
+        **config,
+        "batch_size": batch_size,
+        "complete": False,
+        "dimension": dimension,
+        "last_article_id": last_article_id,
+        "rows": stored_count,
+        "source_rows": total,
+        "workers": workers,
+    }
+    _atomic_json(manifest_path, manifest)
+
+    local_encoder = encoder
+    executors: list[ProcessPoolExecutor] = []
+
+    processed = stored_count
+    try:
+        for rows in _source_batches(source, batch_size):
+            existing_ids = _existing_ids(database, [int(row[0]) for row in rows])
+            rows = [row for row in rows if int(row[0]) not in existing_ids]
+            if not rows:
+                continue
+            article_ids = [int(row[0]) for row in rows]
+            texts = [article_text(row[1], row[2]) for row in rows]
+            if workers == 1:
+                if local_encoder is None:
+                    local_encoder = encoder_factory(model_name, device)
+                vectors = np.asarray(
+                    local_encoder.encode(
+                        texts,
+                        batch_size=encode_batch_size,
+                        show_progress_bar=False,
+                    ),
+                    dtype=np.float32,
+                )
+                dimension = _validate_encoded_batch(
+                    vectors,
+                    len(article_ids),
+                    dimension,
+                )
+                _store_batch(database, article_ids, vectors)
+                processed += len(article_ids)
+                last_article_id = max(last_article_id or -1, article_ids[-1])
+                _update_progress_manifest(
+                    manifest_path,
+                    manifest,
+                    dimension=dimension,
+                    last_article_id=last_article_id,
+                    rows=processed,
+                )
+                logger.info("Stored %s/%s article embeddings", processed, total)
+            else:
+                if not executors:
+                    if all(value == "cpu" for value in execution_devices):
+                        executors = [
+                            ProcessPoolExecutor(
+                                max_workers=workers,
+                                initializer=_init_worker,
+                                initargs=(model_name, "cpu", encode_batch_size),
+                            )
+                        ]
+                    else:
+                        executors = [
+                            ProcessPoolExecutor(
+                                max_workers=1,
+                                initializer=_init_worker,
+                                initargs=(model_name, worker_device, encode_batch_size),
+                            )
+                            for worker_device in execution_devices
+                        ]
+                chunk_indices = [
+                    indices.tolist()
+                    for indices in np.array_split(
+                        np.arange(len(texts)), min(workers, len(texts))
+                    )
+                    if len(indices)
+                ]
+                id_chunks = [
+                    [article_ids[index] for index in indices]
+                    for indices in chunk_indices
+                ]
+                text_chunks = [
+                    [texts[index] for index in indices]
+                    for indices in chunk_indices
+                ]
+                if len(executors) == 1:
+                    encoded_chunks = executors[0].map(_encode_worker, text_chunks)
+                else:
+                    futures = [
+                        executor.submit(_encode_worker, chunk)
+                        for executor, chunk in zip(
+                            executors, text_chunks, strict=True
+                        )
+                    ]
+                    encoded_chunks = (
+                        future.result() for future in futures
+                    )
+                for chunk_ids, chunk_vectors in zip(
+                    id_chunks, encoded_chunks, strict=True
+                ):
+                    dimension = _validate_encoded_batch(
+                        chunk_vectors,
+                        len(chunk_ids),
+                        dimension,
+                    )
+                    _store_batch(database, chunk_ids, chunk_vectors)
+                    processed += len(chunk_ids)
+                    last_article_id = max(last_article_id or -1, chunk_ids[-1])
+                    _update_progress_manifest(
+                        manifest_path,
+                        manifest,
+                        dimension=dimension,
+                        last_article_id=last_article_id,
+                        rows=processed,
+                    )
+                    logger.info("Stored %s/%s article embeddings", processed, total)
+    finally:
+        for executor in executors:
+            executor.shutdown()
+
+    final_count, final_article_id = _embedding_progress(database)
+    manifest.update(
+        {
+            "complete": final_count == total,
+            "dimension": dimension,
+            "last_article_id": final_article_id,
+            "rows": final_count,
+        }
+    )
+    _atomic_json(manifest_path, manifest)
+    if not manifest["complete"]:
+        raise RuntimeError(f"Stored {final_count} embeddings for {total} source articles")
+    return manifest
+
+
+def _source_batches(database: Path, batch_size: int) -> Iterator[list[sqlite3.Row]]:
+    with _connect_readonly(database) as connection:
+        cursor = connection.execute(
+            """
+            SELECT a.article_id, a.title, ab.abstract
+            FROM articles a
+            JOIN abstracts ab ON ab.article_id = a.article_id
+            ORDER BY a.article_id
+            """
+        )
+        while rows := cursor.fetchmany(batch_size):
+            yield rows
+
+
+def _source_count(database: Path) -> int:
+    with _connect_readonly(database) as connection:
+        return int(
+            connection.execute(
                 """
+                SELECT COUNT(*)
+                FROM articles a
+                JOIN abstracts ab ON ab.article_id = a.article_id
+                """
+            ).fetchone()[0]
+        )
 
-        with create_engine(self.source_db_url).connect() as conn:
-            result = pd.read_sql_query(query, conn)
-            return result['total'].iloc[0]
 
-    def process_batch_from_db(self, batch_size: int) -> bool:
-        """Process a single batch from database using cursor-based pagination"""
-        if self.last_random_rank is None:
-            query = """
-                    SELECT a.article_id,
-                           a.title,
-                           ab.abstract,
-                           ao.random_rank
-                    FROM articles a
-                             JOIN abstracts ab ON a.article_id = ab.article_id
-                             JOIN articles_order ao ON a.article_id = ao.article_id
-                    ORDER BY ao.random_rank LIMIT :batch_size \
-                    """
-            params = {'batch_size': batch_size}
-        else:
-            query = """
-                    SELECT a.article_id,
-                           a.title,
-                           ab.abstract,
-                           ao.random_rank
-                    FROM articles a
-                             JOIN abstracts ab ON a.article_id = ab.article_id
-                             JOIN articles_order ao ON a.article_id = ao.article_id
-                    WHERE ao.random_rank > :last_rank
-                    ORDER BY ao.random_rank LIMIT :batch_size \
-                    """
-            params = {'last_rank': int(self.last_random_rank), 'batch_size': batch_size}
+def _existing_ids(database: Path, article_ids: Sequence[int]) -> set[int]:
+    existing: set[int] = set()
+    with sqlite3.connect(database) as connection:
+        for chunk in _chunks(article_ids, _SQLITE_IN_LIMIT):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"SELECT article_id FROM embeddings WHERE article_id IN ({placeholders})",
+                [str(article_id) for article_id in chunk],
+            )
+            existing.update(int(row[0]) for row in rows)
+    return existing
 
-        try:
-            logger.info(f"Querying articles with cursor at rank {self.last_random_rank}")
 
-            with create_engine(self.source_db_url).connect() as conn:
-                result = conn.execute(text(query), params)
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+def _validate_encoded_batch(
+    vectors: np.ndarray,
+    expected_rows: int,
+    dimension: int | None,
+) -> int:
+    vectors = np.asarray(vectors)
+    if vectors.ndim != 2 or vectors.shape[0] != expected_rows:
+        raise ValueError(
+            f"Encoder returned shape {vectors.shape} for {expected_rows} texts"
+        )
+    batch_dimension = int(vectors.shape[1])
+    if dimension is not None and dimension != batch_dimension:
+        raise ValueError(
+            f"Encoder returned dimension {batch_dimension}, expected {dimension}"
+        )
+    return batch_dimension
 
-            if df.empty:
-                logger.info("No more records found - batch processing complete")
-                return False
 
-            logger.info(f"Retrieved {len(df)} records from database")
+def _update_progress_manifest(
+    path: Path,
+    manifest: dict,
+    *,
+    dimension: int,
+    last_article_id: int,
+    rows: int,
+) -> None:
+    manifest.update(
+        {
+            "dimension": dimension,
+            "last_article_id": last_article_id,
+            "rows": rows,
+        }
+    )
+    _atomic_json(path, manifest)
 
-            # Update cursor position
-            if len(df) > 0:
-                self.last_random_rank = df['random_rank'].iloc[-1]
-                logger.info(f"Updated cursor to random_rank: {self.last_random_rank}")
-            else:
-                return False
 
-            # Get already processed IDs for this batch
-            processed_ids = self._get_processed_ids()
+def _initialize_database(database: Path) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings(
+                article_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
-            # Filter out already processed articles
-            unprocessed_df = df[~df['article_id'].isin(processed_ids)].copy()
 
-            if len(unprocessed_df) == 0:
-                logger.info("All articles in this batch already processed, continuing to next batch")
-                return True  # Continue to next batch
+def _embedding_progress(database: Path) -> tuple[int, int | None]:
+    with sqlite3.connect(database) as connection:
+        count, last_id = connection.execute(
+            "SELECT COUNT(*), MAX(CAST(article_id AS INTEGER)) FROM embeddings"
+        ).fetchone()
+    return int(count), int(last_id) if last_id is not None else None
 
-            logger.info(f"Processing {len(unprocessed_df)} unprocessed articles from batch")
 
-            # Prepare texts and article IDs
-            texts = []
-            article_ids = []
+def _stored_dimension(database: Path) -> int | None:
+    with sqlite3.connect(database) as connection:
+        row = connection.execute("SELECT embedding FROM embeddings LIMIT 1").fetchone()
+    return int(decode_embedding(row[0]).size) if row else None
 
-            for _, row in unprocessed_df.iterrows():
-                title = str(row['title']) if pd.notna(row['title']) else ""
-                abstract = str(row['abstract']) if pd.notna(row['abstract']) else ""
-                combined_text = f"{title} . {abstract}".strip()
 
-                texts.append(combined_text)
-                article_ids.append(int(row['article_id']))
+def _store_batch(
+    database: Path, article_ids: Sequence[int], vectors: np.ndarray
+) -> None:
+    payload = [
+        (int(article_id), sqlite3.Binary(encode_embedding(vector)))
+        for article_id, vector in zip(article_ids, vectors, strict=True)
+    ]
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO embeddings(article_id, embedding)
+            VALUES (?, ?)
+            """,
+            payload,
+        )
 
-            # Process batch - only parallelize the encoding part
-            if self.use_multiprocessing:
-                batch_result = self._encode_texts_parallel(texts, article_ids)
-            else:
-                batch_result = self._encode_texts_sequential(texts, article_ids)
 
-            self._save_embeddings_batch(batch_result)
+def _validate_resume(manifest: dict, config: dict) -> None:
+    for key in (
+        "artifact_version",
+        "database",
+        "model",
+        "text_format",
+        "source_database",
+        "source_size",
+    ):
+        if manifest.get(key) != config[key]:
+            raise ValueError(
+                f"Existing embedding artifact used {key}={manifest.get(key)!r}, "
+                f"not {config[key]!r}. Use a new --output-dir."
+            )
 
-            logger.info(f"Processed and saved {len(batch_result)} embeddings")
-            return True
 
-        except Exception as e:
-            logger.error(f"Error processing batch with cursor at rank {self.last_random_rank}: {e}")
-            return False
+def _connect_readonly(database: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(database.resolve()))}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.execute("PRAGMA query_only = ON")
+    return connection
 
-    def process_all_articles_from_db(self):
-        """Process all articles from database using cursor-based pagination"""
-        if not self.source_db_url:
-            raise ValueError("source_db_url must be provided to process from database")
 
-        logger.info("Getting total record count...")
-        total_records = self.get_total_records()
-        logger.info(f"Total records to process: {total_records}")
+def _chunks(values: Sequence[int], size: int) -> Iterator[list[int]]:
+    for start in range(0, len(values), size):
+        yield list(values[start : start + size])
 
-        if self.use_multiprocessing:
-            logger.info(f"Using {self.n_workers} worker processes")
-        else:
-            logger.info(f"Using sequential processing with {torch.get_num_threads()} threads")
 
-        batch_count = 0
-        total_processed = 0
+def _atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
-        # Get initial count of processed embeddings
-        initial_processed = len(self._get_processed_ids())
-        logger.info(f"Starting with {initial_processed} already processed embeddings")
 
-        with tqdm(total=total_records, desc="Processing articles") as pbar:
-            while True:
-                if not self.process_batch_from_db(self.batch_size):
-                    break
-
-                batch_count += 1
-
-                # Update progress every 10 batches
-                if batch_count % 10 == 0:
-                    current_processed = len(self._get_processed_ids())
-                    newly_processed = current_processed - initial_processed
-                    pbar.update(min(self.batch_size * 10, newly_processed - total_processed))
-                    total_processed = newly_processed
-
-                    logger.info(f"Batch {batch_count}: {current_processed:,} total embeddings stored, "
-                                f"{newly_processed:,} newly processed this session. "
-                                f"Cursor at rank: {self.last_random_rank}")
-
-        # Final update
-        final_processed = len(self._get_processed_ids())
-        logger.info(f"Processing complete! Total embeddings in database: {final_processed:,}")
-
-    def get_embedding(self, article_id):
-        """Retrieve embedding for a specific article"""
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT embedding FROM embeddings WHERE article_id = :article_id",
-                       {'article_id': int(article_id)})
-        result = cursor.fetchone()
-
-        conn.close()
-
-        if result:
-            return pickle.loads(result[0])
-        return None
-
-    def get_embeddings_batch(self, article_ids):
-        """Retrieve embeddings for multiple articles"""
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
-
-        # Convert article_ids to integers
-        article_ids_int = [int(aid) for aid in article_ids]
-        placeholders = ','.join([':id' + str(i) for i in range(len(article_ids_int))])
-        params = {f'id{i}': aid for i, aid in enumerate(article_ids_int)}
-
-        cursor.execute(f"SELECT article_id, embedding FROM embeddings WHERE article_id IN ({placeholders})", params)
-        results = cursor.fetchall()
-
-        conn.close()
-
-        embeddings_dict = {}
-        for article_id, embedding_blob in results:
-            embeddings_dict[article_id] = pickle.loads(embedding_blob)
-
-        return embeddings_dict
-
-    def test_embedding_integrity(self):
-        """Test that stored embeddings match freshly computed ones"""
-        logger.info("Testing embedding integrity...")
-
-        # Get a random article from the database
-        conn = sqlite3.connect(self.embeddings_db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT article_id FROM embeddings ORDER BY RANDOM() LIMIT 1")
-        result = cursor.fetchone()
-
-        if not result:
-            logger.warning("No embeddings found in database for testing")
-            return False
-
-        test_article_id = result[0]
-        conn.close()
-
-        # Get the stored embedding
-        stored_embedding = self.get_embedding(test_article_id)
-        if stored_embedding is None:
-            logger.error(f"Could not retrieve stored embedding for article {test_article_id}")
-            return False
-
-        # Get the original text for this article
-        with create_engine(self.source_db_url).connect() as conn:
-            result = conn.execute(text("""
-                                       SELECT a.title, ab.abstract
-                                       FROM articles a
-                                                JOIN abstracts ab ON a.article_id = ab.article_id
-                                       WHERE a.article_id = :article_id
-                                       """), {'article_id': test_article_id})
-
-            row = result.fetchone()
-            if not row:
-                logger.error(f"Could not find original text for article {test_article_id}")
-                return False
-
-            title = str(row[0]) if row[0] else ""
-            abstract = str(row[1]) if row[1] else ""
-            combined_text = f"{title} . {abstract}".strip()
-
-        # Compute fresh embedding
-        if not hasattr(self, 'model') or self.model is None:
-            self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-
-        fresh_embedding = self.model.encode([combined_text], show_progress_bar=False)[0]
-
-        # Compare embeddings using cosine similarity
-        dot_product = np.dot(stored_embedding, fresh_embedding)
-        norm_stored = np.linalg.norm(stored_embedding)
-        norm_fresh = np.linalg.norm(fresh_embedding)
-        cosine_similarity = dot_product / (norm_stored * norm_fresh)
-
-        # Check if embeddings are nearly identical (should be > 0.999)
-        threshold = 0.999
-        is_match = cosine_similarity > threshold
-
-        logger.info(f"Embedding integrity test for article {test_article_id}:")
-        logger.info(f"  Cosine similarity: {cosine_similarity:.6f}")
-        logger.info(f"  Threshold: {threshold}")
-        logger.info(f"  Test result: {'PASS' if is_match else 'FAIL'}")
-
-        if not is_match:
-            logger.error(f"Embedding integrity test FAILED! Similarity {cosine_similarity:.6f} < {threshold}")
-            logger.info(f"  Text: {combined_text[:100]}...")
-            logger.info(f"  Stored embedding shape: {stored_embedding.shape}")
-            logger.info(f"  Fresh embedding shape: {fresh_embedding.shape}")
-
-        return is_match
+def _read_json(path: Path) -> dict:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute article text embeddings.")
-    parser.add_argument("--db-path", default="articles.db", help="Read-only source corpus.")
-    parser.add_argument("--output-db", default="output/article_embeddings.db")
+    parser = argparse.ArgumentParser(
+        description="Compute a manifest-backed article text-embedding artifact."
+    )
+    parser.add_argument("--db-path", type=Path, default=Path("articles.db"))
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=1000)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--no-multiprocessing", action="store_true")
+    parser.add_argument(
+        "--encode-batch-size",
+        type=int,
+        default=None,
+        help="Encoder batch size (auto: 32 on CPU/MPS, 256 on CUDA).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Worker count (auto: 32 on CPU, one per visible GPU).",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Device override such as cpu, mps, cuda, or cuda:0 (default: auto).",
+    )
+    parser.add_argument("--resume", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = build_parser().parse_args(argv)
-    processor = TextEmbeddingProcessor(
-        embeddings_db_path=args.output_db,
-        source_db_url=f"sqlite:///{args.db_path}",
+    manifest = build_embeddings(
+        args.db_path,
+        args.output_dir,
+        model_name=args.model,
         batch_size=args.batch_size,
-        n_workers=args.workers,
-        use_multiprocessing=not args.no_multiprocessing,
+        encode_batch_size=args.encode_batch_size,
+        workers=args.workers,
+        device=args.device,
+        resume=args.resume,
     )
-    processor.process_all_articles_from_db()
+    print(json.dumps(manifest, indent=2))
     return 0
 
 

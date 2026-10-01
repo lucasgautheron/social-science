@@ -4,8 +4,10 @@ Each cluster-year count is a binomial proportion of that year's papers. Four
 curves compete, and the reported curve is the family with the highest Laplace
 evidence. An exact tie prefers the earlier family: trend, then step, then
 shock, then bump. The reported class is trend increasing, trend decreasing,
-step, shock, bump increasing, or bump decreasing. Trend and bump take the
-majority sign of their posterior draws. Step and shock are not split by sign.
+step, shock, bump increasing, or bump decreasing. A bump whose posterior mode
+is unidentified is bump unknown, and the other clusters still finish. Trend
+and an identified bump take the majority sign of their posterior draws. Step
+and shock are not split by sign.
 
     trend: logit p = intercept + beta * u
     step:  logit p = intercept + c * 1{year >= tau}
@@ -63,6 +65,7 @@ STEP_LABEL = "step"
 SHOCK_LABEL = "shock"
 BUMP_INCREASING = "bump increasing"
 BUMP_DECREASING = "bump decreasing"
+BUMP_UNKNOWN = "bump unknown"
 CLUSTER_TYPES = (
     TREND_INCREASING,
     TREND_DECREASING,
@@ -70,6 +73,7 @@ CLUSTER_TYPES = (
     SHOCK_LABEL,
     BUMP_INCREASING,
     BUMP_DECREASING,
+    BUMP_UNKNOWN,
 )
 MODEL_NAMES = ("trend", "step", "shock", "bump")
 TREND_SHAPES = (INCREASING, DECREASING)
@@ -447,21 +451,52 @@ def trend_record(
     trend: BreakFit,
     step: BreakFit,
     shock: BreakFit,
-    bump: BreakFit,
+    bump: BreakFit | None,
 ) -> dict[str, object]:
-    """Summarize the retained shift year of each curve and the winning family."""
-    fits = {"trend": trend, "step": step, "shock": shock, "bump": bump}
+    """Summarize the retained shift year of each curve and the winning family.
+
+    ``bump=None`` means the bump posterior mode is unidentified. That cluster
+    is classified as bump unknown, and the four-model probabilities are left
+    undefined. Trend, step, and shock summaries are still recorded.
+    """
+    fits = {"trend": trend, "step": step, "shock": shock}
     evidences = {name: float(fit.log_evidence) for name, fit in fits.items()}
-    probabilities = posterior_model_probabilities([evidences[name] for name in MODEL_NAMES])
-    probability = dict(zip(MODEL_NAMES, probabilities, strict=True))
-    winner = preferred_model(evidences)
     shares = {
         "trend": _class_share(signed_labels(trend.parameters["beta"], INCREASING, DECREASING), TREND_SHAPES),
         "step": _class_share(signed_labels(step.parameters["c"], STEP_UP, STEP_DOWN), STEP_SHAPES),
         "shock": _class_share(signed_labels(shock.parameters["c"], SHOCK_UP, SHOCK_DOWN), SHOCK_SHAPES),
-        "bump": _class_share(signed_labels(bump.parameters["amplitude"], INVERTED_U, U_SHAPE), BUMP_SHAPES),
     }
-    runner_up = max(evidences[name] for name in MODEL_NAMES if name != winner)
+    if bump is None:
+        evidences["bump"] = float("nan")
+        probability = {name: float("nan") for name in MODEL_NAMES}
+        winner = "bump"
+        compatible = BUMP_UNKNOWN
+        bayes_factor = float("nan")
+        shares["bump"] = {INVERTED_U: float("nan"), U_SHAPE: float("nan")}
+        bump_break_year = float("nan")
+        bump_divergences = float("nan")
+        bump_rhat_max = float("nan")
+        bump_intercept = (float("nan"), float("nan"))
+        bump_amplitude = (float("nan"), float("nan"))
+        bump_width = (float("nan"), float("nan"))
+    else:
+        evidences["bump"] = float(bump.log_evidence)
+        probabilities = posterior_model_probabilities([evidences[name] for name in MODEL_NAMES])
+        probability = dict(zip(MODEL_NAMES, probabilities, strict=True))
+        winner = preferred_model(evidences)
+        shares["bump"] = _class_share(
+            signed_labels(bump.parameters["amplitude"], INVERTED_U, U_SHAPE),
+            BUMP_SHAPES,
+        )
+        compatible = _reported_type(winner, shares)
+        runner_up = max(evidences[name] for name in MODEL_NAMES if name != winner)
+        bayes_factor = evidences[winner] - runner_up
+        bump_break_year = float(bump.break_year)
+        bump_divergences = int(bump.divergences)
+        bump_rhat_max = float(bump.rhat_max)
+        bump_intercept = _mean_sd(np.asarray(bump.parameters["intercept"]))
+        bump_amplitude = _mean_sd(np.asarray(bump.parameters["amplitude"]))
+        bump_width = _mean_sd(np.asarray(bump.parameters["width"]))
     trend_intercept = _mean_sd(np.asarray(trend.parameters["intercept"]))
     trend_slope = _mean_sd(np.asarray(trend.parameters["beta"]))
     step_intercept = _mean_sd(np.asarray(step.parameters["intercept"]))
@@ -469,9 +504,6 @@ def trend_record(
     shock_intercept = _mean_sd(np.asarray(shock.parameters["intercept"]))
     shock_jump = _mean_sd(np.asarray(shock.parameters["c"]))
     shock_half_life = _mean_sd(np.asarray(shock.parameters["half_life"]))
-    bump_intercept = _mean_sd(np.asarray(bump.parameters["intercept"]))
-    bump_amplitude = _mean_sd(np.asarray(bump.parameters["amplitude"]))
-    bump_width = _mean_sd(np.asarray(bump.parameters["width"]))
     return {
         "level": int(series.level),
         "group": int(series.group),
@@ -481,16 +513,16 @@ def trend_record(
         "successes_total": int(series.successes.sum()),
         "trials_total": int(series.trials.sum()),
         "preferred_model": winner,
-        "compatible": _reported_type(winner, shares),
+        "compatible": compatible,
         "trend_break_year": int(trend.break_year),
         "step_break_year": int(step.break_year),
         "shock_break_year": int(shock.break_year),
-        "bump_break_year": float(bump.break_year),
+        "bump_break_year": bump_break_year,
         "trend_log_evidence": evidences["trend"],
         "step_log_evidence": evidences["step"],
         "shock_log_evidence": evidences["shock"],
         "bump_log_evidence": evidences["bump"],
-        "log_bayes_factor": evidences[winner] - runner_up,
+        "log_bayes_factor": bayes_factor,
         "trend_posterior": float(probability["trend"]),
         "step_posterior": float(probability["step"]),
         "shock_posterior": float(probability["shock"]),
@@ -529,11 +561,11 @@ def trend_record(
         "trend_divergences": int(trend.divergences),
         "step_divergences": int(step.divergences),
         "shock_divergences": int(shock.divergences),
-        "bump_divergences": int(bump.divergences),
+        "bump_divergences": bump_divergences,
         "trend_rhat_max": float(trend.rhat_max),
         "step_rhat_max": float(step.rhat_max),
         "shock_rhat_max": float(shock.rhat_max),
-        "bump_rhat_max": float(bump.rhat_max),
+        "bump_rhat_max": bump_rhat_max,
     }
 
 
@@ -777,15 +809,23 @@ def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
             for name in _PROFILED_MODELS
         }
         _set_counts(pm, models["bump"], successes, trials)
+        bump_unidentified = False
         try:
             bump_log_evidence = float(evidence["bump"].log_evidence())
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"Bump posterior mode is unidentified for level {task.level} group {group}"
-            ) from exc
+        except RuntimeError:
+            bump_unidentified = True
+            bump_log_evidence = float("nan")
+            logger.warning(
+                "Level %s group %s bump posterior mode is unidentified; classifying as %s",
+                task.level,
+                group,
+                BUMP_UNKNOWN,
+            )
         fits = {}
         for offset, name in enumerate(MODEL_NAMES):
             if name == "bump":
+                if bump_unidentified:
+                    continue
                 inference = _sample_model(
                     pm,
                     models[name],
@@ -798,9 +838,14 @@ def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
                 center = np.asarray(inference.posterior["tau"].values, dtype=np.float64).ravel()
                 center_year = float(np.mean(center))
                 if not np.isfinite(center_year):
-                    raise RuntimeError(
-                        f"Bump center is unidentified for level {task.level} group {group}"
+                    bump_unidentified = True
+                    logger.warning(
+                        "Level %s group %s bump center is unidentified; classifying as %s",
+                        task.level,
+                        group,
+                        BUMP_UNKNOWN,
                     )
+                    continue
                 fits[name] = _break_fit(
                     az,
                     inference,
@@ -842,7 +887,7 @@ def _fit_worker(task: _WorkerTask) -> list[dict[str, object]]:
             trend=fits["trend"],
             step=fits["step"],
             shock=fits["shock"],
-            bump=fits["bump"],
+            bump=None if bump_unidentified else fits["bump"],
         )
         logger.info(
             "Level %s group %s: preferred %s, compatible %s, break %s, log Bayes factor %.2f",

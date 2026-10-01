@@ -155,9 +155,11 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "average_all_link_distance,all_link_connected_count,"
         "all_link_disconnected_count,all_link_existing_count,"
         "all_link_observation_count,new_link_distance_distribution,"
-        "all_link_distance_distribution,outside_cluster_distance_distribution\n"
-        '0,beta,4,2.5,8,2,1.25,10,2,2,12,"[[1,8],[2,2]]","[[0,2],[2,8]]","[[2,20],[3,5]]"\n'
-        '1,gamma,2,nan,0,3,3.0,4,3,1,7,[],"[[0,1],[3,3]]","[[2,20],[3,5]]"\n',
+        "all_link_distance_distribution,outside_cluster_distance_distribution,"
+        "new_link_distance_by_year,all_link_distance_by_year\n"
+        '0,beta,4,2.5,8,2,1.25,10,2,2,12,"[[1,8],[2,2]]","[[0,2],[2,8]]","[[2,20],[3,5]]",'
+        '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]"\n'
+        '1,gamma,2,nan,0,3,3.0,4,3,1,7,[],"[[0,1],[3,3]]","[[2,20],[3,5]]",[],[]\n',
         encoding="utf-8",
     )
     (clusters_dir / "cluster_trends.csv").write_text(
@@ -182,6 +184,14 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert first["yearly"] == payload["cluster_list"][0]["yearly"]
     assert first["average_new_link_distance"] == 2.5
     assert first["new_link_distance_distribution"] == [[1, 8.0], [2, 2.0]]
+    assert first["new_link_distance_by_year"] == [
+        {"year": 2020, "distance": 2.5},
+        {"year": 2021, "distance": 1.5},
+    ]
+    assert first["all_link_distance_by_year"] == [
+        {"year": 2020, "distance": 1.25},
+    ]
+    assert second["new_link_distance_by_year"] == []
     assert first["outside_cluster_distance_distribution"] == [
         [2, 20.0],
         [3, 5.0],
@@ -218,6 +228,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
     assert "scatter-point" in script
     assert "Connected-distance distribution" in script
+    assert "Mean distance by year" in script
     assert "New links outside clusters" in script
     assert "All paper links" in script
     assert "All clusters" not in script
@@ -232,6 +243,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "shock",
         "bump increasing",
         "bump decreasing",
+        "bump unknown",
     ):
         assert f'data-cluster-type="{cluster_type}"' in page
     assert "matchesType" in script

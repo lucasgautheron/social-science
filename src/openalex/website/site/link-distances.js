@@ -23,6 +23,7 @@
       connected: "new_link_connected_count",
       disconnected: "new_link_disconnected_count",
       distribution: "new_link_distance_distribution",
+      yearly: "new_link_distance_by_year",
       label: "Average first-link distance",
       description: "first coauthorship links",
     },
@@ -31,6 +32,7 @@
       connected: "all_link_connected_count",
       disconnected: "all_link_disconnected_count",
       distribution: "all_link_distance_distribution",
+      yearly: "all_link_distance_by_year",
       label: "Average distance across all paper links",
       description: "all coauthor-pair observations on cluster papers",
     },
@@ -100,7 +102,7 @@
       <div class="empty">
         <p class="eyebrow">Event cluster</p>
         <h2>Explore the points</h2>
-        <p>Each visible point is one matching cluster. Hover it to see its temporal curve and distance distribution.</p>
+        <p>Each visible point is one matching cluster. Hover it to see its temporal curves and distance distribution.</p>
       </div>
     `;
   }
@@ -158,6 +160,63 @@
     chart.setAttribute(
       "aria-label",
       `Share of papers by year: ${values.map((item) => `${item.year} ${formatPercent(item.share)}`).join(", ")}`,
+    );
+    return chart;
+  }
+
+  function distanceYearChart(values) {
+    const chart = svgNode("svg", {
+      class: "line-chart link-curve",
+      viewBox: "0 0 340 180",
+      role: "img",
+    });
+    if (!values.length) {
+      const message = svgNode("text", { class: "axis-label", x: 16, y: 30 });
+      message.textContent = "No yearly distance observations";
+      chart.append(message);
+      return chart;
+    }
+    const padding = { left: 52, right: 12, top: 16, bottom: 30 };
+    const years = values.map((item) => Number(item.year));
+    const distances = values.map((item) => Number(item.distance) || 0);
+    const minYear = Math.min(...years);
+    const maxYear = Math.max(...years);
+    const maxDistance = Math.max(0, ...distances);
+    const scale = maxDistance || 1;
+    const x = (year) => padding.left + ((year - minYear) / Math.max(1, maxYear - minYear)) * (340 - padding.left - padding.right);
+    const y = (distance) => 180 - padding.bottom - (distance / scale) * (180 - padding.top - padding.bottom);
+    chart.append(
+      svgNode("path", {
+        class: "axis",
+        d: `M ${padding.left} ${padding.top} V ${180 - padding.bottom} H ${340 - padding.right}`,
+      }),
+      svgNode("path", {
+        class: "series",
+        d: values.map((item, index) => `${index ? "L" : "M"} ${x(Number(item.year))} ${y(Number(item.distance) || 0)}`).join(" "),
+      }),
+    );
+    for (const item of values) {
+      const point = svgNode("circle", {
+        class: "series-point",
+        cx: x(Number(item.year)),
+        cy: y(Number(item.distance) || 0),
+        r: 3.5,
+      });
+      const title = svgNode("title");
+      title.textContent = `${item.year}: mean distance ${formatDistance(item.distance)}`;
+      point.append(title);
+      chart.append(point);
+    }
+    const start = svgNode("text", { class: "axis-label", x: padding.left, y: 172 });
+    start.textContent = String(minYear);
+    const finish = svgNode("text", { class: "axis-label end", x: 340 - padding.right, y: 172 });
+    finish.textContent = String(maxYear);
+    const maximum = svgNode("text", { class: "axis-label", x: 4, y: padding.top + 4 });
+    maximum.textContent = formatDistance(maxDistance);
+    chart.append(start, finish, maximum);
+    chart.setAttribute(
+      "aria-label",
+      `Mean connected distance by year: ${values.map((item) => `${item.year} ${formatDistance(item.distance)}`).join(", ")}`,
     );
     return chart;
   }
@@ -312,6 +371,8 @@
     }
     const chartTitle = document.createElement("h3");
     chartTitle.textContent = "Share of papers by year";
+    const yearlyDistanceTitle = document.createElement("h3");
+    yearlyDistanceTitle.textContent = "Mean distance by year";
     const distanceTitle = document.createElement("h3");
     distanceTitle.textContent = "Connected-distance distribution";
     const legend = document.createElement("div");
@@ -324,6 +385,8 @@
       stats,
       chartTitle,
       lineChart(row.yearly || []),
+      yearlyDistanceTitle,
+      distanceYearChart(row[config.yearly] || []),
       distanceTitle,
       legend,
       distributionChart(row),

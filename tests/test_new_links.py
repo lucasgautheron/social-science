@@ -232,12 +232,14 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert stats["disconnected_pair_observations"].tolist() == [0, 0]
         assert stats["new_connected_pair_observations"].tolist() == [2, 1]
         assert stats["reservoir_new_acceptances"].tolist() == [2, 1]
+        assert stats["new_connected_distance_sum"].tolist() == [4, 2]
         assert stats["existing_pair_observations"].tolist() == [0, 0]
     with np.load(output / "cluster_years" / "2021.npz", allow_pickle=False) as stats:
         assert stats["connected_pair_observations"].tolist() == [1, 0]
         assert stats["disconnected_pair_observations"].tolist() == [2, 3]
         assert stats["new_connected_pair_observations"].tolist() == [0, 0]
         assert stats["reservoir_new_acceptances"].tolist() == [0, 0]
+        assert stats["new_connected_distance_sum"].tolist() == [0, 0]
         assert stats["existing_pair_observations"].tolist() == [1, 0]
     with np.load(
         output / "cluster_distance_reservoir.npz", allow_pickle=False
@@ -632,6 +634,11 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert int(rows[0]["all_link_distance_sample_count"]) == 2
     assert int(rows[0]["all_link_disconnected_count"]) == 2
     assert json.loads(rows[0]["new_link_distance_distribution"]) == [[2, 1.0]]
+    assert json.loads(rows[0]["new_link_distance_by_year"]) == [[2020, 2.0]]
+    assert json.loads(rows[0]["all_link_distance_by_year"]) == [
+        [2020, 2.0],
+        [2021, 1.0],
+    ]
     assert json.loads(rows[0]["all_link_distance_distribution"]) == [
         [1, 1.0],
         [2, 2.0],

@@ -230,6 +230,34 @@ class ArtifactTests(unittest.TestCase):
             aws_run.pipeline_command(args),
             "openalex events --min-ngram 2",
         )
+        self.assertEqual(args.worker, "cpu")
+
+    def test_submit_can_select_gpu_worker(self):
+        args = aws_run.build_parser().parse_args(
+            ["submit", "--worker", "gpu", "--", "openalex", "embeddings"]
+        )
+        self.assertEqual(args.worker, "gpu")
+
+    def test_last_run_history_is_retained_per_worker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "last-run.json"
+            aws_run.record_last_run(path, "cpu-run", "cpu")
+            aws_run.record_last_run(path, "gpu-run", "gpu")
+            recorded = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(recorded["last_run_id"], "gpu-run")
+            self.assertEqual(recorded["by_worker"]["cpu"]["run_id"], "cpu-run")
+            self.assertEqual(recorded["by_worker"]["gpu"]["run_id"], "gpu-run")
+
+            cpu_args = aws_run.build_parser().parse_args(
+                [
+                    "status",
+                    "--worker",
+                    "cpu",
+                    "--last-run-path",
+                    str(path),
+                ]
+            )
+            self.assertEqual(aws_run.resolve_run_id(cpu_args), "cpu-run")
 
     def test_remote_runner_uses_versioned_persistent_cache(self):
         args = aws_run.build_parser().parse_args(
@@ -264,6 +292,10 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("sys.version_info < (3, 11)", script)
         self.assertIn('rm -rf "$VENV_DIR"', script)
         self.assertIn('"$PYTHON_BIN" -m venv "$VENV_DIR"', script)
+        self.assertIn(
+            "[analysis,website,parquet,aws,download,embeddings,topics]",
+            script,
+        )
         self.assertIn("hashlib.sha256()", script)
         self.assertNotIn("shasum", script)
         self.assertIn(
@@ -294,6 +326,154 @@ class ArtifactTests(unittest.TestCase):
             "Submitted remote command",
         )
         self.assertEqual(status["inputs"], args.prepared_inputs)
+        self.assertEqual(status["worker"], "cpu")
+
+    def test_gpu_remote_runner_validates_cuda(self):
+        args = aws_run.build_parser().parse_args(
+            ["submit", "--worker", "gpu", "--", "openalex", "embeddings"]
+        )
+        args.prepared_inputs = []
+        state = {
+            **self.state,
+            "worker": "gpu",
+            "instance_type": "g6.8xlarge",
+            "repo_url": "https://example.test/repo.git",
+            "db_s3_uri": "s3://bucket/input/articles.db",
+            "region": "us-east-1",
+        }
+        script = aws_run.build_remote_runner_script(
+            state=state,
+            args=args,
+            run_id=self.run_id,
+            command=aws_run.pipeline_command(args),
+        )
+        self.assertIn("GPU_WORKER=1", script)
+        self.assertIn("nvidia-smi", script)
+        self.assertIn("torch.cuda.is_available()", script)
+        self.assertIn("WORKER=gpu", script)
+
+    def test_cancel_targets_the_instance_recorded_by_the_run(self):
+        args = aws_run.build_parser().parse_args(
+            ["cancel", "--run-id", "gpu-run"]
+        )
+        state = {
+            "bucket": "bucket",
+            "prefix": "project",
+            "region": "us-east-1",
+            "default_worker": "cpu",
+            "workers": {
+                "cpu": {"instance_id": "i-cpu", "instance_type": "i4i.8xlarge"},
+                "gpu": {"instance_id": "i-gpu", "instance_type": "g6.8xlarge"},
+            },
+        }
+        sent = []
+
+        class Session:
+            def client(self, name):
+                self.name = name
+                return object()
+
+        with (
+            mock.patch.object(aws_run, "load_state", return_value=state),
+            mock.patch.object(aws_run, "boto3_session", return_value=Session()),
+            mock.patch.object(
+                aws_run,
+                "get_s3_json",
+                return_value={
+                    "run_id": "gpu-run",
+                    "worker": "gpu",
+                    "instance_id": "i-gpu",
+                    "scratch_dir": "/scratch",
+                },
+            ),
+            mock.patch.object(
+                aws_run,
+                "send_ssm_command",
+                side_effect=lambda _session, instance_id, _script, _run_id: (
+                    sent.append(instance_id) or "command-1"
+                ),
+            ),
+            mock.patch.object(aws_run, "put_s3_json"),
+            mock.patch.object(aws_run, "require_boto3", return_value=(None, Exception)),
+        ):
+            self.assertEqual(aws_run.command_cancel(args), 0)
+
+        self.assertEqual(sent, ["i-gpu"])
+
+    def test_submit_routes_to_selected_gpu_and_records_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            last_run = Path(temp_dir) / "last-run.json"
+            args = aws_run.build_parser().parse_args(
+                [
+                    "submit",
+                    "--worker",
+                    "gpu",
+                    "--run-id",
+                    "gpu-run",
+                    "--last-run-path",
+                    str(last_run),
+                    "--",
+                    "openalex",
+                    "embeddings",
+                ]
+            )
+            state = {
+                "bucket": "bucket",
+                "prefix": "project",
+                "region": "us-east-1",
+                "repo_url": "https://example.test/repo.git",
+                "db_s3_uri": "s3://bucket/input/articles.db",
+                "default_worker": "cpu",
+                "workers": {
+                    "cpu": {
+                        "instance_id": "i-cpu",
+                        "instance_type": "i4i.8xlarge",
+                    },
+                    "gpu": {
+                        "instance_id": "i-gpu",
+                        "instance_type": "g6.8xlarge",
+                    },
+                },
+            }
+            started = []
+            sent = []
+
+            class Session:
+                def client(self, _name):
+                    return object()
+
+            with (
+                mock.patch.object(aws_run, "load_state", return_value=state),
+                mock.patch.object(aws_run, "boto3_session", return_value=Session()),
+                mock.patch.object(
+                    aws_run,
+                    "publish_input_artifacts",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    aws_run,
+                    "ensure_instance_running",
+                    side_effect=lambda _session, selected, **_kwargs: started.append(
+                        selected["instance_id"]
+                    ),
+                ),
+                mock.patch.object(aws_run, "put_s3_json"),
+                mock.patch.object(aws_run, "put_s3_text"),
+                mock.patch.object(
+                    aws_run,
+                    "send_ssm_command",
+                    side_effect=lambda _session, instance_id, _script, _run_id: (
+                        sent.append(instance_id) or "command-1"
+                    ),
+                ),
+            ):
+                self.assertEqual(aws_run.command_submit(args), 0)
+
+            self.assertEqual(started, ["i-gpu"])
+            self.assertEqual(sent, ["i-gpu"])
+            history = json.loads(last_run.read_text(encoding="utf-8"))
+            self.assertEqual(history["last_worker"], "gpu")
+            self.assertEqual(history["by_worker"]["gpu"]["run_id"], "gpu-run")
 
     def test_launcher_mounts_instance_store_before_creating_run_directory(self):
         args = aws_run.build_parser().parse_args(

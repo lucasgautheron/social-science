@@ -65,6 +65,12 @@ def build_cluster_link_plots(
     new_distance_histograms: list[defaultdict[int, float]] = [
         defaultdict(float) for _ in range(cluster_count)
     ]
+    new_distance_by_year: list[list[list[int | float]]] = [
+        [] for _ in range(cluster_count)
+    ]
+    all_distance_by_year: list[list[list[int | float]]] = [
+        [] for _ in range(cluster_count)
+    ]
     outside_cluster_distance_histogram: defaultdict[int, float] = defaultdict(float)
 
     cluster_years_dir = root / manifest["cluster_years_dir"]
@@ -77,11 +83,12 @@ def build_cluster_link_plots(
             )
         attributed = link_clusters >= 0
         connected = attributed & (distances >= 0)
-        new_distance_sum += np.bincount(
+        year_new_sum = np.bincount(
             link_clusters[connected],
             weights=distances[connected] * sampling_weight[connected],
             minlength=cluster_count,
         )
+        new_distance_sum += year_new_sum
         for cluster in np.unique(link_clusters[connected]):
             members = connected & (link_clusters == cluster)
             values, inverse = np.unique(distances[members], return_inverse=True)
@@ -104,12 +111,21 @@ def build_cluster_link_plots(
             outside_cluster_distance_histogram[int(distance)] += float(total)
 
         with np.load(cluster_years_dir / f"{year}.npz", allow_pickle=False) as stats:
-            new_connected += stats["attributed_new_link_connected"]
+            year_new_connected = stats["attributed_new_link_connected"]
+            new_connected += year_new_connected
             new_disconnected += stats["attributed_new_link_disconnected"]
             all_connected += stats["connected_pair_observations"]
             all_disconnected += stats["disconnected_pair_observations"]
             all_existing += stats["existing_pair_observations"]
             all_total += stats["total_pair_observations"]
+            _append_yearly_means(
+                year,
+                year_new_sum,
+                year_new_connected,
+                stats,
+                new_distance_by_year,
+                all_distance_by_year,
+            )
 
     with np.load(
         root / manifest["cluster_distance_reservoir"], allow_pickle=False
@@ -167,6 +183,8 @@ def build_cluster_link_plots(
         new_distance_histograms,
         all_distance_histograms,
         outside_cluster_distance_histogram,
+        new_distance_by_year,
+        all_distance_by_year,
     )
 
     output.mkdir(parents=True, exist_ok=True)
@@ -215,6 +233,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         dpi=args.dpi,
     )
     return 0
+
+
+def _append_yearly_means(
+    year: int,
+    year_new_sum: np.ndarray,
+    year_new_connected: np.ndarray,
+    stats: np.lib.npyio.NpzFile,
+    new_distance_by_year: list[list[list[int | float]]],
+    all_distance_by_year: list[list[list[int | float]]],
+) -> None:
+    """Record connected-only means for one year.
+
+    First-link means use the same weighted sum and exact connected count as
+    the scatter. All-link means scale the year's reservoir-acceptance distances
+    up to that year's new observations and count each existing link as 1.
+    """
+    for cluster, count in enumerate(year_new_connected):
+        if int(count) > 0:
+            new_distance_by_year[cluster].append(
+                [int(year), float(year_new_sum[cluster]) / int(count)]
+            )
+    if "new_connected_distance_sum" not in stats:
+        return
+    distance_sums = stats["new_connected_distance_sum"].astype(np.float64, copy=False)
+    acceptances = stats["reservoir_new_acceptances"].astype(np.int64, copy=False)
+    populations = stats["new_connected_pair_observations"].astype(np.int64, copy=False)
+    existing_counts = stats["existing_pair_observations"].astype(np.int64, copy=False)
+    if distance_sums.shape != year_new_connected.shape:
+        raise ValueError(f"Year {year} distance sums do not align with clusters")
+    for cluster in range(year_new_connected.size):
+        population = int(populations[cluster])
+        sample_count = int(acceptances[cluster])
+        existing_count = int(existing_counts[cluster])
+        connected = population + existing_count
+        if connected <= 0:
+            continue
+        if population == 0:
+            mean = 1.0
+        elif sample_count <= 0:
+            continue
+        else:
+            mean = (
+                float(distance_sums[cluster]) / sample_count * population
+                + existing_count
+            ) / connected
+        all_distance_by_year[cluster].append([int(year), mean])
 
 
 def _safe_average(total: np.ndarray, count: np.ndarray) -> np.ndarray:
@@ -290,6 +354,8 @@ def _summary_rows(
     new_distance_histograms: Sequence[Mapping[int, float]],
     all_distance_histograms: Sequence[Mapping[int, float]],
     outside_cluster_distance_histogram: Mapping[int, float],
+    new_distance_by_year: Sequence[Sequence[Sequence[int | float]]],
+    all_distance_by_year: Sequence[Sequence[Sequence[int | float]]],
 ) -> list[dict[str, object]]:
     new_highlighted = set(int(index) for index in new_selection.highlighted)
     all_highlighted = set(int(index) for index in all_selection.highlighted)
@@ -308,6 +374,9 @@ def _summary_rows(
                 "new_link_highlighted": index in new_highlighted,
                 "new_link_distance_distribution": _distribution_json(
                     new_distance_histograms[index]
+                ),
+                "new_link_distance_by_year": _series_json(
+                    new_distance_by_year[index]
                 ),
                 "outside_cluster_distance_distribution": _distribution_json(
                     outside_cluster_distance_histogram
@@ -329,9 +398,19 @@ def _summary_rows(
                 "all_link_distance_distribution": _distribution_json(
                     all_distance_histograms[index]
                 ),
+                "all_link_distance_by_year": _series_json(
+                    all_distance_by_year[index]
+                ),
             }
         )
     return rows
+
+
+def _series_json(points: Sequence[Sequence[int | float]]) -> str:
+    return json.dumps(
+        [[int(year), float(mean)] for year, mean in points],
+        separators=(",", ":"),
+    )
 
 
 def _distribution_json(histogram: Mapping[int, float]) -> str:
@@ -357,6 +436,7 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "new_link_size_quantile",
         "new_link_highlighted",
         "new_link_distance_distribution",
+        "new_link_distance_by_year",
         "outside_cluster_distance_distribution",
         "average_all_link_distance",
         "all_link_connected_count",
@@ -369,6 +449,7 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "all_link_size_quantile",
         "all_link_highlighted",
         "all_link_distance_distribution",
+        "all_link_distance_by_year",
     ]
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", newline="", encoding="utf-8") as handle:

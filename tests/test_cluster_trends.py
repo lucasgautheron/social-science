@@ -7,6 +7,7 @@ import pytest
 from openalex.analysis.cluster_trends import (
     BUMP_DECREASING,
     BUMP_INCREASING,
+    BUMP_UNKNOWN,
     DECREASING,
     FIELDNAMES,
     INCREASING,
@@ -315,6 +316,24 @@ def test_trend_record_keeps_the_trend_on_a_tie_and_saves_every_family():
     assert outside_row["bump_break_year"] == pytest.approx(2031.25)
     assert outside_row["compatible"] == BUMP_INCREASING
     assert tied["log_bayes_factor"] == pytest.approx(0.0)
+    unknown = trend_record(
+        series,
+        time_mean=time_mean,
+        time_scale=time_scale,
+        trend=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
+        step=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
+        shock=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
+        bump=None,
+    )
+    assert unknown["preferred_model"] == "bump"
+    assert unknown["compatible"] == BUMP_UNKNOWN
+    assert unknown["trend_log_evidence"] == pytest.approx(0.0)
+    assert np.isnan(unknown["bump_log_evidence"])
+    assert np.isnan(unknown["log_bayes_factor"])
+    assert np.isnan(unknown["bump_posterior"])
+    assert np.isnan(unknown["bump_break_year"])
+    assert np.isnan(unknown["p_inverted_u"])
+    assert set(unknown) == set(FIELDNAMES)
 
 
 def test_write_trend_csv_round_trips_the_header(tmp_path):
