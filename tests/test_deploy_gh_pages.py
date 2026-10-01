@@ -95,3 +95,10 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
         == str(visualizations)
     )
     assert arguments[arguments.index("--incidence-workers") + 1] == "16"
+    assert "--trends" not in arguments
+    trends = tmp_path / "cluster_trends.csv"
+    trends.write_text("level,group,compatible\n", encoding="utf-8")
+    env["OPENALEX_CLUSTER_TRENDS"] = str(trends)
+    run([str(DEPLOY), str(events)], cwd=root, env=env)
+    arguments = (tmp_path / "build-args").read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--trends") + 1] == str(trends)

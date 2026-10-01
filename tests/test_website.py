@@ -104,12 +104,13 @@ def test_complete_linkage_and_coarse_matrix_preserve_counts(tmp_path):
     assert result["coarse"].sum() == result["matrix"].sum()
 
 
-def test_website_has_four_pages_and_exact_paper_unions(tmp_path):
+def test_website_pages_and_exact_paper_unions(tmp_path):
     event_dir = tmp_path / "events"
     site_dir = tmp_path / "site"
     write_event_fixture(event_dir)
     site_dir.mkdir()
     (site_dir / "progress.html").write_text("stale", encoding="utf-8")
+    (site_dir / "app.js").write_text("stale keywords", encoding="utf-8")
     summary = build_website(
         event_dir,
         output_dir=site_dir,
@@ -118,13 +119,19 @@ def test_website_has_four_pages_and_exact_paper_unions(tmp_path):
         cluster_similarity=0.5,
     )
     assert summary["dendrogram_keywords"] == 3
-    assert (site_dir / "index.html").is_file()
+    index = (site_dir / "index.html").read_text(encoding="utf-8")
+    assert "dendrogram.html" in index
+    assert "Top keywords" not in index
     assert (site_dir / "dendrogram.html").is_file()
     assert (site_dir / "clusters.html").is_file()
     assert (site_dir / "link-distances.html").is_file()
+    assert not (site_dir / "app.js").exists()
     assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
+    for page in ("dendrogram.html", "clusters.html", "link-distances.html"):
+        assert "Top keywords" not in (site_dir / page).read_text(encoding="utf-8")
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    assert "top_keywords" not in payload
     assert payload["cluster_list"] is None
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta", "gamma"}
@@ -182,6 +189,32 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert second["average_new_link_distance"] is None
     assert first["cluster_type"] == "shock"
     assert second["cluster_type"] is None
+    external = tmp_path / "cluster_trends.csv"
+    external.write_text(
+        "level,group,compatible\n0,0,step\n",
+        encoding="utf-8",
+    )
+    build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        new_link_visualizations_dir=plots_dir,
+        output_dir=site_dir,
+        trends=external,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+    )
+    labeled = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    assert labeled["link_distances"][0]["cluster_type"] == "step"
+    with pytest.raises(ValueError, match="Cluster trends not found"):
+        build_website(
+            event_dir,
+            clusters_dir=clusters_dir,
+            new_link_visualizations_dir=plots_dir,
+            output_dir=site_dir,
+            trends=tmp_path / "missing-trends.csv",
+            min_document_frequency=2,
+            max_dendrogram_keywords=10,
+        )
     script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
     assert "scatter-point" in script
     assert "Connected-distance distribution" in script
@@ -277,7 +310,6 @@ def test_website_uses_genuine_keywords_when_available(tmp_path):
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta"}
-    assert [item["keyword"] for item in payload["top_keywords"]] == ["beta", "alpha"]
     assert payload["cluster_list"][0]["keywords"] == ["beta", "alpha"]
     assert payload["cluster_list"][0]["papers"] == 4
 

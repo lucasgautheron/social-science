@@ -23,14 +23,12 @@ from scipy.spatial.distance import squareform
 
 DEFAULT_CLUSTER_SIMILARITY = 0.5
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 10
-DEFAULT_TOP_KEYWORDS = 100
 DEFAULT_MAX_DENDROGRAM_KEYWORDS = 500
 SITE_ASSETS = (
     "index.html",
     "dendrogram.html",
     "clusters.html",
     "link-distances.html",
-    "app.js",
     "dendrogram.js",
     "clusters.js",
     "link-distances.js",
@@ -645,15 +643,25 @@ def build_cluster_list(
     return _cluster_rows(prepared, yearly_counts, papers_by_year, total_documents)
 
 
-def load_cluster_types(clusters_dir: str | Path, level: int) -> dict[int, str]:
+def load_cluster_types(
+    clusters_dir: str | Path,
+    level: int,
+    trends: str | Path | None = None,
+) -> dict[int, str]:
     """Read the six-way class of each cluster at one hierarchy level.
 
-    Missing ``cluster_trends.csv`` means no classes are available. The class
-    is the ``compatible`` column written by cluster-trends.
+    ``trends`` is the cluster-trends CSV. When omitted, ``cluster_trends.csv``
+    inside ``clusters_dir`` is used, and a missing file means no classes are
+    available. The class is the ``compatible`` column.
     """
-    path = Path(clusters_dir).expanduser().resolve() / "cluster_trends.csv"
-    if not path.is_file():
-        return {}
+    if trends is None:
+        path = Path(clusters_dir).expanduser().resolve() / "cluster_trends.csv"
+        if not path.is_file():
+            return {}
+    else:
+        path = Path(trends).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"Cluster trends not found: {path}")
     types: dict[int, str] = {}
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -783,13 +791,13 @@ def build_website(
     *,
     clusters_dir: str | Path | None = None,
     output_dir: str | Path = "output/website",
-    top_keywords: int = DEFAULT_TOP_KEYWORDS,
     min_document_frequency: int = DEFAULT_MIN_DOCUMENT_FREQUENCY,
     max_dendrogram_keywords: int = DEFAULT_MAX_DENDROGRAM_KEYWORDS,
     cluster_similarity: float = DEFAULT_CLUSTER_SIMILARITY,
     filtered_dir: str | Path | None = None,
     db_path: str | Path | None = None,
     new_link_visualizations_dir: str | Path | None = None,
+    trends: str | Path | None = None,
     incidence_workers: int = 1,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
@@ -804,13 +812,6 @@ def build_website(
         papers_by_year = count_papers_by_year(db_path)
         yearly_denominator = "database"
     total_documents = int(sum(papers_by_year.values())) or processed
-    ranked = np.argsort(-frequencies, kind="stable")
-    if allowed is not None:
-        ranked = np.asarray(
-            [int(index) for index in ranked if str(vocabulary[int(index)]) in allowed],
-            dtype=np.int64,
-        )
-    top_indices = ranked[:top_keywords]
     selected = select_keywords(
         artifacts["matrix"],
         frequencies,
@@ -885,6 +886,7 @@ def build_website(
             cluster_types = load_cluster_types(
                 clusters_dir,
                 int(prepared_clusters["level"]),
+                trends,
             )
         link_distances = load_link_distance_summary(
             new_link_visualizations_dir,
@@ -902,14 +904,6 @@ def build_website(
             "yearly_denominator": yearly_denominator,
             "total_documents": total_documents,
         },
-        "top_keywords": [
-            {
-                "keyword": str(vocabulary[index]),
-                "papers": int(frequencies[index]),
-                "share": int(frequencies[index]) / processed if processed else 0.0,
-            }
-            for index in top_indices
-        ],
         "dendrogram": {"nodes": nodes},
         "coarse_matrix": _sparse_payload(clustered["coarse"]),
         "cluster_list": cluster_list,
@@ -926,7 +920,7 @@ def build_website(
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
             stale_html.unlink()
-    for retired in ("graph.js",):
+    for retired in ("app.js", "graph.js"):
         retired_path = output / retired
         if retired_path.is_file():
             retired_path.unlink()
@@ -940,7 +934,6 @@ def build_website(
     )
     return {
         "output_dir": str(output),
-        "keywords": len(payload["top_keywords"]),
         "dendrogram_keywords": len(selected),
         "clusters": payload["meta"]["clusters"],
         "event_clusters": (
@@ -991,7 +984,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional visualize-new-links output used by link-distances.html."
         ),
     )
-    parser.add_argument("--top-keywords", type=int, default=DEFAULT_TOP_KEYWORDS)
+    parser.add_argument(
+        "--trends",
+        type=Path,
+        default=None,
+        help=(
+            "cluster-trends CSV used to classify link-distance points. "
+            "Defaults to cluster_trends.csv inside --clusters-dir when that file exists."
+        ),
+    )
     parser.add_argument(
         "--min-document-frequency",
         type=int,
@@ -1021,8 +1022,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.top_keywords < 1:
-        raise SystemExit("--top-keywords must be positive")
     if args.min_document_frequency < 1:
         raise SystemExit("--min-document-frequency must be positive")
     if args.max_dendrogram_keywords < 1:
@@ -1033,13 +1032,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.events_dir,
         clusters_dir=args.clusters_dir,
         output_dir=args.output_dir,
-        top_keywords=args.top_keywords,
         min_document_frequency=args.min_document_frequency,
         max_dendrogram_keywords=args.max_dendrogram_keywords,
         cluster_similarity=args.cluster_similarity,
         filtered_dir=args.filtered_dir,
         db_path=args.db_path,
         new_link_visualizations_dir=args.new_link_visualizations_dir,
+        trends=args.trends,
         incidence_workers=args.incidence_workers,
     )
     print(json.dumps(summary, indent=2))

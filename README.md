@@ -160,7 +160,7 @@ the cluster's highest-frequency keyword.
 
 ## Website
 
-Build the four-page site:
+Build the site:
 
 ```bash
 openalex build-website \
@@ -172,9 +172,9 @@ openalex build-website \
 python -m http.server --directory output/website 8000
 ```
 
-`index.html` ranks keywords by document frequency. `dendrogram.html` shows the
-complete-linkage keyword hierarchy and a sidebar with each node's share of
-that year's articles and its descendant keywords. `clusters.html` lists every
+The site root opens `dendrogram.html`, which shows the complete-linkage
+keyword hierarchy and a sidebar with each node's share of that year's articles
+and its descendant keywords. `clusters.html` lists every
 cluster from `cluster-events`. A cluster's size is the number of documents
 that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year. `link-distances.html` interactively
@@ -187,8 +187,8 @@ distribution of new links outside every cluster (`cluster_id == -1`). The
 cluster search matches labels, member keywords, and cluster ids, and filters
 the scatter points immediately.
 
-When genuine classifications are available, the index, dendrogram, and cluster
-list use those keywords. Artefact-labelled members are left out of a cluster.
+When genuine classifications are available, the dendrogram and cluster list
+use those keywords. Artefact-labelled members are left out of a cluster.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,
@@ -202,7 +202,10 @@ by the number of articles published that year. The count is one read-only
 `GROUP BY publication_year` over `idx_publication_year`, so the article rows
 are not read. Without `--db-path`, the curves use the processed-paper totals
 stored in the event manifest. Omitting `--new-link-visualizations-dir` leaves
-the link-distance page in an empty state.
+the link-distance page in an empty state. `--trends` is the cluster-trends
+CSV that classifies those points. Without it, the builder uses
+`cluster_trends.csv` inside `--clusters-dir` when that file exists.
+`scripts/deploy-website.slurm` passes the file only in that case.
 
 Publish a fresh orphan `gh-pages` commit with:
 
@@ -210,6 +213,7 @@ Publish a fresh orphan `gh-pages` commit with:
 OPENALEX_CLUSTERS_DIR=output/event_clusters \
 OPENALEX_NEW_LINK_VISUALIZATIONS_DIR=output/new_link_visualizations \
 OPENALEX_DB_PATH=/path/to/articles.db \
+OPENALEX_CLUSTER_TRENDS=output/event_clusters/cluster_trends.csv \
   scripts/deploy-gh-pages.sh output/events
 ```
 
