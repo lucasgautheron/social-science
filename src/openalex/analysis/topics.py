@@ -470,9 +470,15 @@ def finalize_existing_topics(
         for path in output.iterdir()
         if path.name != "manifest.json" and not path.name.endswith(".tmp")
     )
-    embedding_manifest_path = (
+    candidate_embedding_manifest = (
         Path(embeddings_path).expanduser().resolve() / "manifest.json"
         if embeddings_path is not None
+        else None
+    )
+    embedding_manifest_path = (
+        candidate_embedding_manifest
+        if candidate_embedding_manifest is not None
+        and candidate_embedding_manifest.is_file()
         else None
     )
     manifest = {
@@ -486,7 +492,7 @@ def finalize_existing_topics(
         "complete": True,
         "embedding_artifact": (
             str(Path(embeddings_path).expanduser().resolve())
-            if embeddings_path is not None
+            if embedding_manifest_path is not None
             else None
         ),
         "embedding_manifest_sha256": (
