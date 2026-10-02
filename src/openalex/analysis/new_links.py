@@ -1,4 +1,4 @@
-"""First coauthorship links, prior-network distances, and event attribution.
+"""First coauthorship links, network and semantic distances, and event attribution.
 
 The corpus is streamed by publication year. Every unordered author pair enters
 the cumulative graph in its first observed year. Output retains weighted
@@ -6,6 +6,8 @@ yearly random samples of no-cluster links and links in each attributed cluster,
 together with hop distance in the graph through the preceding year. A link is
 attributed to one event cluster only when that cluster occurs on every paper
 creating the link in its first year and no second cluster does too.
+All cluster-paper pair occurrences also feed a frequency-weighted reservoir of
+cosine distances between the linked authors' embeddings.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,6 +31,7 @@ import numpy as np
 from numba import njit
 from scipy import sparse
 
+from openalex.analysis.author_aggregation import file_sha256
 from openalex.website.build import load_event_artifacts
 
 logger = logging.getLogger(__name__)
@@ -42,8 +46,12 @@ DEFAULT_CLUSTER_SAMPLE = 2_000
 DEFAULT_BASELINE_SAMPLE = 2_000
 DEFAULT_SAMPLING_SEED = 0
 DEFAULT_CACHE_MB = 2048
+AUTHOR_EMBEDDING_ARTIFACT_VERSION = 1
+AUTHOR_EMBEDDING_DATABASE = "author_embeddings.db"
+AUTHOR_EMBEDDING_ENCODING = "little-endian-float32"
 _FETCH_SIZE = 200_000
 _AUTHOR_FLUSH = 100_000
+_SQLITE_IN_LIMIT = 900
 _INT32_MAX = int(np.iinfo(np.int32).max)
 NO_CLUSTER = np.int32(-1)
 DISCONNECTED = np.int32(-1)
@@ -57,12 +65,87 @@ ORDER BY aa.article_id
 """
 
 
+@dataclass(frozen=True)
+class AuthorEmbeddingStore:
+    root: Path
+    database_path: Path
+    dimension: int
+    author_ids: np.ndarray
+    manifest_sha256: str
+
+    def distances(
+        self,
+        pair_keys: np.ndarray,
+        link_author_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Return cosine distances for pair occurrences, preserving duplicates."""
+        if pair_keys.size == 0:
+            return np.empty(0, dtype=np.float32)
+        result = np.empty(pair_keys.size, dtype=np.float32)
+        with _connect_readonly(self.database_path) as connection:
+            for start in range(0, pair_keys.size, 10_000):
+                stop = min(start + 10_000, pair_keys.size)
+                left, right = _decode_pairs(pair_keys[start:stop])
+                left_ids = link_author_ids[left]
+                right_ids = link_author_ids[right]
+                requested = np.unique(np.concatenate((left_ids, right_ids)))
+                vectors: dict[int, np.ndarray] = {}
+                for chunk in _chunks(requested, _SQLITE_IN_LIMIT):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = connection.execute(
+                        f"""
+                        SELECT author_id, embedding
+                        FROM author_embeddings
+                        WHERE author_id IN ({placeholders})
+                        """,
+                        [int(value) for value in chunk],
+                    )
+                    for author_id, payload in rows:
+                        vector = np.frombuffer(payload, dtype="<f4")
+                        if vector.shape != (self.dimension,):
+                            raise ValueError(
+                                f"Author {author_id} embedding has dimension "
+                                f"{vector.size}, expected {self.dimension}"
+                            )
+                        vectors[int(author_id)] = vector
+                if len(vectors) != requested.size:
+                    missing = next(
+                        int(author_id)
+                        for author_id in requested
+                        if int(author_id) not in vectors
+                    )
+                    raise RuntimeError(
+                        "Sampled semantic pair references missing author "
+                        f"embedding {missing}"
+                    )
+                first = np.vstack(
+                    [vectors[int(author_id)] for author_id in left_ids]
+                )
+                second = np.vstack(
+                    [vectors[int(author_id)] for author_id in right_ids]
+                )
+                first_norm = np.linalg.norm(first, axis=1)
+                second_norm = np.linalg.norm(second, axis=1)
+                if np.any(first_norm == 0) or np.any(second_norm == 0):
+                    raise ValueError(
+                        "Author embeddings used for cosine distance must be nonzero"
+                    )
+                similarity = np.einsum("ij,ij->i", first, second) / (
+                    first_norm * second_norm
+                )
+                result[start:stop] = np.clip(
+                    1.0 - similarity, 0.0, 2.0
+                )
+        return result
+
+
 def build_new_links(
     db_path: str | Path,
     events_dir: str | Path,
     clusters_dir: str | Path,
     output_dir: str | Path,
     *,
+    author_embeddings_dir: str | Path,
     to_year: int | None = None,
     max_authors: int = DEFAULT_MAX_AUTHORS,
     max_edges: int = DEFAULT_MAX_EDGES,
@@ -77,7 +160,7 @@ def build_new_links(
     resume: bool = False,
     fetch_size: int = _FETCH_SIZE,
 ) -> None:
-    """Build year-partitioned first-link records from a read-only corpus."""
+    """Build first-link, network-distance, and semantic-distance artifacts."""
     _validate_options(
         max_authors,
         max_edges,
@@ -99,9 +182,9 @@ def build_new_links(
     manifest_path = output / "manifest.json"
 
     existing = _load_manifest(manifest_path) if resume and manifest_path.exists() else None
-    if existing is not None and int(existing.get("artifact_version", 0)) != 7:
+    if existing is not None and int(existing.get("artifact_version", 0)) != 9:
         raise ValueError(
-            "Existing output predates year-matched cluster baselines. "
+            "Existing output predates semantic null samples. "
             "Use a new --output-dir."
         )
     if existing is not None and existing.get("distance_mode") != "exact":
@@ -117,7 +200,12 @@ def build_new_links(
             f"{output} already contains new-link files. Use --resume or a new --output-dir."
         )
 
+    author_embeddings = _load_author_embedding_store(
+        author_embeddings_dir,
+        database,
+    )
     config = {
+        "author_embeddings_manifest_sha256": author_embeddings.manifest_sha256,
         "clusters_manifest_sha256": _sha256(clusters / "manifest.json"),
         "events_manifest_sha256": _sha256(events / "manifest.json"),
         "distance_mode": "exact",
@@ -194,6 +282,18 @@ def build_new_links(
         int(cluster_labels.size),
         cluster_sample,
     )
+    (
+        semantic_reservoirs,
+        semantic_reservoir_years,
+        semantic_observation_population,
+        semantic_excluded_population,
+    ) = _restore_semantic_reservoir(
+        scratch,
+        years,
+        completed,
+        int(cluster_labels.size),
+        cluster_sample,
+    )
 
     for year in years:
         if year in completed:
@@ -208,6 +308,10 @@ def build_new_links(
             cluster_reservoirs,
             cluster_reservoir_years,
             cluster_observation_population,
+            semantic_reservoirs,
+            semantic_reservoir_years,
+            semantic_observation_population,
+            semantic_excluded_population,
             all_left,
             all_right,
         ) = _process_year(
@@ -231,7 +335,12 @@ def build_new_links(
             cluster_reservoirs,
             cluster_reservoir_years,
             cluster_observation_population,
+            semantic_reservoirs,
+            semantic_reservoir_years,
+            semantic_observation_population,
+            semantic_excluded_population,
             seen_keys,
+            author_embeddings,
         )
         _save_year(_year_path(output, year), arrays)
         _save_cluster_year(
@@ -243,6 +352,13 @@ def build_new_links(
             cluster_reservoirs,
             cluster_reservoir_years,
             cluster_observation_population,
+        )
+        _save_semantic_reservoir(
+            _semantic_reservoir_path(scratch, year),
+            semantic_reservoirs,
+            semantic_reservoir_years,
+            semantic_observation_population,
+            semantic_excluded_population,
         )
 
         year_keys = _encode_pairs(all_left, all_right)
@@ -282,6 +398,13 @@ def build_new_links(
         cluster_reservoir_years,
         cluster_observation_population,
     )
+    _save_semantic_reservoir(
+        output / "cluster_semantic_distance_reservoir.npz",
+        semantic_reservoirs,
+        semantic_reservoir_years,
+        semantic_observation_population,
+        semantic_excluded_population,
+    )
     shutil.rmtree(scratch, ignore_errors=True)
     logger.info("Wrote first-link records for %s years to %s", len(years), output)
 
@@ -313,6 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", default="articles.db", help="Read-only source corpus.")
     parser.add_argument("--events-dir", required=True)
     parser.add_argument("--clusters-dir", required=True)
+    parser.add_argument(
+        "--author-embeddings-dir",
+        required=True,
+        help="Completed author-embeddings artifact used for cosine distances.",
+    )
     parser.add_argument("--output-dir", default="output/new_links")
     parser.add_argument("--to-year", type=int, default=None)
     parser.add_argument("--max-authors", type=int, default=DEFAULT_MAX_AUTHORS)
@@ -362,6 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.events_dir,
         args.clusters_dir,
         args.output_dir,
+        author_embeddings_dir=args.author_embeddings_dir,
         to_year=args.to_year,
         max_authors=args.max_authors,
         max_edges=args.max_edges,
@@ -410,6 +539,90 @@ def _validate_options(
         raise ValueError("--sampling-seed must be >= 0")
     if fetch_size < 1:
         raise ValueError("fetch_size must be >= 1")
+
+
+def _load_author_embedding_store(
+    root: str | Path,
+    source_database: Path,
+) -> AuthorEmbeddingStore:
+    artifact = Path(root).expanduser().resolve()
+    manifest_path = artifact / "manifest.json"
+    manifest = _read_json(manifest_path)
+    if int(manifest.get("artifact_version", 0)) != AUTHOR_EMBEDDING_ARTIFACT_VERSION:
+        raise ValueError("Unsupported author-embedding artifact version")
+    if not bool(manifest.get("complete")):
+        raise ValueError("The author-embedding artifact is incomplete")
+    if manifest.get("embedding_encoding") != AUTHOR_EMBEDDING_ENCODING:
+        raise ValueError("Unsupported author-embedding encoding")
+    dimension = int(manifest.get("dimension", 0))
+    if dimension < 1:
+        raise ValueError("Author-embedding dimension must be positive")
+    database_path = artifact / str(
+        manifest.get("database") or AUTHOR_EMBEDDING_DATABASE
+    )
+    if not database_path.is_file():
+        raise ValueError(f"Author-embedding database not found: {database_path}")
+
+    source = source_database.expanduser().resolve()
+    expected_source = manifest.get("source_database")
+    if expected_source is not None and (
+        Path(str(expected_source)).expanduser().resolve() != source
+    ):
+        raise ValueError("Author embeddings were built from a different corpus")
+    expected_size = manifest.get("source_size")
+    if expected_size is not None and int(expected_size) != source.stat().st_size:
+        raise ValueError("Author embeddings were built from a different corpus size")
+    expected_digest = manifest.get("source_sha256")
+    if expected_digest is not None and str(expected_digest) != file_sha256(source):
+        raise ValueError("Author embeddings were built from a different corpus")
+
+    with _connect_readonly(database_path) as connection:
+        metadata = {
+            str(key): str(value)
+            for key, value in connection.execute(
+                "SELECT key, value FROM metadata"
+            )
+        }
+        if int(metadata.get("artifact_version", 0)) != AUTHOR_EMBEDDING_ARTIFACT_VERSION:
+            raise ValueError("Author-embedding database version does not match")
+        if int(metadata.get("dimension", 0)) != dimension:
+            raise ValueError("Author-embedding database dimension does not match")
+        if metadata.get("embedding_encoding") != AUTHOR_EMBEDDING_ENCODING:
+            raise ValueError("Author-embedding database encoding does not match")
+        author_ids = np.fromiter(
+            (
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT author_id FROM author_embeddings ORDER BY author_id"
+                )
+            ),
+            dtype=np.int64,
+        )
+    if author_ids.size and np.any(author_ids[1:] <= author_ids[:-1]):
+        raise ValueError("Author-embedding ids must be strictly increasing")
+    return AuthorEmbeddingStore(
+        root=artifact,
+        database_path=database_path,
+        dimension=dimension,
+        author_ids=author_ids,
+        manifest_sha256=_sha256(manifest_path),
+    )
+
+
+@contextmanager
+def _connect_readonly(path: Path) -> Iterator[sqlite3.Connection]:
+    uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.execute("PRAGMA query_only = ON")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _chunks(values: Sequence[int] | np.ndarray, size: int) -> Iterator[np.ndarray]:
+    for start in range(0, len(values), size):
+        yield np.asarray(values[start : start + size])
 
 
 @contextmanager
@@ -723,7 +936,12 @@ def _process_year(
     cluster_reservoirs: list[np.ndarray],
     cluster_reservoir_years: list[np.ndarray],
     cluster_observation_population: np.ndarray,
+    semantic_reservoirs: list[np.ndarray],
+    semantic_reservoir_years: list[np.ndarray],
+    semantic_observation_population: np.ndarray,
+    semantic_excluded_population: np.ndarray,
     seen_keys: np.ndarray,
+    author_embeddings: AuthorEmbeddingStore,
 ) -> tuple[
     dict[str, np.ndarray],
     dict[str, int | float],
@@ -731,6 +949,10 @@ def _process_year(
     dict[str, np.ndarray],
     list[np.ndarray],
     list[np.ndarray],
+    np.ndarray,
+    list[np.ndarray],
+    list[np.ndarray],
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -748,6 +970,21 @@ def _process_year(
         )
     columns = _author_columns(author_ids, authors, year)
     pair_occurrences = _make_pair_keys(columns, counts)
+    (
+        semantic_reference_keys,
+        semantic_reference_population,
+    ) = _sample_semantic_reference(
+        pair_occurrences,
+        author_ids,
+        author_embeddings.author_ids,
+        baseline_sample,
+        sampling_seed,
+        year,
+    )
+    semantic_reference_distances = author_embeddings.distances(
+        semantic_reference_keys,
+        author_ids,
+    )
     pair_keys, paper_counts = np.unique(pair_occurrences, return_counts=True)
     del pair_occurrences
 
@@ -813,6 +1050,52 @@ def _process_year(
         cluster_reservoir_years,
         cluster_observation_population,
     )
+    (
+        semantic_observations,
+        sampled_semantic_keys,
+        sampled_semantic_clusters,
+        kept_semantic_reservoirs,
+        kept_semantic_reservoir_years,
+        semantic_observation_population,
+        semantic_excluded_population,
+    ) = _sample_semantic_observations(
+        event_pair_keys,
+        event_pair_clusters,
+        author_ids,
+        author_embeddings.author_ids,
+        cluster_count,
+        cluster_sample,
+        sampling_seed,
+        year,
+        semantic_reservoirs,
+        semantic_reservoir_years,
+        semantic_observation_population,
+        semantic_excluded_population,
+    )
+    semantic_distances = author_embeddings.distances(
+        sampled_semantic_keys,
+        author_ids,
+    )
+    semantic_reservoirs, semantic_reservoir_years = (
+        _finish_semantic_reservoir(
+            kept_semantic_reservoirs,
+            kept_semantic_reservoir_years,
+            semantic_distances,
+            sampled_semantic_clusters,
+            cluster_count,
+            year,
+        )
+    )
+    semantic_sums = np.zeros(cluster_count, dtype=np.float64)
+    np.add.at(semantic_sums, sampled_semantic_clusters, semantic_distances)
+    semantic_observations["semantic_distance_sum"] = semantic_sums
+    semantic_observations["semantic_reference_distance"] = (
+        semantic_reference_distances
+    )
+    semantic_observations["semantic_reference_population"] = np.asarray(
+        [semantic_reference_population], dtype=np.int64
+    )
+    cluster_observations.update(semantic_observations)
     (
         reference_keys,
         reference_clusters,
@@ -906,6 +1189,10 @@ def _process_year(
         cluster_reservoirs,
         cluster_reservoir_years,
         cluster_observation_population,
+        semantic_reservoirs,
+        semantic_reservoir_years,
+        semantic_observation_population,
+        semantic_excluded_population,
         all_left,
         all_right,
     )
@@ -1292,6 +1579,200 @@ def _sample_cluster_observations(
         kept_reservoir_years,
         updated_population,
     )
+
+
+def _embedding_covered_pairs(
+    pair_keys: np.ndarray,
+    link_author_ids: np.ndarray,
+    embedding_author_ids: np.ndarray,
+) -> np.ndarray:
+    left, right = _decode_pairs(pair_keys)
+    left_ids = link_author_ids[left]
+    right_ids = link_author_ids[right]
+    left_positions = np.searchsorted(embedding_author_ids, left_ids)
+    right_positions = np.searchsorted(embedding_author_ids, right_ids)
+    left_present = left_positions < embedding_author_ids.size
+    right_present = right_positions < embedding_author_ids.size
+    left_present[left_present] &= (
+        embedding_author_ids[left_positions[left_present]]
+        == left_ids[left_present]
+    )
+    right_present[right_present] &= (
+        embedding_author_ids[right_positions[right_present]]
+        == right_ids[right_present]
+    )
+    return left_present & right_present
+
+
+def _sample_semantic_reference(
+    pair_occurrences: np.ndarray,
+    link_author_ids: np.ndarray,
+    embedding_author_ids: np.ndarray,
+    sample_size: int,
+    sampling_seed: int,
+    year: int,
+) -> tuple[np.ndarray, int]:
+    """Sample embedding-covered pair occurrences from all analyzed papers."""
+    eligible = np.flatnonzero(
+        _embedding_covered_pairs(
+            pair_occurrences,
+            link_author_ids,
+            embedding_author_ids,
+        )
+    )
+    population = int(eligible.size)
+    retained_size = min(sample_size, population)
+    retained = _uniform_sample(
+        eligible,
+        retained_size,
+        [sampling_seed, int(year), 5],
+    )
+    return pair_occurrences[retained], population
+
+
+def _sample_semantic_observations(
+    event_keys: np.ndarray,
+    event_clusters: np.ndarray,
+    link_author_ids: np.ndarray,
+    embedding_author_ids: np.ndarray,
+    cluster_count: int,
+    cluster_sample: int,
+    sampling_seed: int,
+    year: int,
+    reservoirs: list[np.ndarray],
+    reservoir_years: list[np.ndarray],
+    population: np.ndarray,
+    excluded_population: np.ndarray,
+) -> tuple[
+    dict[str, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    list[np.ndarray],
+    list[np.ndarray],
+    np.ndarray,
+    np.ndarray,
+]:
+    """Reservoir-sample embedding-covered pair occurrences per cluster.
+
+    ``event_keys`` deliberately retains duplicate pair occurrences. A pair
+    observed on f qualifying papers therefore has f equal-probability entries.
+    """
+    eligible = _embedding_covered_pairs(
+        event_keys,
+        link_author_ids,
+        embedding_author_ids,
+    )
+    current_population = np.bincount(
+        event_clusters[eligible], minlength=cluster_count
+    ).astype(np.int64)
+    current_excluded = np.bincount(
+        event_clusters[~eligible], minlength=cluster_count
+    ).astype(np.int64)
+
+    sampled_parts: list[np.ndarray] = []
+    sampled_cluster_parts: list[np.ndarray] = []
+    kept_reservoirs: list[np.ndarray] = []
+    kept_years: list[np.ndarray] = []
+    accepted_counts = np.zeros(cluster_count, dtype=np.int64)
+    updated_population = population.astype(np.int64, copy=True) + current_population
+    updated_excluded = (
+        excluded_population.astype(np.int64, copy=True) + current_excluded
+    )
+    for cluster in range(cluster_count):
+        candidates = np.flatnonzero(
+            eligible & (event_clusters == cluster)
+        )
+        previous_count = int(population[cluster])
+        current_count = int(candidates.size)
+        total_count = previous_count + current_count
+        target_size = min(cluster_sample, total_count)
+        if total_count <= cluster_sample:
+            accepted_new = current_count
+        else:
+            rng = np.random.default_rng(
+                np.random.SeedSequence(
+                    [sampling_seed, int(year), 4, cluster]
+                )
+            )
+            accepted_new = int(
+                rng.hypergeometric(
+                    ngood=current_count,
+                    nbad=previous_count,
+                    nsample=target_size,
+                )
+            )
+        kept_old = target_size - accepted_new
+        old_indices = _uniform_sample(
+            np.arange(reservoirs[cluster].size, dtype=np.int64),
+            kept_old,
+            [sampling_seed, int(year), 4, cluster, 0],
+        )
+        accepted = _uniform_sample(
+            candidates,
+            accepted_new,
+            [sampling_seed, int(year), 4, cluster, 1],
+        )
+        kept_reservoirs.append(reservoirs[cluster][old_indices])
+        kept_years.append(reservoir_years[cluster][old_indices])
+        sampled_parts.append(accepted)
+        sampled_cluster_parts.append(
+            np.full(accepted_new, cluster, dtype=np.int32)
+        )
+        accepted_counts[cluster] = accepted_new
+
+    if sampled_parts:
+        sampled_indices = np.concatenate(sampled_parts)
+        sampled_clusters = np.concatenate(sampled_cluster_parts)
+    else:
+        sampled_indices = np.empty(0, dtype=np.int64)
+        sampled_clusters = np.empty(0, dtype=np.int32)
+    observations = {
+        "semantic_pair_observations": current_population,
+        "semantic_missing_embedding_observations": current_excluded,
+        "semantic_reservoir_acceptances": accepted_counts,
+    }
+    return (
+        observations,
+        event_keys[sampled_indices],
+        sampled_clusters,
+        kept_reservoirs,
+        kept_years,
+        updated_population,
+        updated_excluded,
+    )
+
+
+def _finish_semantic_reservoir(
+    kept_reservoirs: list[np.ndarray],
+    kept_reservoir_years: list[np.ndarray],
+    sampled_distances: np.ndarray,
+    sampled_clusters: np.ndarray,
+    cluster_count: int,
+    year: int,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    reservoirs = [
+        np.concatenate(
+            (
+                kept_reservoirs[cluster],
+                sampled_distances[sampled_clusters == cluster],
+            )
+        ).astype(np.float32, copy=False)
+        for cluster in range(cluster_count)
+    ]
+    reservoir_years = [
+        np.concatenate(
+            (
+                kept_reservoir_years[cluster],
+                np.full(
+                    np.count_nonzero(sampled_clusters == cluster),
+                    year,
+                    dtype=np.int32,
+                ),
+            )
+        ).astype(np.int32, copy=False)
+        for cluster in range(cluster_count)
+    ]
+    return reservoirs, reservoir_years
 
 
 def _accepted_distance_sums(
@@ -1841,6 +2322,58 @@ def _restore_cluster_reservoir(
     return reservoirs, years_by_cluster, population.copy()
 
 
+def _restore_semantic_reservoir(
+    scratch: Path,
+    years: Sequence[int],
+    completed: set[int],
+    cluster_count: int,
+    cluster_sample: int,
+) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray]:
+    completed_years = [year for year in years if year in completed]
+    if not completed_years:
+        return (
+            [np.empty(0, dtype=np.float32) for _ in range(cluster_count)],
+            [np.empty(0, dtype=np.int32) for _ in range(cluster_count)],
+            np.zeros(cluster_count, dtype=np.int64),
+            np.zeros(cluster_count, dtype=np.int64),
+        )
+    path = _semantic_reservoir_path(scratch, completed_years[-1])
+    if not path.exists():
+        raise RuntimeError(
+            f"Completed year {completed_years[-1]} is missing semantic reservoir scratch"
+        )
+    with np.load(path, allow_pickle=False) as payload:
+        offsets = payload["offsets"].astype(np.int64, copy=False)
+        distances = payload["distances"].astype(np.float32, copy=False)
+        reservoir_years = payload["years"].astype(np.int32, copy=False)
+        population = payload["population"].astype(np.int64, copy=False)
+        excluded = payload["excluded_population"].astype(np.int64, copy=False)
+    if (
+        offsets.shape != (cluster_count + 1,)
+        or population.shape != (cluster_count,)
+        or excluded.shape != (cluster_count,)
+        or reservoir_years.shape != distances.shape
+    ):
+        raise RuntimeError("Semantic reservoir does not align with cluster metadata")
+    reservoirs = [
+        distances[offsets[cluster] : offsets[cluster + 1]].copy()
+        for cluster in range(cluster_count)
+    ]
+    years_by_cluster = [
+        reservoir_years[offsets[cluster] : offsets[cluster + 1]].copy()
+        for cluster in range(cluster_count)
+    ]
+    expected_sizes = np.minimum(population, cluster_sample)
+    if not np.array_equal(
+        np.asarray([values.size for values in reservoirs], dtype=np.int64),
+        expected_sizes,
+    ):
+        raise RuntimeError(
+            "Semantic reservoir sample sizes do not match populations"
+        )
+    return reservoirs, years_by_cluster, population.copy(), excluded.copy()
+
+
 def _encode_pairs(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return (left.astype(np.uint64) << np.uint64(32)) | right.astype(np.uint64)
 
@@ -1893,11 +2426,14 @@ def _fresh_manifest(
 ) -> dict:
     return {
         **config,
-        "artifact_version": 7,
+        "artifact_version": 9,
         "author_count": int(author_ids.size),
         "cluster_level": None,
         "cluster_metadata": "cluster_metadata.npz",
         "cluster_distance_reservoir": "cluster_distance_reservoir.npz",
+        "cluster_semantic_distance_reservoir": (
+            "cluster_semantic_distance_reservoir.npz"
+        ),
         "cluster_years_dir": "cluster_years",
         "clustered_link_counts": {},
         "completed_years": [],
@@ -1916,8 +2452,15 @@ def _fresh_manifest(
         "sampling_design": (
             "year-stratified simple random samples without replacement for no-cluster "
             "links, each attributed cluster, and all-paper-link references; one global "
-            "year-labelled reservoir per cluster for all connected paper-pair observations"
+            "year-labelled reservoir per cluster for all connected paper-pair observations; "
+            "one independent global reservoir per cluster for embedding-covered paper-pair "
+            "occurrences, retaining repeated pairs as repeated observations; one uniform "
+            "embedding-covered paper-pair-occurrence null sample per year from all papers"
         ),
+        "semantic_distance_definition": (
+            "cosine distance between fractional-authorship author embeddings"
+        ),
+        "semantic_distance_dtype": "float32",
         "sampling_stats": {},
         "stored_link_counts": {},
         "papers_kept": {
@@ -1960,6 +2503,7 @@ def _is_complete(manifest: dict, output: Path) -> bool:
         bool(manifest.get("phase1_complete"))
         and (output / "cluster_metadata.npz").exists()
         and (output / "cluster_distance_reservoir.npz").exists()
+        and (output / "cluster_semantic_distance_reservoir.npz").exists()
         and all(
             year in completed
             and _year_path(output, year).exists()
@@ -2063,6 +2607,46 @@ def _save_cluster_reservoir(
     )
 
 
+def _save_semantic_reservoir(
+    path: Path,
+    reservoirs: Sequence[np.ndarray],
+    reservoir_years: Sequence[np.ndarray],
+    population: np.ndarray,
+    excluded_population: np.ndarray,
+) -> None:
+    if len(reservoirs) != len(reservoir_years) or any(
+        distances.size != years.size
+        for distances, years in zip(reservoirs, reservoir_years, strict=True)
+    ):
+        raise ValueError("Semantic reservoir years do not align with distances")
+    sizes = np.asarray([values.size for values in reservoirs], dtype=np.int64)
+    offsets = np.empty(sizes.size + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(sizes, out=offsets[1:])
+    distances = (
+        np.concatenate(reservoirs).astype(np.float32, copy=False)
+        if reservoirs
+        else np.empty(0, dtype=np.float32)
+    )
+    years = (
+        np.concatenate(reservoir_years).astype(np.int32, copy=False)
+        if reservoir_years
+        else np.empty(0, dtype=np.int32)
+    )
+    _save_year(
+        path,
+        {
+            "distances": distances,
+            "years": years,
+            "offsets": offsets,
+            "population": population.astype(np.int64, copy=False),
+            "excluded_population": excluded_population.astype(
+                np.int64, copy=False
+            ),
+        },
+    )
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -2095,6 +2679,10 @@ def _cluster_year_path(output: Path, year: int) -> Path:
 
 def _reservoir_path(scratch: Path, year: int) -> Path:
     return scratch / "cluster_reservoirs" / f"{year}.npz"
+
+
+def _semantic_reservoir_path(scratch: Path, year: int) -> Path:
+    return scratch / "semantic_cluster_reservoirs" / f"{year}.npz"
 
 
 def _edge_path(scratch: Path, year: int) -> Path:

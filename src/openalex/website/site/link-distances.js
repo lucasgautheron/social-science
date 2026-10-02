@@ -39,6 +39,15 @@
       label: "Average distance across all paper links",
       description: "all coauthor-pair observations on cluster papers",
     },
+    semantic: {
+      distance: "average_semantic_link_distance",
+      distribution: "semantic_link_distance_distribution",
+      baselineDistribution: "semantic_link_baseline_distance_distribution",
+      yearly: "semantic_link_distance_by_year",
+      label: "Average semantic link distance",
+      description: "frequency-weighted author-pair occurrences with embeddings",
+      semantic: true,
+    },
   };
 
   function svgNode(name, attrs = {}) {
@@ -240,6 +249,7 @@
 
   function distributionChart(row) {
     const config = measures[state.measure];
+    if (config.semantic) return semanticDistributionChart(row, config);
     const selected = distributionMap(row[config.distribution], state.measure);
     const baseline = distributionMap(row[config.baselineDistribution], state.measure);
     const maximumDistance = Math.max(0, ...selected.keys(), ...baseline.keys());
@@ -329,6 +339,96 @@
     return chart;
   }
 
+  function semanticDistributionChart(row, config) {
+    const bins = row[config.distribution] || [];
+    const baselineBins = row[config.baselineDistribution] || [];
+    const chart = svgNode("svg", {
+      class: "line-chart distance-chart",
+      viewBox: "0 0 340 190",
+      role: "img",
+    });
+    const total = bins.reduce((sum, item) => sum + Number(item[2] || 0), 0);
+    const baselineTotal = baselineBins.reduce((sum, item) => sum + Number(item[2] || 0), 0);
+    if (!total) {
+      const message = svgNode("text", { class: "axis-label", x: 16, y: 30 });
+      message.textContent = "No semantic distance observations";
+      chart.append(message);
+      return chart;
+    }
+    const padding = { left: 46, right: 12, top: 16, bottom: 34 };
+    const plotWidth = 340 - padding.left - padding.right;
+    const shares = bins.map((item) => Number(item[2]) / total);
+    const baselineByBin = new Map(
+      baselineBins.map((item) => [
+        Math.round(Number(item[0]) * 20),
+        baselineTotal ? Number(item[2]) / baselineTotal : 0,
+      ]),
+    );
+    const maxShare = Math.max(...shares, ...baselineByBin.values()) || 1;
+    const x = (distance) => padding.left + (Number(distance) / 2) * plotWidth;
+    const y = (share) => 190 - padding.bottom - (share / maxShare) * (190 - padding.top - padding.bottom);
+    chart.append(
+      svgNode("path", {
+        class: "axis",
+        d: `M ${padding.left} ${padding.top} V ${190 - padding.bottom} H ${340 - padding.right}`,
+      }),
+    );
+    bins.forEach((item, index) => {
+      const left = Number(item[0]);
+      const right = Number(item[1]);
+      const share = shares[index];
+      chart.append(
+        svgNode("rect", {
+          class: "distance-bar",
+          x: x(left),
+          y: y(share),
+          width: Math.max(1, x(right) - x(left) - 0.5),
+          height: Math.max(0, 190 - padding.bottom - y(share)),
+        }),
+      );
+    });
+    const baselinePath = Array.from({ length: 40 }, (_, index) => {
+      const center = (index + 0.5) / 20;
+      return `${index ? "L" : "M"} ${x(center)} ${y(baselineByBin.get(index) || 0)}`;
+    }).join(" ");
+    chart.append(svgNode("path", { class: "baseline-series", d: baselinePath }));
+    for (let index = 0; index < 40; index += 1) {
+      chart.append(
+        svgNode("circle", {
+          class: "baseline-point",
+          cx: x((index + 0.5) / 20),
+          cy: y(baselineByBin.get(index) || 0),
+          r: 2,
+        }),
+      );
+    }
+    for (const distance of [0, 0.5, 1, 1.5, 2]) {
+      const label = svgNode("text", {
+        class: "axis-label",
+        x: x(distance),
+        y: 176,
+        "text-anchor": "middle",
+      });
+      label.textContent = formatDistance(distance);
+      chart.append(label);
+    }
+    const maximum = svgNode("text", { class: "axis-label", x: 3, y: padding.top + 4 });
+    maximum.textContent = formatPercent(maxShare);
+    const xLabel = svgNode("text", {
+      class: "axis-label",
+      x: (padding.left + 340 - padding.right) / 2,
+      y: 189,
+      "text-anchor": "middle",
+    });
+    xLabel.textContent = "Cosine distance";
+    chart.append(maximum, xLabel);
+    chart.setAttribute(
+      "aria-label",
+      `Semantic-distance distribution for ${row.label}, compared with ${baselineLabel()}`,
+    );
+    return chart;
+  }
+
   function distributionMap(pairs, measure) {
     const counts = new Map();
     for (const [distance, count] of pairs || []) {
@@ -339,6 +439,7 @@
   }
 
   function baselineLabel() {
+    if (state.measure === "semantic") return "Year-matched random paper links";
     return state.measure === "all"
       ? "Year-matched links outside this cluster"
       : "Year-matched new links outside clusters";
@@ -359,34 +460,47 @@
     type.textContent = row.cluster_type || "Unclassified";
     const stats = document.createElement("div");
     stats.className = "link-stats";
-    const values = [
-      ["Cluster size", `${Number(row.paper_count).toLocaleString()} papers`],
-      ["Mean distance", formatDistance(row[config.distance])],
-      ["Connected", Number(row[config.connected]).toLocaleString()],
-      ["Disconnected", Number(row[config.disconnected]).toLocaleString()],
-      ["Disconnected share", formatProbability(row[`${config.prefix}_disconnection_probability`])],
-      ["Matched baseline", formatProbability(row[`${config.prefix}_baseline_disconnection_probability`])],
-      ["Disconnect Δ", formatProbability(row[`${config.prefix}_disconnection_risk_difference`])],
-      ["Disconnect 95% CI", formatInterval(
-        row[`${config.prefix}_disconnection_ci_low`],
-        row[`${config.prefix}_disconnection_ci_high`],
-        formatProbability,
-      )],
-      ["Disconnect p", formatPValue(row[`${config.prefix}_disconnection_p_value`])],
-      ["Disconnect q", formatPValue(row[`${config.prefix}_disconnection_q_value`])],
-      ["Mean-hop Δ", formatDistance(row[`${config.prefix}_mean_distance_shift`])],
-      ["Mean-hop 95% CI", formatInterval(
-        row[`${config.prefix}_mean_distance_shift_ci_low`],
-        row[`${config.prefix}_mean_distance_shift_ci_high`],
-      )],
-      ["Wasserstein-1", formatDistance(row[`${config.prefix}_wasserstein_distance`])],
-      ["Wasserstein 95% CI", formatInterval(
-        row[`${config.prefix}_wasserstein_ci_low`],
-        row[`${config.prefix}_wasserstein_ci_high`],
-      )],
-      ["Distance p", formatPValue(row[`${config.prefix}_wasserstein_p_value`])],
-      ["Distance q", formatPValue(row[`${config.prefix}_wasserstein_q_value`])],
-    ];
+    const values = [["Cluster size", `${Number(row.paper_count).toLocaleString()} papers`]];
+    if (config.semantic) {
+      const covered = Number(row.semantic_link_observation_count || 0);
+      const missing = Number(row.semantic_link_missing_embedding_count || 0);
+      const coverage = covered + missing ? covered / (covered + missing) : null;
+      values.push(
+        ["Mean cosine distance", formatDistance(row[config.distance])],
+        ["Covered occurrences", covered.toLocaleString()],
+        ["Missing embeddings", missing.toLocaleString()],
+        ["Embedding coverage", formatProbability(coverage)],
+        ["Sampled occurrences", Number(row.semantic_link_distance_sample_count || 0).toLocaleString()],
+      );
+    } else {
+      values.push(
+        ["Mean distance", formatDistance(row[config.distance])],
+        ["Connected", Number(row[config.connected]).toLocaleString()],
+        ["Disconnected", Number(row[config.disconnected]).toLocaleString()],
+        ["Disconnected share", formatProbability(row[`${config.prefix}_disconnection_probability`])],
+        ["Matched baseline", formatProbability(row[`${config.prefix}_baseline_disconnection_probability`])],
+        ["Disconnect Δ", formatProbability(row[`${config.prefix}_disconnection_risk_difference`])],
+        ["Disconnect 95% CI", formatInterval(
+          row[`${config.prefix}_disconnection_ci_low`],
+          row[`${config.prefix}_disconnection_ci_high`],
+          formatProbability,
+        )],
+        ["Disconnect p", formatPValue(row[`${config.prefix}_disconnection_p_value`])],
+        ["Disconnect q", formatPValue(row[`${config.prefix}_disconnection_q_value`])],
+        ["Mean-hop Δ", formatDistance(row[`${config.prefix}_mean_distance_shift`])],
+        ["Mean-hop 95% CI", formatInterval(
+          row[`${config.prefix}_mean_distance_shift_ci_low`],
+          row[`${config.prefix}_mean_distance_shift_ci_high`],
+        )],
+        ["Wasserstein-1", formatDistance(row[`${config.prefix}_wasserstein_distance`])],
+        ["Wasserstein 95% CI", formatInterval(
+          row[`${config.prefix}_wasserstein_ci_low`],
+          row[`${config.prefix}_wasserstein_ci_high`],
+        )],
+        ["Distance p", formatPValue(row[`${config.prefix}_wasserstein_p_value`])],
+        ["Distance q", formatPValue(row[`${config.prefix}_wasserstein_q_value`])],
+      );
+    }
     if (state.measure === "all") {
       values.push(["Existing links", Number(row.all_link_existing_count).toLocaleString()]);
       values.push(["Repeat share", formatProbability(row.all_link_repeat_probability)]);
@@ -409,13 +523,19 @@
     const chartTitle = document.createElement("h3");
     chartTitle.textContent = "Share of papers by year";
     const yearlyDistanceTitle = document.createElement("h3");
-    yearlyDistanceTitle.textContent = "Mean distance by year";
+    yearlyDistanceTitle.textContent = config.semantic
+      ? "Mean semantic distance by year"
+      : "Mean distance by year";
     const distanceTitle = document.createElement("h3");
-    distanceTitle.textContent = "Connected-distance distribution";
+    distanceTitle.textContent = config.semantic
+      ? "Semantic-distance distribution"
+      : "Connected-distance distribution";
     const legend = document.createElement("div");
     legend.className = "distance-legend";
-    legend.innerHTML = `<span><i class="cluster-swatch"></i>Selected cluster</span><span><i class="baseline-swatch"></i>${baselineLabel()}</span>`;
-    details.append(
+    legend.innerHTML = config.semantic
+      ? `<span><i class="cluster-swatch"></i>Selected cluster</span><span><i class="baseline-swatch"></i>${baselineLabel()}</span>`
+      : `<span><i class="cluster-swatch"></i>Selected cluster</span><span><i class="baseline-swatch"></i>${baselineLabel()}</span>`;
+    const detailNodes = [
       eyebrow,
       heading,
       type,
@@ -427,7 +547,8 @@
       distanceTitle,
       legend,
       distributionChart(row),
-    );
+    ];
+    details.append(...detailNodes);
     if (row.keywords && row.keywords.length) {
       const wordTitle = document.createElement("h3");
       wordTitle.textContent = "Included keywords";

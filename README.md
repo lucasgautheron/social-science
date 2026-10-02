@@ -83,6 +83,11 @@ sample CSV preserves BERTopic's training targets for auditing. Use
 `--sample-size` to change the discovery sample and `--no-hierarchy`,
 `--no-visualizations`, or `--no-save-model` to omit optional outputs.
 These full-corpus classifier outputs use topic artifact schema version 2.
+If an older run failed only after writing the classifier and full-corpus
+Parquet, `openalex topics --output-dir output/topics --finalize-existing`
+validates those core files and publishes the manifest without refitting. The
+recovered artifact omits any model or optional visualization that had not
+already been saved.
 
 Build per-author representations without modifying any input artifact:
 
@@ -204,6 +209,7 @@ openalex new-links \
   --db-path /path/to/articles.db \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
+  --author-embeddings-dir output/author_embeddings \
   --output-dir output/new_links
 ```
 
@@ -220,8 +226,22 @@ into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 first-year link. Use `sampling_weight` when estimating totals. Exact
 population/sample counts and inclusion probabilities are in `manifest.json`.
 Event artifacts produced before article-id incidence sidecars were added must
-be regenerated. New-link artifacts before version 7 lack year-matched
-reference samples and must also be rebuilt.
+be regenerated. New-link artifacts before version 9 lack the current
+year-matched network references, semantic distances, or semantic null samples
+and must also be rebuilt.
+
+For semantic distance, every occurrence of an author pair on a qualifying
+cluster paper is a separate population record. A pair appearing on `f` such
+papers therefore has `f` chances to enter an independent global reservoir of
+up to `--cluster-sample` records per cluster. The stored float32 value is the
+cosine distance between the two fractional-authorship author embeddings.
+Occurrences missing either author embedding are excluded rather than imputed,
+with exact covered and excluded populations recorded for every cluster.
+The null draws up to `--baseline-sample` embedding-covered author-pair
+occurrences uniformly from all analyzed papers in each year. Visualization
+post-stratifies those yearly samples to each cluster reservoir's observed year
+distribution, so the selected and null semantic samples have identical year
+weights.
 
 Both `network` and `new-links` skip papers with more than 16 authors by
 default; change this with `--max-authors`. Exact distances use bidirectional
@@ -243,8 +263,9 @@ openalex visualize-new-links \
   --permutation-replicates 1000
 ```
 
-This writes separate scatter plots for first links and for all coauthor-pair
-observations on cluster papers. In the latter, pairs already linked before the
+This writes separate scatter plots for first links, all coauthor-pair
+observations on cluster papers, and semantic link distance. In the all-link
+network measure, pairs already linked before the
 paper contribute distance one. All connected observations use one uniform
 reservoir of up to `--cluster-sample` observations per cluster across all
 years. Exact connected denominators and reservoir-weighted distance sums keep
@@ -291,13 +312,16 @@ The site root opens `clusters.html`, which lists every cluster from
 `cluster-events`. A cluster's size is the number of documents
 that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year. `link-distances.html` interactively
-plots cluster paper count on a logarithmic x-axis against the two mean-distance
-measures from `visualize-new-links`. Its points use one neutral style rather
+plots cluster paper count on a logarithmic x-axis against three mean-distance
+measures from `visualize-new-links`: first-link network distance,
+all-paper-link network distance, and author-embedding cosine distance. Its
+points use one neutral style rather
 than the static plots' residual highlights; hovering a point shows the cluster,
 its share-of-papers curve by year, the mean connected distance by year for the
-selected measure, and its discrete connected-link
-distance distribution (1, 2, ...) overlaid with that cluster's year-matched
-reference. The details also report disconnection and distribution effect
+selected measure, and its distance distribution. Network-distance
+distributions (1, 2, ...) are overlaid with that cluster's year-matched
+reference; semantic distance uses a continuous histogram and reports embedding
+coverage, overlaid with year-matched random paper links. The details also report network disconnection and distribution effect
 sizes with FDR-adjusted q-values. The
 cluster search matches labels, member keywords, and cluster ids, and filters
 the scatter points immediately.
@@ -405,9 +429,11 @@ the same relative path inside the isolated run:
 openalex-aws submit \
   --input output/events \
   --input output/event_clusters \
+  --input output/author_embeddings \
   -- openalex new-links \
   --events-dir output/events \
-  --clusters-dir output/event_clusters
+  --clusters-dir output/event_clusters \
+  --author-embeddings-dir output/author_embeddings
 ```
 
 The author pipelines use the same staging mechanism:

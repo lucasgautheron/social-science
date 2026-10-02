@@ -22,6 +22,7 @@ DEFAULT_BOOTSTRAP_REPLICATES = 250
 DEFAULT_PERMUTATION_REPLICATES = 499
 DEFAULT_INFERENCE_SEED = 0
 DEFAULT_INFERENCE_WORKERS = 8
+SEMANTIC_HISTOGRAM_EDGES = np.linspace(0.0, 2.0, 41)
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ def build_cluster_link_plots(
     inference_seed: int = DEFAULT_INFERENCE_SEED,
     inference_workers: int = DEFAULT_INFERENCE_WORKERS,
 ) -> Path:
-    """Write cluster summaries and two paper-count/distance scatter plots."""
+    """Write cluster summaries and three paper-count/distance scatter plots."""
     if dpi < 1:
         raise ValueError("--dpi must be >= 1")
     if bootstrap_replicates < 1:
@@ -82,9 +83,9 @@ def build_cluster_link_plots(
     root = Path(new_links_dir).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
     manifest = _read_json(root / "manifest.json")
-    if int(manifest.get("artifact_version", 0)) < 7:
+    if int(manifest.get("artifact_version", 0)) < 9:
         raise ValueError(
-            "New-link artifacts lack cluster visualization aggregates; rebuild them."
+            "New-link artifacts lack semantic null samples; rebuild them."
         )
     years = [int(year) for year in manifest.get("years", [])]
     with np.load(root / manifest["cluster_metadata"], allow_pickle=False) as payload:
@@ -121,6 +122,12 @@ def build_cluster_link_plots(
     ]
     all_distance_by_year: list[list[list[int | float]]] = [
         [] for _ in range(cluster_count)
+    ]
+    semantic_distance_by_year: list[list[list[int | float]]] = [
+        [] for _ in range(cluster_count)
+    ]
+    semantic_reference_year_histograms: list[defaultdict[int, float]] = [
+        defaultdict(float) for _ in years
     ]
 
     cluster_years_dir = root / manifest["cluster_years_dir"]
@@ -180,6 +187,12 @@ def build_cluster_link_plots(
                 "new_connected_pair_observations"
             ]
             all_total_by_year[year_index] = stats["total_pair_observations"]
+            _add_semantic_values(
+                semantic_reference_year_histograms[year_index],
+                stats["semantic_reference_distance"].astype(
+                    np.float32, copy=False
+                ),
+            )
             all_reference_records.append(
                 (
                     stats["reference_cluster_id"].astype(np.int32, copy=True),
@@ -193,6 +206,7 @@ def build_cluster_link_plots(
                 stats,
                 new_distance_by_year,
                 all_distance_by_year,
+                semantic_distance_by_year,
             )
 
     with np.load(
@@ -240,6 +254,70 @@ def build_cluster_link_plots(
                     all_cluster_year_histograms[cluster][
                         year_lookup[int(sample_year)]
                     ][int(distance)] += 1.0
+
+    with np.load(
+        root / manifest["cluster_semantic_distance_reservoir"],
+        allow_pickle=False,
+    ) as semantic_reservoir:
+        semantic_distances = semantic_reservoir["distances"].astype(
+            np.float32, copy=False
+        )
+        semantic_years = semantic_reservoir["years"].astype(
+            np.int32, copy=False
+        )
+        semantic_offsets = semantic_reservoir["offsets"].astype(
+            np.int64, copy=False
+        )
+        semantic_population = semantic_reservoir["population"].astype(
+            np.int64, copy=False
+        )
+        semantic_excluded = semantic_reservoir["excluded_population"].astype(
+            np.int64, copy=False
+        )
+    if (
+        semantic_offsets.shape != (cluster_count + 1,)
+        or semantic_population.shape != (cluster_count,)
+        or semantic_excluded.shape != (cluster_count,)
+        or semantic_years.shape != semantic_distances.shape
+    ):
+        raise ValueError("Semantic reservoir does not align with metadata")
+    semantic_sample_count = np.diff(semantic_offsets)
+    average_semantic = np.full(cluster_count, np.nan, dtype=np.float64)
+    semantic_histograms: list[list[list[float]]] = []
+    semantic_baseline_histograms: list[list[list[float]]] = []
+    for cluster in range(cluster_count):
+        sample = semantic_distances[
+            semantic_offsets[cluster] : semantic_offsets[cluster + 1]
+        ]
+        sample_years = semantic_years[
+            semantic_offsets[cluster] : semantic_offsets[cluster + 1]
+        ]
+        if sample.size:
+            average_semantic[cluster] = float(
+                sample.mean(dtype=np.float64)
+            )
+        semantic_histograms.append(
+            _semantic_histogram(
+                sample,
+                int(semantic_population[cluster]),
+            )
+        )
+        sample_year_counts = np.asarray(
+            [np.count_nonzero(sample_years == year) for year in years],
+            dtype=np.float64,
+        )
+        if sample.size:
+            sample_year_counts *= (
+                float(semantic_population[cluster]) / sample.size
+            )
+        baseline = _poststratified_histogram(
+            semantic_reference_year_histograms,
+            sample_year_counts,
+            connected_only=True,
+        )
+        semantic_baseline_histograms.append(
+            _semantic_histogram_from_bins(baseline)
+        )
 
     new_connected = new_connected_by_year.sum(axis=0)
     new_disconnected = new_disconnected_by_year.sum(axis=0)
@@ -294,6 +372,7 @@ def build_cluster_link_plots(
     _assign_q_values(all_comparisons)
     new_selection = _residual_highlights(paper_counts, average_new)
     all_selection = _residual_highlights(paper_counts, average_all)
+    semantic_selection = _residual_highlights(paper_counts, average_semantic)
     rows = _summary_rows(
         cluster_ids,
         labels,
@@ -316,6 +395,14 @@ def build_cluster_link_plots(
         all_comparisons,
         new_distance_by_year,
         all_distance_by_year,
+        average_semantic,
+        semantic_population,
+        semantic_excluded,
+        semantic_sample_count,
+        semantic_selection,
+        semantic_histograms,
+        semantic_baseline_histograms,
+        semantic_distance_by_year,
     )
 
     output.mkdir(parents=True, exist_ok=True)
@@ -329,6 +416,16 @@ def build_cluster_link_plots(
         new_selection,
         title="Event-cluster size and average new-link distance",
         y_label="Average new-link distance (connected only)",
+        dpi=dpi,
+    )
+    _write_scatter(
+        output / "cluster_semantic_link_distance.png",
+        paper_counts,
+        average_semantic,
+        labels,
+        semantic_selection,
+        title="Event-cluster size and average semantic link distance",
+        y_label="Average cosine distance between linked authors",
         dpi=dpi,
     )
     _write_scatter(
@@ -397,6 +494,7 @@ def _append_yearly_means(
     stats: np.lib.npyio.NpzFile,
     new_distance_by_year: list[list[list[int | float]]],
     all_distance_by_year: list[list[list[int | float]]],
+    semantic_distance_by_year: list[list[list[int | float]]],
 ) -> None:
     """Record connected-only means for one year.
 
@@ -425,6 +523,26 @@ def _append_yearly_means(
             continue
         mean = float(distance_sums[cluster]) / sample_count
         all_distance_by_year[cluster].append([int(year), mean])
+    if "semantic_distance_sum" not in stats:
+        return
+    semantic_sums = stats["semantic_distance_sum"].astype(
+        np.float64, copy=False
+    )
+    semantic_acceptances = stats["semantic_reservoir_acceptances"].astype(
+        np.int64, copy=False
+    )
+    if semantic_sums.shape != year_new_connected.shape:
+        raise ValueError(
+            f"Year {year} semantic distance sums do not align with clusters"
+        )
+    for cluster, sample_count in enumerate(semantic_acceptances):
+        if int(sample_count) > 0:
+            semantic_distance_by_year[cluster].append(
+                [
+                    int(year),
+                    float(semantic_sums[cluster]) / int(sample_count),
+                ]
+            )
 
 
 def _add_values(
@@ -438,6 +556,57 @@ def _add_values(
     counts = np.bincount(inverse, weights=weights)
     for value, count in zip(unique, counts, strict=True):
         histogram[int(value)] += float(count)
+
+
+def _semantic_histogram(
+    sample: np.ndarray,
+    population: int,
+) -> list[list[float]]:
+    if sample.size == 0:
+        return []
+    counts, edges = np.histogram(sample, bins=SEMANTIC_HISTOGRAM_EDGES)
+    weight = float(population) / sample.size
+    return [
+        [float(left), float(right), float(count) * weight]
+        for left, right, count in zip(
+            edges[:-1],
+            edges[1:],
+            counts,
+            strict=True,
+        )
+        if count
+    ]
+
+
+def _add_semantic_values(
+    histogram: defaultdict[int, float],
+    values: np.ndarray,
+) -> None:
+    if values.size == 0:
+        return
+    bins = np.searchsorted(
+        SEMANTIC_HISTOGRAM_EDGES,
+        values,
+        side="right",
+    ) - 1
+    bins = np.clip(bins, 0, SEMANTIC_HISTOGRAM_EDGES.size - 2)
+    unique, counts = np.unique(bins, return_counts=True)
+    for bin_index, count in zip(unique, counts, strict=True):
+        histogram[int(bin_index)] += float(count)
+
+
+def _semantic_histogram_from_bins(
+    histogram: Mapping[int, float],
+) -> list[list[float]]:
+    return [
+        [
+            float(SEMANTIC_HISTOGRAM_EDGES[bin_index]),
+            float(SEMANTIC_HISTOGRAM_EDGES[bin_index + 1]),
+            float(count),
+        ]
+        for bin_index, count in sorted(histogram.items())
+        if count > 0
+    ]
 
 
 def _poststratified_histogram(
@@ -924,9 +1093,24 @@ def _summary_rows(
     all_comparisons: Sequence[DistributionComparison],
     new_distance_by_year: Sequence[Sequence[Sequence[int | float]]],
     all_distance_by_year: Sequence[Sequence[Sequence[int | float]]],
+    average_semantic: np.ndarray,
+    semantic_population: np.ndarray,
+    semantic_excluded: np.ndarray,
+    semantic_sample_count: np.ndarray,
+    semantic_selection: ResidualSelection,
+    semantic_histograms: Sequence[Sequence[Sequence[float]]],
+    semantic_baseline_histograms: Sequence[
+        Sequence[Sequence[float]]
+    ],
+    semantic_distance_by_year: Sequence[
+        Sequence[Sequence[int | float]]
+    ],
 ) -> list[dict[str, object]]:
     new_highlighted = set(int(index) for index in new_selection.highlighted)
     all_highlighted = set(int(index) for index in all_selection.highlighted)
+    semantic_highlighted = set(
+        int(index) for index in semantic_selection.highlighted
+    )
     rows = []
     for index, cluster_id in enumerate(cluster_ids):
         new_comparison = new_comparisons[index]
@@ -974,6 +1158,36 @@ def _summary_rows(
                     all_comparison.baseline_histogram
                 ),
                 **_comparison_fields("all_link", all_comparison),
+                "average_semantic_link_distance": float(
+                    average_semantic[index]
+                ),
+                "semantic_link_observation_count": int(
+                    semantic_population[index]
+                ),
+                "semantic_link_missing_embedding_count": int(
+                    semantic_excluded[index]
+                ),
+                "semantic_link_distance_sample_count": int(
+                    semantic_sample_count[index]
+                ),
+                "semantic_link_residual": float(
+                    semantic_selection.residuals[index]
+                ),
+                "semantic_link_size_quantile": int(
+                    semantic_selection.size_quantile[index]
+                ),
+                "semantic_link_highlighted": index in semantic_highlighted,
+                "semantic_link_distance_distribution": json.dumps(
+                    semantic_histograms[index],
+                    separators=(",", ":"),
+                ),
+                "semantic_link_baseline_distance_distribution": json.dumps(
+                    semantic_baseline_histograms[index],
+                    separators=(",", ":"),
+                ),
+                "semantic_link_distance_by_year": _series_json(
+                    semantic_distance_by_year[index]
+                ),
             }
         )
     return rows
@@ -1067,6 +1281,16 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "all_link_distance_by_year",
         "all_link_baseline_distance_distribution",
         *_comparison_fieldnames("all_link"),
+        "average_semantic_link_distance",
+        "semantic_link_observation_count",
+        "semantic_link_missing_embedding_count",
+        "semantic_link_distance_sample_count",
+        "semantic_link_residual",
+        "semantic_link_size_quantile",
+        "semantic_link_highlighted",
+        "semantic_link_distance_distribution",
+        "semantic_link_baseline_distance_distribution",
+        "semantic_link_distance_by_year",
     ]
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", newline="", encoding="utf-8") as handle:

@@ -159,15 +159,23 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "new_link_connected_count,new_link_disconnected_count,"
         "average_all_link_distance,all_link_connected_count,"
         "all_link_disconnected_count,all_link_existing_count,"
-        "all_link_observation_count,new_link_distance_distribution,"
+        "all_link_observation_count,average_semantic_link_distance,"
+        "semantic_link_observation_count,semantic_link_missing_embedding_count,"
+        "semantic_link_distance_sample_count,new_link_distance_distribution,"
         "all_link_distance_distribution,new_link_baseline_distance_distribution,"
-        "all_link_baseline_distance_distribution,"
-        "new_link_distance_by_year,all_link_distance_by_year\n"
-        '0,beta,4,2.5,8,2,1.25,10,2,2,12,"[[1,8],[2,2]]","[[0,2],[2,8]]",'
+        "all_link_baseline_distance_distribution,semantic_link_distance_distribution,"
+        "semantic_link_baseline_distance_distribution,"
+        "new_link_distance_by_year,all_link_distance_by_year,"
+        "semantic_link_distance_by_year\n"
+        '0,beta,4,2.5,8,2,1.25,10,2,2,12,0.4,11,1,5,'
+        '"[[1,8],[2,2]]","[[0,2],[2,8]]",'
         '"[[2,20],[3,5]]","[[1,4],[2,6]]",'
-        '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]"\n'
-        '1,gamma,2,nan,0,3,3.0,4,3,1,7,[],"[[0,1],[3,3]]",'
-        '"[[3,2]]","[[1,1],[3,3]]",[],[]\n',
+        '"[[0.35,0.4,3],[0.4,0.45,2]]",'
+        '"[[0.2,0.25,3],[0.4,0.45,2]]",'
+        '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]","[[2020,0.4]]"\n'
+        '1,gamma,2,nan,0,3,3.0,4,3,1,7,nan,0,7,0,[],'
+        '"[[0,1],[3,3]]",'
+        '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[]\n',
         encoding="utf-8",
     )
     (clusters_dir / "cluster_trends.csv").write_text(
@@ -198,6 +206,21 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     ]
     assert first["all_link_distance_by_year"] == [
         {"year": 2020, "distance": 1.25},
+    ]
+    assert first["average_semantic_link_distance"] == 0.4
+    assert first["semantic_link_observation_count"] == 11
+    assert first["semantic_link_missing_embedding_count"] == 1
+    assert first["semantic_link_distance_sample_count"] == 5
+    assert first["semantic_link_distance_distribution"] == [
+        [0.35, 0.4, 3.0],
+        [0.4, 0.45, 2.0],
+    ]
+    assert first["semantic_link_baseline_distance_distribution"] == [
+        [0.2, 0.25, 3.0],
+        [0.4, 0.45, 2.0],
+    ]
+    assert first["semantic_link_distance_by_year"] == [
+        {"year": 2020, "distance": 0.4},
     ]
     assert second["new_link_distance_by_year"] == []
     assert first["new_link_baseline_distance_distribution"] == [
@@ -241,6 +264,8 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert "scatter-point" in script
     assert "Connected-distance distribution" in script
     assert "Mean distance by year" in script
+    assert "Semantic-distance distribution" in script
+    assert "Year-matched random paper links" in script
     assert "Year-matched new links outside clusters" in script
     assert "wasserstein_q_value" in script
     assert "Year-matched links outside this cluster" in script
@@ -249,6 +274,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert "new_link_highlighted" not in script
     page = (site_dir / "link-distances.html").read_text(encoding="utf-8")
     assert 'id="cluster-search"' in page
+    assert 'data-measure="semantic"' in page
     for cluster_type in (
         "trend increasing",
         "trend decreasing",

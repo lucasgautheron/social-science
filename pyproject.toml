@@ -26,6 +26,7 @@ analysis = [
 download = ["pyalex>=0.18"]
 embeddings = [
   "numpy>=1.26",
+  "scipy>=1.13",
   "sentence-transformers>=3.3",
   "torch>=2.3",
 ]

@@ -697,10 +697,14 @@ def load_link_distance_summary(
         "all_link_disconnected_count",
         "all_link_existing_count",
         "all_link_observation_count",
+        "semantic_link_observation_count",
+        "semantic_link_missing_embedding_count",
+        "semantic_link_distance_sample_count",
     )
     distance_fields = (
         "average_new_link_distance",
         "average_all_link_distance",
+        "average_semantic_link_distance",
     )
     comparison_suffixes = (
         "disconnection_probability",
@@ -734,10 +738,13 @@ def load_link_distance_summary(
         "all_link_distance_distribution",
         "new_link_baseline_distance_distribution",
         "all_link_baseline_distance_distribution",
+        "semantic_link_distance_distribution",
+        "semantic_link_baseline_distance_distribution",
     )
     yearly_distance_fields = (
         "new_link_distance_by_year",
         "all_link_distance_by_year",
+        "semantic_link_distance_by_year",
     )
     rows: list[dict[str, Any]] = []
     with path.open(newline="", encoding="utf-8") as handle:
@@ -776,10 +783,16 @@ def load_link_distance_summary(
                 row[field] = value if math.isfinite(value) else None
             for field in distribution_fields:
                 distribution = json.loads(source[field])
-                row[field] = [
-                    [int(distance), float(count)]
-                    for distance, count in distribution
-                ]
+                if field.startswith("semantic_link_"):
+                    row[field] = [
+                        [float(left), float(right), float(count)]
+                        for left, right, count in distribution
+                    ]
+                else:
+                    row[field] = [
+                        [int(distance), float(count)]
+                        for distance, count in distribution
+                    ]
             for field in yearly_distance_fields:
                 raw = source.get(field) or "[]"
                 row[field] = [

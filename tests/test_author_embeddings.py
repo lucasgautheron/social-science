@@ -71,6 +71,33 @@ def write_embeddings(path, *, complete=True):
     )
 
 
+def test_aggregate_author_updates_groups_each_author_once():
+    vectors = np.asarray(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+        ],
+        dtype=np.float32,
+    )
+    positions, sums, weights, counts = (
+        author_embeddings_module._aggregate_author_updates(
+            vectors,
+            paper_rows=np.asarray([0, 0, 1, 2, 2], dtype=np.int64),
+            positions=np.asarray([7, 3, 7, 3, 7], dtype=np.int64),
+            fractional_weights=np.asarray(
+                [0.5, 0.5, 1.0, 0.5, 0.5],
+                dtype=np.float64,
+            ),
+        )
+    )
+
+    np.testing.assert_array_equal(positions, [3, 7])
+    np.testing.assert_allclose(sums, [[3.0, 4.0], [6.0, 8.0]])
+    np.testing.assert_allclose(weights, [1.0, 2.0])
+    np.testing.assert_array_equal(counts, [2, 3])
+
+
 def test_author_embeddings_fractional_weight_schema_and_read_only_inputs(tmp_path):
     corpus = tmp_path / "articles.db"
     embeddings = tmp_path / "embeddings"

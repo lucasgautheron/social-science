@@ -16,6 +16,7 @@ from openalex.analysis.new_links import (
     _grouped_exact_bfs,
     _sample_cluster_observations,
     _sample_links,
+    _sample_semantic_observations,
     build_new_links,
     load_new_links,
 )
@@ -95,6 +96,77 @@ def create_corpus(path):
                 for author_id in paper_authors
             ],
         )
+
+
+def create_author_embedding_artifacts(root, database, *, omitted=()):
+    root.mkdir()
+    vectors = {
+        1: [1.0, 0.0],
+        2: [1.0, 0.0],
+        3: [0.0, 1.0],
+        4: [-1.0, 0.0],
+        5: [0.0, -1.0],
+        10: [1.0, 1.0],
+        11: [1.0, 1.0],
+        12: [1.0, -1.0],
+        13: [1.0, -1.0],
+        20: [1.0, 0.0],
+        21: [0.0, 1.0],
+        22: [-1.0, 0.0],
+    }
+    omitted = set(omitted)
+    artifact_database = root / "author_embeddings.db"
+    with sqlite3.connect(artifact_database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE author_embeddings(
+                author_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                paper_count INTEGER NOT NULL,
+                total_weight REAL NOT NULL
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO metadata VALUES (?, ?)",
+            [
+                ("artifact_version", "1"),
+                ("dimension", "2"),
+                ("embedding_encoding", "little-endian-float32"),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO author_embeddings VALUES (?, ?, ?, ?)",
+            [
+                (
+                    author_id,
+                    np.asarray(vector, dtype="<f4").tobytes(),
+                    1,
+                    1.0,
+                )
+                for author_id, vector in vectors.items()
+                if author_id not in omitted
+            ],
+        )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_version": 1,
+                "complete": True,
+                "database": "author_embeddings.db",
+                "dimension": 2,
+                "embedding_encoding": "little-endian-float32",
+                "source_database": str(database.resolve()),
+                "source_size": database.stat().st_size,
+                "source_sha256": digest(database),
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def create_event_artifacts(events, clusters, *, include_article_ids=True):
@@ -185,10 +257,12 @@ def pair_rows(author_ids, arrays):
 
 def test_new_links_distances_clusters_and_read_only(tmp_path):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     output = tmp_path / "new_links"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters)
     before = digest(database)
 
@@ -197,6 +271,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         events,
         clusters,
         output,
+        author_embeddings_dir=author_embeddings,
         max_authors=2,
         fetch_size=1,
     )
@@ -216,7 +291,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
     assert 20 not in author_ids
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_version"] == 7
+    assert manifest["artifact_version"] == 9
     assert manifest["baseline_sample"] == 2_000
     assert manifest["completed_years"] == [2019, 2020, 2021]
     assert manifest["clustered_link_counts"]["2020"] == 1
@@ -243,6 +318,10 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert stats["reference_cluster_id"].tolist() == [0, 1, 0]
         assert stats["reference_distance"].tolist() == [2, 2, 2]
         assert stats["reference_sampling_weight"].tolist() == [1, 1, 1]
+        assert stats["semantic_reference_population"].tolist() == [4]
+        assert stats["semantic_reference_distance"].tolist() == pytest.approx(
+            [1, 1, 1, 1]
+        )
     with np.load(output / "cluster_years" / "2021.npz", allow_pickle=False) as stats:
         assert stats["connected_pair_observations"].tolist() == [1, 0]
         assert stats["disconnected_pair_observations"].tolist() == [2, 3]
@@ -257,23 +336,50 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert reservoir["offsets"].tolist() == [0, 3, 4]
         assert reservoir["distances"].tolist() == [2, 2, 1, 2]
         assert reservoir["years"].tolist() == [2020, 2020, 2021, 2020]
+    with np.load(
+        output / "cluster_semantic_distance_reservoir.npz",
+        allow_pickle=False,
+    ) as reservoir:
+        assert reservoir["population"].tolist() == [5, 4]
+        assert reservoir["excluded_population"].tolist() == [0, 0]
+        assert reservoir["offsets"].tolist() == [0, 5, 9]
+        assert reservoir["distances"].tolist() == pytest.approx(
+            [1, 1, 2, 2, 1, 1, 1, 2, 2]
+        )
     assert not (output / "scratch").exists()
 
 
 def test_resume_complete_needs_no_inputs(tmp_path):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     output = tmp_path / "new_links"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters)
-    build_new_links(database, events, clusters, output, max_authors=2)
+    build_new_links(
+        database,
+        events,
+        clusters,
+        output,
+        author_embeddings_dir=author_embeddings,
+        max_authors=2,
+    )
     year_path = output / "years" / "2020.npz"
     before = digest(year_path)
     modified = year_path.stat().st_mtime_ns
     database.unlink()
 
-    build_new_links(database, events, clusters, output, max_authors=2, resume=True)
+    build_new_links(
+        database,
+        events,
+        clusters,
+        output,
+        author_embeddings_dir=author_embeddings,
+        max_authors=2,
+        resume=True,
+    )
 
     assert digest(year_path) == before
     assert year_path.stat().st_mtime_ns == modified
@@ -281,9 +387,11 @@ def test_resume_complete_needs_no_inputs(tmp_path):
 
 def test_old_event_artifacts_explain_required_regeneration(tmp_path):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters, include_article_ids=False)
 
     with pytest.raises(ValueError, match="article-id sidecar"):
@@ -292,6 +400,7 @@ def test_old_event_artifacts_explain_required_regeneration(tmp_path):
             events,
             clusters,
             tmp_path / "new_links",
+            author_embeddings_dir=author_embeddings,
             max_authors=2,
         )
 
@@ -408,31 +517,76 @@ def test_network_commands_default_to_sixteen_authors():
     assert build_network_parser().parse_args([]).max_authors == 16
     assert (
         build_new_links_parser()
-        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .parse_args(
+            [
+                "--events-dir",
+                "events",
+                "--clusters-dir",
+                "clusters",
+                "--author-embeddings-dir",
+                "author_embeddings",
+            ]
+        )
         .max_authors
         == 16
     )
     assert (
         build_new_links_parser()
-        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .parse_args(
+            [
+                "--events-dir",
+                "events",
+                "--clusters-dir",
+                "clusters",
+                "--author-embeddings-dir",
+                "author_embeddings",
+            ]
+        )
         .no_cluster_sample
         == 2_000
     )
     assert (
         build_new_links_parser()
-        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .parse_args(
+            [
+                "--events-dir",
+                "events",
+                "--clusters-dir",
+                "clusters",
+                "--author-embeddings-dir",
+                "author_embeddings",
+            ]
+        )
         .cluster_sample
         == 2_000
     )
     assert (
         build_new_links_parser()
-        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .parse_args(
+            [
+                "--events-dir",
+                "events",
+                "--clusters-dir",
+                "clusters",
+                "--author-embeddings-dir",
+                "author_embeddings",
+            ]
+        )
         .baseline_sample
         == 2_000
     )
     assert (
         build_new_links_parser()
-        .parse_args(["--events-dir", "events", "--clusters-dir", "clusters"])
+        .parse_args(
+            [
+                "--events-dir",
+                "events",
+                "--clusters-dir",
+                "clusters",
+                "--author-embeddings-dir",
+                "author_embeddings",
+            ]
+        )
         .distance_workers
         == 16
     )
@@ -467,6 +621,56 @@ def test_cluster_link_sampling_is_capped_and_weighted_per_cluster():
     assert stats["cluster_strata"]["0"]["population"] == 20
     assert stats["cluster_strata"]["0"]["sample"] == 5
     assert stats["cluster_strata"]["1"]["population"] == 6
+
+
+def test_semantic_sampling_weights_repeated_pairs_by_frequency_and_tracks_coverage():
+    repeated = (np.uint64(0) << np.uint64(32)) | np.uint64(1)
+    distinct = (np.uint64(1) << np.uint64(32)) | np.uint64(2)
+    missing = (np.uint64(0) << np.uint64(32)) | np.uint64(3)
+    event_keys = np.array(
+        [repeated, repeated, repeated, distinct, missing],
+        dtype=np.uint64,
+    )
+    arguments = (
+        event_keys,
+        np.zeros(5, dtype=np.int32),
+        np.array([10, 20, 30, 40], dtype=np.int64),
+        np.array([10, 20, 30], dtype=np.int64),
+    )
+    result = _sample_semantic_observations(
+        *arguments,
+        cluster_count=1,
+        cluster_sample=10,
+        sampling_seed=9,
+        year=2020,
+        reservoirs=[np.empty(0, dtype=np.float32)],
+        reservoir_years=[np.empty(0, dtype=np.int32)],
+        population=np.zeros(1, dtype=np.int64),
+        excluded_population=np.zeros(1, dtype=np.int64),
+    )
+
+    observations, sampled_keys, sampled_clusters, _, _, population, excluded = result
+    assert sampled_keys.tolist() == [int(repeated)] * 3 + [int(distinct)]
+    assert sampled_clusters.tolist() == [0, 0, 0, 0]
+    assert observations["semantic_pair_observations"].tolist() == [4]
+    assert observations["semantic_missing_embedding_observations"].tolist() == [1]
+    assert population.tolist() == [4]
+    assert excluded.tolist() == [1]
+    capped = [
+        _sample_semantic_observations(
+            *arguments,
+            cluster_count=1,
+            cluster_sample=2,
+            sampling_seed=9,
+            year=2020,
+            reservoirs=[np.empty(0, dtype=np.float32)],
+            reservoir_years=[np.empty(0, dtype=np.int32)],
+            population=np.zeros(1, dtype=np.int64),
+            excluded_population=np.zeros(1, dtype=np.int64),
+        )
+        for _ in range(2)
+    ]
+    assert np.array_equal(capped[0][1], capped[1][1])
 
 
 def test_cluster_paper_observations_use_reproducible_global_reservoirs():
@@ -648,10 +852,12 @@ def test_inference_uses_exact_rates_and_actual_draw_counts():
 
 def test_unsampled_links_still_grow_the_cumulative_graph(tmp_path):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     output = tmp_path / "new_links"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters)
 
     build_new_links(
@@ -659,6 +865,7 @@ def test_unsampled_links_still_grow_the_cumulative_graph(tmp_path):
         events,
         clusters,
         output,
+        author_embeddings_dir=author_embeddings,
         max_authors=2,
         no_cluster_sample=0,
     )
@@ -675,10 +882,12 @@ def test_unsampled_links_still_grow_the_cumulative_graph(tmp_path):
 
 def test_resume_restores_unsampled_edges_from_scratch(tmp_path, monkeypatch):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     output = tmp_path / "new_links"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters)
     original = new_links._process_year
 
@@ -694,6 +903,7 @@ def test_resume_restores_unsampled_edges_from_scratch(tmp_path, monkeypatch):
             events,
             clusters,
             output,
+            author_embeddings_dir=author_embeddings,
             max_authors=2,
             no_cluster_sample=1,
         )
@@ -708,24 +918,39 @@ def test_resume_restores_unsampled_edges_from_scratch(tmp_path, monkeypatch):
         events,
         clusters,
         output,
+        author_embeddings_dir=author_embeddings,
         max_authors=2,
         no_cluster_sample=1,
         resume=True,
     )
     author_ids, links_2020 = load_new_links(output, 2020)
     assert pair_rows(author_ids, links_2020)[(1, 3)] == (2, 0)
+    with np.load(
+        output / "cluster_semantic_distance_reservoir.npz",
+        allow_pickle=False,
+    ) as semantic:
+        assert semantic["population"].tolist() == [5, 4]
     assert not (output / "scratch").exists()
 
 
 def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_path):
     database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     links = tmp_path / "new_links"
     plots = tmp_path / "plots"
     create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
     create_event_artifacts(events, clusters)
-    build_new_links(database, events, clusters, links, max_authors=2)
+    build_new_links(
+        database,
+        events,
+        clusters,
+        links,
+        author_embeddings_dir=author_embeddings,
+        max_authors=2,
+    )
 
     summary = build_cluster_link_plots(
         links,
@@ -766,10 +991,32 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert float(rows[0]["all_link_repeat_probability"]) == pytest.approx(1 / 3)
     assert float(rows[1]["average_all_link_distance"]) == pytest.approx(2)
     assert int(rows[1]["all_link_disconnected_count"]) == 3
+    assert float(rows[0]["average_semantic_link_distance"]) == pytest.approx(
+        1.4
+    )
+    assert int(rows[0]["semantic_link_observation_count"]) == 5
+    assert int(rows[0]["semantic_link_missing_embedding_count"]) == 0
+    assert int(rows[0]["semantic_link_distance_sample_count"]) == 5
+    semantic_distribution = json.loads(
+        rows[0]["semantic_link_distance_distribution"]
+    )
+    assert sum(bin_[2] for bin_ in semantic_distribution) == pytest.approx(5)
+    semantic_baseline = json.loads(
+        rows[0]["semantic_link_baseline_distance_distribution"]
+    )
+    assert sum(bin_[2] for bin_ in semantic_baseline) == pytest.approx(5)
+    assert [bin_[2] for bin_ in semantic_baseline] == pytest.approx(
+        [3.8, 1.2]
+    )
+    assert json.loads(rows[0]["semantic_link_distance_by_year"]) == [
+        [2020, 1.0],
+        [2021, 5 / 3],
+    ]
     assert rows[0]["label"] == "alpha"
     assert rows[0]["new_link_highlighted"] == "True"
     assert (plots / "cluster_new_link_distance.png").stat().st_size > 0
     assert (plots / "cluster_all_link_distance.png").stat().st_size > 0
+    assert (plots / "cluster_semantic_link_distance.png").stat().st_size > 0
 
 
 def test_residual_highlights_choose_both_extremes_in_each_size_quantile():

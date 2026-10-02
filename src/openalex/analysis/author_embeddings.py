@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from openalex.analysis.author_aggregation import (
     atomic_json,
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 ARTIFACT_VERSION = 1
 DATABASE_NAME = "author_embeddings.db"
 DEFAULT_OUTPUT_DIR = Path("output/author_embeddings")
-DEFAULT_BATCH_SIZE = 2_000
+DEFAULT_BATCH_SIZE = 20_000
 DEFAULT_FINALIZE_BATCH_SIZE = 10_000
 AGGREGATION = "sum((1/author_count) * embedding) / sum(1/author_count)"
 ENCODING = "little-endian-float32"
@@ -183,9 +184,28 @@ def build_author_embeddings(
             )
             if len(batch_author_ids):
                 positions = author_positions(author_ids, batch_author_ids)
-                contributions = (
-                    vectors[paper_rows]
-                    * fractional_weights.astype(np.float32)[:, None]
+                (
+                    batch_positions,
+                    batch_weighted_sums,
+                    batch_total_weights,
+                    batch_paper_counts,
+                ) = _aggregate_author_updates(
+                    vectors,
+                    paper_rows,
+                    positions,
+                    fractional_weights,
+                )
+                old_sums = np.asarray(
+                    weighted_sums[batch_positions],
+                    dtype=np.float32,
+                )
+                old_weights = np.asarray(
+                    total_weights[batch_positions],
+                    dtype=np.float64,
+                )
+                old_counts = np.asarray(
+                    paper_counts[batch_positions],
+                    dtype=np.uint32,
                 )
                 _write_pending_batch(
                     pending_batch_path,
@@ -195,14 +215,17 @@ def build_author_embeddings(
                         else None
                     ),
                     next_last_article_id=int(article_ids[-1]),
-                    positions=np.unique(positions),
-                    weighted_sums=weighted_sums,
-                    total_weights=total_weights,
-                    paper_counts=paper_counts,
+                    positions=batch_positions,
+                    old_sums=old_sums,
+                    old_weights=old_weights,
+                    old_counts=old_counts,
                 )
-                np.add.at(weighted_sums, positions, contributions)
-                np.add.at(total_weights, positions, fractional_weights)
-                np.add.at(paper_counts, positions, np.uint32(1))
+                np.add(old_sums, batch_weighted_sums, out=old_sums)
+                np.add(old_weights, batch_total_weights, out=old_weights)
+                np.add(old_counts, batch_paper_counts, out=old_counts)
+                weighted_sums[batch_positions] = old_sums
+                total_weights[batch_positions] = old_weights
+                paper_counts[batch_positions] = old_counts
                 authorships += len(batch_author_ids)
             processed_articles += len(article_ids)
             last_article_id = article_ids[-1]
@@ -245,6 +268,46 @@ def build_author_embeddings(
     atomic_json(manifest_path, final_manifest)
     shutil.rmtree(scratch)
     return final_manifest
+
+
+def _aggregate_author_updates(
+    vectors: np.ndarray,
+    paper_rows: np.ndarray,
+    positions: np.ndarray,
+    fractional_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Group a batch into one update per author using sparse matrix multiply."""
+    unique_positions, local_author_rows = np.unique(
+        positions,
+        return_inverse=True,
+    )
+    author_paper_weights = csr_matrix(
+        (
+            fractional_weights.astype(np.float32, copy=False),
+            (local_author_rows, paper_rows),
+        ),
+        shape=(len(unique_positions), len(vectors)),
+        dtype=np.float32,
+    )
+    batch_weighted_sums = np.asarray(
+        author_paper_weights @ vectors,
+        dtype=np.float32,
+    )
+    batch_total_weights = np.bincount(
+        local_author_rows,
+        weights=fractional_weights,
+        minlength=len(unique_positions),
+    ).astype(np.float64, copy=False)
+    batch_paper_counts = np.bincount(
+        local_author_rows,
+        minlength=len(unique_positions),
+    ).astype(np.uint32, copy=False)
+    return (
+        unique_positions,
+        batch_weighted_sums,
+        batch_total_weights,
+        batch_paper_counts,
+    )
 
 
 def _write_author_database(
@@ -340,9 +403,9 @@ def _write_pending_batch(
     previous_last_article_id: int | None,
     next_last_article_id: int,
     positions: np.ndarray,
-    weighted_sums: np.ndarray,
-    total_weights: np.ndarray,
-    paper_counts: np.ndarray,
+    old_sums: np.ndarray,
+    old_weights: np.ndarray,
+    old_counts: np.ndarray,
 ) -> None:
     """Persist rows needed to roll back a partly checkpointed batch."""
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -357,9 +420,9 @@ def _write_pending_batch(
             ),
             next_last=np.asarray([next_last_article_id], dtype=np.int64),
             positions=np.asarray(positions, dtype=np.int64),
-            old_sums=np.asarray(weighted_sums[positions], dtype=np.float32),
-            old_weights=np.asarray(total_weights[positions], dtype=np.float64),
-            old_counts=np.asarray(paper_counts[positions], dtype=np.uint32),
+            old_sums=np.asarray(old_sums, dtype=np.float32),
+            old_weights=np.asarray(old_weights, dtype=np.float64),
+            old_counts=np.asarray(old_counts, dtype=np.uint32),
         )
         handle.flush()
         os.fsync(handle.fileno())
