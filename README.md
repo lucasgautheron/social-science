@@ -213,13 +213,21 @@ openalex new-links \
   --output-dir output/new_links
 ```
 
-All new links are added to the cumulative graph. Results retain simple random
-samples of up to 2,000 no-cluster links per year and 2,000 links per
-attributed cluster and year; change these with `--no-cluster-sample` and
-`--cluster-sample`. A separate sample of up to 2,000 cluster-paper pair
-observations per year supplies all-link reference distributions; change it
-with `--baseline-sample`. Reproduce every sample with `--sampling-seed`. They are
-partitioned as `years/<year>.npz`, with int32 `author_i` and `author_j` indices
+All new links are added to the cumulative graph, whether or not they are
+sampled for output. The sampling strategies are:
+
+| Sample | Eligible population unit | Design and cap | Use |
+| --- | --- | --- | --- |
+| First-link, no unique cluster | New author pair whose first-year papers do not identify exactly one common cluster | Independent yearly simple random sample of up to `--no-cluster-sample` | First-link reference; stored with inverse-inclusion `sampling_weight` |
+| First-link, attributed cluster | New author pair uniquely attributed to a cluster | Independent simple random sample of up to `--cluster-sample` per cluster and year | Cluster first-link distance; stored with inverse-inclusion `sampling_weight` |
+| All-link network reservoir | Connected cluster-paper-pair occurrence; repeated pair occurrences are retained and an existing link has distance one | Uniform global reservoir of up to `--cluster-sample` per cluster across all years | Cluster all-link distance distribution; disconnected occurrences and population totals are counted exactly |
+| All-link network reference | Cluster-paper-pair occurrence in one year | Independent yearly simple random sample of up to `--baseline-sample` | Leave-one-cluster-out, year-matched network reference |
+| Semantic cluster reservoir | Embedding-covered cluster-paper-pair occurrence; repeated pair occurrences are retained | Uniform global reservoir of up to `--cluster-sample` per cluster across all years | Cluster cosine-distance distribution; covered and missing-embedding populations are counted exactly |
+| Semantic reference | Embedding-covered author-pair occurrence from any analyzed paper in one year | Independent yearly simple random sample of up to `--baseline-sample` | Corpus-wide semantic null, post-stratified to each cluster reservoir's year distribution |
+
+All draws are reproducible with `--sampling-seed`; separate deterministic seed
+streams keep the designs independent. First-link samples are partitioned as
+`years/<year>.npz`, with int32 `author_i` and `author_j` indices
 into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 `sampling_weight`. Distance `-1` means the authors were disconnected. Cluster
 `-1` means no unique cluster is present on every paper responsible for that
