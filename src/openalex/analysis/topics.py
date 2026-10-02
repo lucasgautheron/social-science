@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 import numpy as np
 
+from openalex.analysis.author_aggregation import file_sha256
 from openalex.analysis.embeddings import DEFAULT_MODEL, EmbeddingStore
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,16 @@ def assign_topics(
         raise FileExistsError(
             f"{output} already contains topic results. Use a new --output-dir."
         )
+    logger.info("Fingerprinting source corpus %s", source)
+    source_sha256 = file_sha256(source)
+    embedding_source_sha256 = store.manifest.get("source_sha256")
+    if (
+        embedding_source_sha256 is not None
+        and embedding_source_sha256 != source_sha256
+    ):
+        raise ValueError(
+            "The embedding artifact was built from a different source corpus"
+        )
 
     selected_ids = select_topic_sample(
         source,
@@ -268,36 +279,45 @@ def assign_topics(
         hierarchical_topics.to_csv(hierarchy_path, index=False)
         files.append(hierarchy_path.name)
         if visualizations:
-            figure = topic_model.visualize_hierarchy(
-                hierarchical_topics=hierarchical_topics
+            _write_optional_visualization(
+                output,
+                files,
+                "topic_hierarchy.html",
+                lambda: topic_model.visualize_hierarchy(
+                    hierarchical_topics=hierarchical_topics
+                ),
             )
-            hierarchy_html = output / "topic_hierarchy.html"
-            figure.write_html(hierarchy_html)
-            files.append(hierarchy_html.name)
-
-    if visualizations:
-        visualizations_to_write = [
-            ("topic_words.html", topic_model.visualize_barchart(top_k_topics=20)),
-            ("intertopic_distance.html", topic_model.visualize_topics()),
-        ]
-        probability_values = (
-            np.asarray(probabilities) if probabilities is not None else np.empty(0)
-        )
-        if probability_values.ndim == 2 and len(probability_values):
-            visualizations_to_write.append(
-                (
-                    "topic_distribution_sample.html",
-                    topic_model.visualize_distribution(probability_values[0]),
-                )
-            )
-        for filename, figure in visualizations_to_write:
-            figure.write_html(output / filename)
-            files.append(filename)
 
     if save_model:
         model_path = output / "bertopic_model"
         topic_model.save(model_path, serialization="pickle")
         files.append(model_path.name)
+
+    if visualizations:
+        _write_optional_visualization(
+            output,
+            files,
+            "topic_words.html",
+            lambda: topic_model.visualize_barchart(top_n_topics=20),
+        )
+        _write_optional_visualization(
+            output,
+            files,
+            "intertopic_distance.html",
+            topic_model.visualize_topics,
+        )
+        probability_values = (
+            np.asarray(probabilities) if probabilities is not None else np.empty(0)
+        )
+        if probability_values.ndim == 2 and len(probability_values):
+            _write_optional_visualization(
+                output,
+                files,
+                "topic_distribution_sample.html",
+                lambda: topic_model.visualize_distribution(
+                    probability_values[0]
+                ),
+            )
 
     unique_topics = sorted({int(topic) for topic in reduced_topics if int(topic) != -1})
     outliers = int(full_topic_counts.get(-1, 0))
@@ -330,12 +350,165 @@ def assign_topics(
         "random_seed": random_seed,
         "sample_size": sample_size,
         "source_database": str(source),
+        "source_sha256": source_sha256,
+        "source_size": source.stat().st_size,
         "topics": len(unique_topics),
         "umap_components": umap_components,
         "umap_metric": metric,
         "visualizations": visualizations,
     }
     _atomic_json(output / "manifest.json", manifest)
+    return manifest
+
+
+def _write_optional_visualization(
+    output: Path,
+    files: list[str],
+    filename: str,
+    build_figure: Callable[[], Any],
+) -> None:
+    """Write one optional plot without invalidating core topic outputs."""
+    try:
+        figure = build_figure()
+        figure.write_html(output / filename)
+    except Exception:
+        logger.exception("Skipping optional topic visualization %s", filename)
+        return
+    files.append(filename)
+
+
+def finalize_existing_topics(
+    db_path: str | Path,
+    output_dir: str | Path,
+    embeddings_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Validate completed core files and publish a failed late-stage run."""
+    source = Path(db_path).expanduser().resolve()
+    output = Path(output_dir).expanduser().resolve()
+    manifest_path = output / "manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(f"Topic manifest already exists: {manifest_path}")
+
+    required = {
+        "article_assignments": output
+        / "article_topic_classifications.parquet",
+        "sample_assignments": output / "sample_topic_classifications.csv",
+        "topic_list": output / "topic_list.csv",
+        "classifier_model": output / "topic_classifier.joblib",
+        "classifier_metrics": output / "classifier_metrics.json",
+        "classifier_cv": output / "classifier_cv_results.csv",
+    }
+    missing = [str(path) for path in required.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Cannot finalize partial topic output; missing: "
+            + ", ".join(missing)
+        )
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "Topic recovery requires pyarrow. Install the topics extras."
+        ) from exc
+
+    parquet = pq.ParquetFile(required["article_assignments"])
+    expected_schema = {
+        "article_id": pa.int64(),
+        "topic": pa.int32(),
+        "probability": pa.float32(),
+    }
+    for name, expected_type in expected_schema.items():
+        field = parquet.schema_arrow.field(name)
+        if field.type != expected_type:
+            raise ValueError(
+                f"Topic column {name!r} has type {field.type}, "
+                f"expected {expected_type}"
+            )
+
+    topic_counts: Counter[int] = Counter()
+    previous_article_id: int | None = None
+    for batch in parquet.iter_batches(
+        batch_size=100_000, columns=["article_id", "topic"]
+    ):
+        article_ids = batch.column(0).to_numpy(zero_copy_only=False)
+        topics = batch.column(1).to_numpy(zero_copy_only=False)
+        if len(article_ids) == 0:
+            continue
+        if (
+            (previous_article_id is not None and article_ids[0] <= previous_article_id)
+            or np.any(article_ids[1:] <= article_ids[:-1])
+        ):
+            raise ValueError(
+                "Topic classifications must be strictly ordered by article_id"
+            )
+        previous_article_id = int(article_ids[-1])
+        topic_counts.update(int(topic) for topic in topics)
+
+    with required["topic_list"].open(newline="", encoding="utf-8") as handle:
+        labeled_topics = {
+            int(row["Topic"]) for row in csv.DictReader(handle)
+        }
+    missing_labels = sorted(set(topic_counts) - labeled_topics)
+    if missing_labels:
+        raise ValueError(
+            "Topic labels are missing topics: "
+            + ", ".join(str(topic) for topic in missing_labels)
+        )
+    with required["sample_assignments"].open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        sample_articles = sum(1 for _row in csv.DictReader(handle))
+    with required["classifier_metrics"].open(encoding="utf-8") as handle:
+        classifier_metrics = json.load(handle)
+
+    logger.info("Fingerprinting source corpus %s", source)
+    source_sha256 = file_sha256(source)
+    files = sorted(
+        path.name
+        for path in output.iterdir()
+        if path.name != "manifest.json" and not path.name.endswith(".tmp")
+    )
+    embedding_manifest_path = (
+        Path(embeddings_path).expanduser().resolve() / "manifest.json"
+        if embeddings_path is not None
+        else None
+    )
+    manifest = {
+        "artifact_version": ARTIFACT_VERSION,
+        "article_assignments": required["article_assignments"].name,
+        "articles": int(parquet.metadata.num_rows),
+        "classifier": {
+            **classifier_metrics,
+            "model": required["classifier_model"].name,
+        },
+        "complete": True,
+        "embedding_artifact": (
+            str(Path(embeddings_path).expanduser().resolve())
+            if embeddings_path is not None
+            else None
+        ),
+        "embedding_manifest_sha256": (
+            _manifest_digest(embedding_manifest_path)
+            if embedding_manifest_path is not None
+            else None
+        ),
+        "files": files,
+        "hierarchy": (output / "topic_hierarchy.csv").is_file(),
+        "outliers": int(topic_counts.get(-1, 0)),
+        "recovered_from_partial_run": True,
+        "sample_articles": sample_articles,
+        "sample_assignments": required["sample_assignments"].name,
+        "source_database": str(source),
+        "source_sha256": source_sha256,
+        "source_size": source.stat().st_size,
+        "topics": len(set(topic_counts) - {-1}),
+        "visualizations": any(
+            path.suffix == ".html" for path in output.iterdir()
+        ),
+    }
+    _atomic_json(manifest_path, manifest)
     return manifest
 
 
@@ -912,32 +1085,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-hierarchy", action="store_true")
     parser.add_argument("--no-visualizations", action="store_true")
     parser.add_argument("--no-save-model", action="store_true")
+    parser.add_argument(
+        "--finalize-existing",
+        action="store_true",
+        help=(
+            "Validate core files left by a late-stage failure and write the "
+            "manifest without refitting"
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = build_parser().parse_args(argv)
-    manifest = assign_topics(
-        args.db_path,
-        args.embeddings_dir,
-        args.output_dir,
-        sample_size=args.sample_size,
-        random_seed=args.random_seed,
-        min_cluster_size=args.min_cluster_size,
-        n_neighbors=args.n_neighbors,
-        min_dist=args.min_dist,
-        metric=args.metric,
-        umap_components=args.umap_components,
-        outlier_threshold=args.outlier_threshold,
-        hierarchy=not args.no_hierarchy,
-        visualizations=not args.no_visualizations,
-        save_model=not args.no_save_model,
-        classification_batch_size=args.classification_batch_size,
-        classifier_cv_folds=args.classifier_cv_folds,
-        classifier_jobs=args.classifier_jobs,
-        classifier_test_size=args.classifier_test_size,
-    )
+    if args.finalize_existing:
+        manifest = finalize_existing_topics(
+            args.db_path,
+            args.output_dir,
+            args.embeddings_dir,
+        )
+    else:
+        manifest = assign_topics(
+            args.db_path,
+            args.embeddings_dir,
+            args.output_dir,
+            sample_size=args.sample_size,
+            random_seed=args.random_seed,
+            min_cluster_size=args.min_cluster_size,
+            n_neighbors=args.n_neighbors,
+            min_dist=args.min_dist,
+            metric=args.metric,
+            umap_components=args.umap_components,
+            outlier_threshold=args.outlier_threshold,
+            hierarchy=not args.no_hierarchy,
+            visualizations=not args.no_visualizations,
+            save_model=not args.no_save_model,
+            classification_batch_size=args.classification_batch_size,
+            classifier_cv_folds=args.classifier_cv_folds,
+            classifier_jobs=args.classifier_jobs,
+            classifier_test_size=args.classifier_test_size,
+        )
     print(json.dumps(manifest, indent=2))
     return 0
 

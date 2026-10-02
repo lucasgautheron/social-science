@@ -72,8 +72,11 @@ def build_author_embeddings(
         or store.root.is_relative_to(output)
     ):
         raise ValueError("--output-dir must not overlap --embeddings-dir")
+    logger.info("Fingerprinting source corpus %s", source)
     source_info = source_metadata(source)
     _validate_corpus_provenance(store.manifest, source, source_info)
+    logger.info("Fingerprinting embedding payload %s", store.database_path)
+    embedding_database_sha256 = file_sha256(store.database_path)
 
     manifest_path = output / "manifest.json"
     database_path = output / DATABASE_NAME
@@ -84,7 +87,7 @@ def build_author_embeddings(
         "database": DATABASE_NAME,
         "dimension": int(store.dimension),
         "embedding_encoding": ENCODING,
-        "embedding_database_sha256": file_sha256(store.database_path),
+        "embedding_database_sha256": embedding_database_sha256,
         "embedding_manifest_sha256": manifest_sha256(store.manifest_path),
         "model": store.manifest.get("model"),
         **source_info,

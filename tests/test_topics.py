@@ -13,6 +13,7 @@ from openalex.analysis.topics import (
     _write_full_classifications,
     assign_topics,
     build_parser,
+    finalize_existing_topics,
     select_topic_sample,
     topic_probabilities,
     train_topic_classifier,
@@ -132,7 +133,8 @@ class FakeTopicModel:
     def visualize_hierarchy(self, **_kwargs):
         return FakeFigure()
 
-    def visualize_barchart(self, **_kwargs):
+    def visualize_barchart(self, *, top_n_topics):
+        assert top_n_topics == 20
         return FakeFigure()
 
     def visualize_topics(self):
@@ -219,6 +221,7 @@ def test_topic_assignment_restores_legacy_outputs_and_keeps_corpus_read_only(tmp
     )
     assert manifest["articles"] == 2
     assert manifest["sample_articles"] == 2
+    assert len(manifest["source_sha256"]) == 64
     assert manifest["classifier"]["held_out_macro_f1"] == 0.75
     assert manifest["topics"] == 2
     assert manifest["outliers"] == 0
@@ -269,6 +272,69 @@ def test_topic_assignment_restores_legacy_outputs_and_keeps_corpus_read_only(tmp
             min_cluster_size=2,
             model_factory=model_factory,
         )
+
+
+def test_optional_visualization_failure_does_not_discard_topic_artifact(
+    tmp_path,
+):
+    database = tmp_path / "articles.db"
+    embeddings = tmp_path / "embeddings"
+    output = tmp_path / "topics"
+    write_corpus(database)
+    build_embeddings(database, embeddings, workers=1, encoder=FakeEncoder())
+
+    class VisualizationFailureModel(FakeTopicModel):
+        def visualize_barchart(self, *, top_n_topics):
+            assert top_n_topics == 20
+            raise TypeError("plot API failure")
+
+    manifest = assign_topics(
+        database,
+        embeddings,
+        output,
+        sample_size=2,
+        min_cluster_size=2,
+        model_factory=lambda **_kwargs: VisualizationFailureModel(),
+        classifier_trainer=fake_classifier_trainer,
+    )
+
+    assert manifest["articles"] == 2
+    assert "topic_words.html" not in manifest["files"]
+    assert (output / "manifest.json").is_file()
+    assert (output / "bertopic_model" / "model.fake").is_file()
+
+
+def test_finalize_existing_recovers_core_outputs_without_refitting(tmp_path):
+    database = tmp_path / "articles.db"
+    embeddings = tmp_path / "embeddings"
+    output = tmp_path / "topics"
+    write_corpus(database)
+    build_embeddings(database, embeddings, workers=1, encoder=FakeEncoder())
+    assign_topics(
+        database,
+        embeddings,
+        output,
+        sample_size=2,
+        min_cluster_size=2,
+        model_factory=lambda **_kwargs: FakeTopicModel(),
+        classifier_trainer=fake_classifier_trainer,
+    )
+    (output / "manifest.json").unlink()
+    for html in output.glob("*.html"):
+        html.unlink()
+    for model_file in (output / "bertopic_model").iterdir():
+        model_file.unlink()
+    (output / "bertopic_model").rmdir()
+
+    manifest = finalize_existing_topics(database, output, embeddings)
+
+    assert manifest["complete"] is True
+    assert manifest["recovered_from_partial_run"] is True
+    assert manifest["articles"] == 2
+    assert manifest["sample_articles"] == 2
+    assert manifest["embedding_manifest_sha256"]
+    assert "bertopic_model" not in manifest["files"]
+    assert json.loads((output / "manifest.json").read_text()) == manifest
 
 
 def test_topic_sample_uses_existing_random_order(tmp_path):

@@ -194,5 +194,62 @@ def test_author_topics_reject_stale_schema_and_unordered_rows(tmp_path):
         build_author_topics(corpus, topics, tmp_path / "output")
 
 
+def test_author_topics_require_matching_provenance_and_complete_labels(
+    tmp_path,
+):
+    corpus = tmp_path / "articles.db"
+    topics = tmp_path / "topics"
+    write_corpus(corpus)
+    write_topics(topics)
+    manifest_path = topics / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source_database"] = str(tmp_path / "another.db")
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="corpus provenance"):
+        build_author_topics(corpus, topics, tmp_path / "wrong-source")
+
+    manifest["source_database"] = str(corpus.resolve())
+    manifest_path.write_text(json.dumps(manifest))
+    (topics / "topic_list.csv").unlink()
+    with pytest.raises(FileNotFoundError, match="topic labels"):
+        build_author_topics(corpus, topics, tmp_path / "missing-label-file")
+
+    (topics / "topic_list.csv").write_text("Topic,Count,Name\n0,1,zero\n")
+    output = tmp_path / "missing-label"
+    with pytest.raises(ValueError, match="missing topics: 1"):
+        build_author_topics(corpus, topics, output)
+    assert not (output / "author_topics.db").exists()
+
+
+def test_author_topics_resume_rejects_changed_parquet(
+    tmp_path, monkeypatch
+):
+    corpus = tmp_path / "articles.db"
+    topics = tmp_path / "topics"
+    output = tmp_path / "author_topics"
+    write_corpus(corpus)
+    write_topics(topics)
+    monkeypatch.setattr(
+        author_topics_module,
+        "_write_final_database",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
+    )
+    with pytest.raises(RuntimeError, match="stop"):
+        build_author_topics(corpus, topics, output)
+
+    pq.write_table(
+        pa.table(
+            {
+                "article_id": pa.array([1, 2], type=pa.int64()),
+                "topic": pa.array([1, 1], type=pa.int32()),
+                "probability": pa.array([0.9, 0.8], type=pa.float32()),
+            }
+        ),
+        topics / "article_topic_classifications.parquet",
+    )
+    with pytest.raises(ValueError, match="topic_assignments_sha256"):
+        build_author_topics(corpus, topics, output, resume=True)
+
+
 def test_author_topic_command_is_registered():
     assert COMMANDS["author-topics"] == "openalex.analysis.author_topics"

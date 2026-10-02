@@ -20,6 +20,8 @@ from urllib.parse import quote
 
 import numpy as np
 
+from openalex.analysis.author_aggregation import file_sha256
+
 logger = logging.getLogger(__name__)
 
 ARTIFACT_VERSION = 1
@@ -340,12 +342,15 @@ def build_embeddings(
         raise ValueError("--output-dir must not contain the source database")
     database = output / DATABASE_NAME
     manifest_path = output / "manifest.json"
+    logger.info("Fingerprinting source corpus %s", source)
+    source_sha256 = file_sha256(source)
     config = {
         "artifact_version": ARTIFACT_VERSION,
         "database": DATABASE_NAME,
         "model": model_name,
         "text_format": TEXT_FORMAT,
         "source_database": str(source),
+        "source_sha256": source_sha256,
         "source_size": source.stat().st_size,
         "encode_batch_size": encode_batch_size,
         "device": runtime_device,
@@ -627,14 +632,17 @@ def _store_batch(
 
 
 def _validate_resume(manifest: dict, config: dict) -> None:
-    for key in (
+    keys = [
         "artifact_version",
         "database",
         "model",
         "text_format",
         "source_database",
         "source_size",
-    ):
+    ]
+    if "source_sha256" in manifest:
+        keys.append("source_sha256")
+    for key in keys:
         if manifest.get(key) != config[key]:
             raise ValueError(
                 f"Existing embedding artifact used {key}={manifest.get(key)!r}, "

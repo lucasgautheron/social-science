@@ -86,8 +86,12 @@ def build_author_topics(
         raise FileNotFoundError(
             f"Canonical topic labels not found: {topic_list_path}"
         )
+    logger.info("Fingerprinting source corpus %s", source)
     source_info = source_metadata(source)
     _validate_corpus_provenance(topic_manifest, source, source_info)
+    logger.info("Fingerprinting topic assignments %s", assignments_path)
+    assignments_sha256 = file_sha256(assignments_path)
+    labels_sha256 = file_sha256(topic_list_path)
 
     manifest_path = output / "manifest.json"
     database_path = output / DATABASE_NAME
@@ -97,8 +101,8 @@ def build_author_topics(
         "artifact_version": ARTIFACT_VERSION,
         "aggregation": AGGREGATION,
         "database": DATABASE_NAME,
-        "topic_assignments_sha256": file_sha256(assignments_path),
-        "topic_labels_sha256": file_sha256(topic_list_path),
+        "topic_assignments_sha256": assignments_sha256,
+        "topic_labels_sha256": labels_sha256,
         "topic_manifest_sha256": manifest_sha256(topic_manifest_path),
         "topic_artifact_version": REQUIRED_TOPIC_ARTIFACT_VERSION,
         **source_info,

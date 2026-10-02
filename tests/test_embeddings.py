@@ -77,6 +77,7 @@ def test_embeddings_are_manifest_backed_resumable_and_read_only(tmp_path):
     assert manifest["complete"] is True
     assert manifest["rows"] == 2
     assert manifest["dimension"] == 2
+    assert len(manifest["source_sha256"]) == 64
     assert json.loads((output / "manifest.json").read_text())["database"] == "embeddings.db"
 
     store = EmbeddingStore(output)
