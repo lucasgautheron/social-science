@@ -257,15 +257,33 @@ class EmbeddingStore:
         return found
 
     def iter_batches(
-        self, batch_size: int = 10_000
+        self,
+        batch_size: int = 10_000,
+        *,
+        start_after: int | None = None,
     ) -> Iterator[tuple[list[int], np.ndarray]]:
         """Stream every stored embedding without loading the artifact at once."""
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         with self._connect() as connection:
-            cursor = connection.execute(
-                "SELECT article_id, embedding FROM embeddings ORDER BY article_id"
-            )
+            if start_after is None:
+                cursor = connection.execute(
+                    """
+                    SELECT article_id, embedding
+                    FROM embeddings
+                    ORDER BY article_id
+                    """
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    SELECT article_id, embedding
+                    FROM embeddings
+                    WHERE article_id > ?
+                    ORDER BY article_id
+                    """,
+                    (int(start_after),),
+                )
             while rows := cursor.fetchmany(batch_size):
                 article_ids = [int(row[0]) for row in rows]
                 vectors = np.vstack(

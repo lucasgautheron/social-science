@@ -84,6 +84,37 @@ sample CSV preserves BERTopic's training targets for auditing. Use
 `--no-visualizations`, or `--no-save-model` to omit optional outputs.
 These full-corpus classifier outputs use topic artifact schema version 2.
 
+Build per-author representations without modifying any input artifact:
+
+```bash
+openalex author-embeddings \
+  --db-path /path/to/articles.db \
+  --embeddings-dir output/embeddings \
+  --output-dir output/author_embeddings \
+  --resume
+
+openalex author-topics \
+  --db-path /path/to/articles.db \
+  --topics-dir output/topics \
+  --output-dir output/author_topics \
+  --resume
+```
+
+Both commands stream articles in bounded batches and checkpoint disk-backed
+state, so RAM use does not grow with the corpus. For a paper with `n` authors,
+each author receives fractional weight `1/n`. An author's embedding is
+`sum(weight * paper_embedding) / sum(weight)`. Its topic distribution uses the
+hard full-corpus MLP topic for each paper and normalizes the same fractional
+weights; classifier confidence is intentionally not used.
+
+`author_embeddings.db` stores one row per represented author in
+`author_embeddings(author_id, embedding, paper_count, total_weight)`.
+`embedding` is a raw little-endian `float32` vector whose dimension is recorded
+in the metadata table. `author_topics.db` stores sparse nonzero rows in
+`author_topics(author_id, topic, probability, fractional_weight)`, per-author
+totals in `authors`, and labels in `topics`. Both artifact directories include
+a versioned manifest tied to their exact upstream artifact.
+
 ## Corpus and event pipeline
 
 Database-producing and maintenance commands require an explicit writable
@@ -377,6 +408,26 @@ openalex-aws submit \
   -- openalex new-links \
   --events-dir output/events \
   --clusters-dir output/event_clusters
+```
+
+The author pipelines use the same staging mechanism:
+
+```bash
+openalex-aws submit --worker cpu \
+  --input output/embeddings \
+  -- openalex author-embeddings \
+  --db-path articles.db \
+  --embeddings-dir output/embeddings \
+  --output-dir output/author_embeddings \
+  --resume
+
+openalex-aws submit --worker cpu \
+  --input output/topics \
+  -- openalex author-topics \
+  --db-path articles.db \
+  --topics-dir output/topics \
+  --output-dir output/author_topics \
+  --resume
 ```
 
 The first submission publishes and downloads each artifact. Later submissions

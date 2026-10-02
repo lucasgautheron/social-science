@@ -8,6 +8,8 @@ import sys
 from collections.abc import Sequence
 
 COMMANDS = {
+    "author-embeddings": "openalex.analysis.author_embeddings",
+    "author-topics": "openalex.analysis.author_topics",
     "build-reference-index": "openalex.db.build_reference_index",
     "build-website": "openalex.website.build",
     "cluster-events": "openalex.analysis.cluster_events",
