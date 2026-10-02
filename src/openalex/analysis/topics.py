@@ -85,7 +85,7 @@ def _topic_model_factory(
         hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
         representation_model=representation_model,
-        nr_topics="auto",
+        nr_topics=None,
         calculate_probabilities=True,
         verbose=True,
     )
@@ -98,11 +98,11 @@ def assign_topics(
     *,
     sample_size: int | None = DEFAULT_SAMPLE_SIZE,
     random_seed: int = 42,
-    min_cluster_size: int = 50,
+    min_cluster_size: int = 25,
     n_neighbors: int = 15,
     min_dist: float = 0.0,
     metric: str = "cosine",
-    umap_components: int = 10,
+    umap_components: int = 5,
     outlier_threshold: float = 0.1,
     hierarchy: bool = True,
     visualizations: bool = True,
@@ -175,6 +175,14 @@ def assign_topics(
     )
     original_topics, probabilities = topic_model.fit_transform(documents, embeddings)
     original_topics = np.asarray(original_topics, dtype=np.int64)
+    discovered_topics = len(
+        {int(topic) for topic in original_topics if int(topic) != -1}
+    )
+    logger.info(
+        "BERTopic discovered %s topics and %s outliers in the sample",
+        discovered_topics,
+        int(np.count_nonzero(original_topics == -1)),
+    )
 
     if np.any(original_topics == -1):
         reduced_topics = np.asarray(
@@ -871,11 +879,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--sample-size", type=_sample_size, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--random-seed", type=int, default=42)
-    parser.add_argument("--min-cluster-size", type=int, default=50)
+    parser.add_argument("--min-cluster-size", type=int, default=25)
     parser.add_argument("--n-neighbors", type=int, default=15)
     parser.add_argument("--min-dist", type=float, default=0.0)
     parser.add_argument("--metric", default="cosine")
-    parser.add_argument("--umap-components", type=int, default=10)
+    parser.add_argument("--umap-components", type=int, default=5)
     parser.add_argument("--outlier-threshold", type=float, default=0.1)
     parser.add_argument(
         "--classification-batch-size",

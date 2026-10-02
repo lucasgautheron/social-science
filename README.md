@@ -66,7 +66,11 @@ openalex topics \
 BERTopic discovers topics on a deterministic random sample of 100,000
 articles selected exclusively from the corpus `articles_order` table. The
 command rejects missing or stale random-order tables instead of silently using
-a different sample. A standardized MLP is then selected by stratified cross-validation,
+a different sample. Topic discovery uses EOM cluster selection with a minimum
+topic size of 25, tuned for the 100,000-article sample; use
+`--min-cluster-size` to change the minimum. BERTopic does not apply a second
+automatic topic-reduction pass. A standardized MLP is then selected by
+stratified cross-validation,
 evaluated on a held-out portion of that sample, refit on all sample labels, and
 used to classify every stored embedding in chunks. Results include full-corpus
 and sample assignments, macro/weighted F1 metrics, cross-validation results,

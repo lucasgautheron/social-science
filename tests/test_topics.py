@@ -12,6 +12,7 @@ from openalex.analysis.embeddings import EmbeddingStore, build_embeddings
 from openalex.analysis.topics import (
     _write_full_classifications,
     assign_topics,
+    build_parser,
     select_topic_sample,
     topic_probabilities,
     train_topic_classifier,
@@ -348,6 +349,16 @@ def test_classifier_extrapolates_sample_topics_to_every_embedding(tmp_path):
 
 def test_topics_command_is_registered():
     assert COMMANDS["topics"] == "openalex.analysis.topics"
+
+
+def test_topics_use_configured_granularity_defaults():
+    args = build_parser().parse_args([])
+
+    assert args.min_cluster_size == 25
+    assert args.n_neighbors == 15
+    assert args.min_dist == 0.0
+    assert args.metric == "cosine"
+    assert args.umap_components == 5
 
 
 def test_real_mlp_reports_f1_and_refits_without_holding_out_rows():
