@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Event keyword clusters and their share of documents over time">
+    <title>Clusters · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app list-app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Clusters</h1>
+          <nav aria-label="Site">
+            <a href="clusters.html" aria-current="page">Clusters</a>
+            <a href="link-distances.html">Link distances</a>
+          </nav>
+        </div>
+        <p class="intro">Every cluster, ranked by the share of documents that contain any of its keywords.</p>
+      </header>
+      <section class="card keyword-card">
+        <div class="summary" id="summary">Loading clusters…</div>
+        <ol id="clusters" class="keyword-list"></ol>
+      </section>
+    </main>
+    <script src="clusters.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Event-cluster size and coauthorship-link distance">
+    <title>Link distances · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app link-app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Cluster link distances</h1>
+          <nav aria-label="Site">
+            <a href="clusters.html">Clusters</a>
+            <a href="link-distances.html" aria-current="page">Link distances</a>
+          </nav>
+        </div>
+        <p class="intro">Compare cluster size with mean coauthor-network or semantic distance. Hover a cluster to see its publication curve, mean distance by year, and distance distribution.</p>
+      </header>
+      <section class="link-workspace card">
+        <div class="scatter-panel">
+          <div class="plot-toolbar">
+            <div class="plot-tabs" role="group" aria-label="Distance measure">
+              <button type="button" data-measure="new" aria-pressed="true">First links</button>
+              <button type="button" data-measure="all" aria-pressed="false">All paper links</button>
+              <button type="button" data-measure="semantic" aria-pressed="false">Semantic distance</button>
+            </div>
+            <label class="plot-search">
+              <span>Search clusters</span>
+              <input id="cluster-search" type="search" placeholder="Keyword or cluster…" autocomplete="off">
+            </label>
+            <p id="summary" class="summary">Loading cluster distances…</p>
+            <div class="type-filter" role="group" aria-label="Cluster type">
+              <button type="button" data-cluster-type="trend increasing" aria-pressed="true"><i></i>Trend increasing</button>
+              <button type="button" data-cluster-type="trend decreasing" aria-pressed="true"><i></i>Trend decreasing</button>
+              <button type="button" data-cluster-type="step" aria-pressed="true"><i></i>Step</button>
+              <button type="button" data-cluster-type="shock" aria-pressed="true"><i></i>Shock</button>
+              <button type="button" data-cluster-type="bump increasing" aria-pressed="true"><i></i>Bump increasing</button>
+              <button type="button" data-cluster-type="bump decreasing" aria-pressed="true"><i></i>Bump decreasing</button>
+              <button type="button" data-cluster-type="bump unknown" aria-pressed="true"><i></i>Bump unknown</button>
+            </div>
+          </div>
+          <div class="scatter-frame">
+            <svg id="link-scatter" role="img" aria-label="Clusters by paper count and average link distance"></svg>
+            <div id="link-tooltip" class="tooltip scatter-tooltip" hidden></div>
+          </div>
+          <p class="hint scatter-hint">Hover a point for its temporal curves and distance distribution</p>
+        </div>
+        <aside id="link-details" class="details link-details" aria-live="polite">
+          <div class="empty">
+            <p class="eyebrow">Event cluster</p>
+            <h2>Explore the points</h2>
+            <p>Each point is one cluster. Its size is on the logarithmic horizontal axis; mean connected distance is vertical. Hovering a point also shows that cluster's mean distance by year.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+    <script src="link-distances.js" defer></script>
+  </body>
+</html>
