@@ -32,8 +32,10 @@ embeddings = [
 topics = [
   "bertopic>=0.17",
   "hdbscan>=0.8.40",
+  "joblib>=1.4",
   "pandas>=2.2",
   "plotly>=5.24",
+  "pyarrow>=17",
   "scikit-learn>=1.5",
   "umap-learn>=0.5.7",
 ]

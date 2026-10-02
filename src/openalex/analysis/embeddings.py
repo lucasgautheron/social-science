@@ -216,11 +216,16 @@ class EmbeddingStore:
             return int(connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
 
     def article_ids(self) -> list[int]:
+        return list(self.iter_article_ids())
+
+    def iter_article_ids(self) -> Iterator[int]:
+        """Stream stored article IDs in deterministic order."""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT article_id FROM embeddings ORDER BY CAST(article_id AS INTEGER)"
+                "SELECT article_id FROM embeddings ORDER BY article_id"
             )
-            return [int(row[0]) for row in rows]
+            for row in rows:
+                yield int(row[0])
 
     def get_embedding(self, article_id: int | str) -> np.ndarray | None:
         with self._connect() as connection:
@@ -250,6 +255,26 @@ class EmbeddingStore:
                         blob, dimension=self.dimension
                     )
         return found
+
+    def iter_batches(
+        self, batch_size: int = 10_000
+    ) -> Iterator[tuple[list[int], np.ndarray]]:
+        """Stream every stored embedding without loading the artifact at once."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "SELECT article_id, embedding FROM embeddings ORDER BY article_id"
+            )
+            while rows := cursor.fetchmany(batch_size):
+                article_ids = [int(row[0]) for row in rows]
+                vectors = np.vstack(
+                    [
+                        decode_embedding(row[1], dimension=self.dimension)
+                        for row in rows
+                    ]
+                )
+                yield article_ids, vectors
 
 
 def build_embeddings(

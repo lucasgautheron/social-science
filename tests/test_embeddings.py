@@ -83,6 +83,9 @@ def test_embeddings_are_manifest_backed_resumable_and_read_only(tmp_path):
     assert store.article_ids() == [1, 2]
     assert store.get_embedding(1).tolist() == [28.0, 0.0]
     assert set(store.get_embeddings_batch([2, 999])) == {2}
+    streamed = list(store.iter_batches(batch_size=1))
+    assert [article_ids for article_ids, _vectors in streamed] == [[1], [2]]
+    assert streamed[0][1].shape == (1, 2)
 
     resumed_encoder = FakeEncoder()
     resumed = build_embeddings(

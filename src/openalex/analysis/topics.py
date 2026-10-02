@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import sqlite3
+from collections import Counter
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import numpy as np
@@ -19,12 +21,16 @@ from openalex.analysis.embeddings import DEFAULT_MODEL, EmbeddingStore
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 DEFAULT_OUTPUT_DIR = Path("output/topics")
 DEFAULT_SAMPLE_SIZE = 100_000
+DEFAULT_CLASSIFICATION_BATCH_SIZE = 10_000
+DEFAULT_CLASSIFIER_CV_FOLDS = 3
+DEFAULT_CLASSIFIER_JOBS = 4
 _SQLITE_IN_LIMIT = 900
 
 TopicModelFactory = Callable[..., object]
+ClassifierTrainer = Callable[..., tuple[object, dict[str, Any], list[dict[str, Any]]]]
 
 
 def _topic_model_factory(
@@ -101,9 +107,14 @@ def assign_topics(
     hierarchy: bool = True,
     visualizations: bool = True,
     save_model: bool = True,
+    classification_batch_size: int = DEFAULT_CLASSIFICATION_BATCH_SIZE,
+    classifier_cv_folds: int = DEFAULT_CLASSIFIER_CV_FOLDS,
+    classifier_jobs: int = DEFAULT_CLASSIFIER_JOBS,
+    classifier_test_size: float = 0.2,
     model_factory: TopicModelFactory = _topic_model_factory,
+    classifier_trainer: ClassifierTrainer | None = None,
 ) -> dict[str, object]:
-    """Fit BERTopic and write article assignments plus topic metadata."""
+    """Discover BERTopic labels, train an MLP, and classify the full artifact."""
     if sample_size is not None and sample_size < 1:
         raise ValueError("--sample-size must be >= 1 or 'all'")
     if min_cluster_size < 2:
@@ -114,6 +125,14 @@ def assign_topics(
         raise ValueError("--umap-components must be >= 2")
     if not 0 <= outlier_threshold <= 1:
         raise ValueError("--outlier-threshold must be between 0 and 1")
+    if classification_batch_size < 1:
+        raise ValueError("--classification-batch-size must be >= 1")
+    if classifier_cv_folds < 2:
+        raise ValueError("--classifier-cv-folds must be >= 2")
+    if classifier_jobs == 0:
+        raise ValueError("--classifier-jobs must not be zero")
+    if not 0 < classifier_test_size < 1:
+        raise ValueError("--classifier-test-size must be between 0 and 1")
 
     source = Path(db_path).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
@@ -130,7 +149,11 @@ def assign_topics(
             f"{output} already contains topic results. Use a new --output-dir."
         )
 
-    selected_ids = select_article_ids(store.article_ids(), sample_size, random_seed)
+    selected_ids = select_topic_sample(
+        source,
+        store,
+        sample_size,
+    )
     article_ids, documents, embeddings = load_topic_inputs(source, store, selected_ids)
     if not article_ids:
         raise ValueError("No articles have both embeddings and source documents")
@@ -175,23 +198,61 @@ def assign_topics(
     output.mkdir(parents=True, exist_ok=True)
     topic_info = topic_model.get_topic_info()
     labels = topic_labels(topic_info)
-    classifications_path = output / "article_topic_classifications.csv"
+    sample_classifications_path = output / "sample_topic_classifications.csv"
     _write_classifications(
-        classifications_path,
+        sample_classifications_path,
         article_ids,
         reduced_topics,
         assignment_probabilities,
         labels,
     )
+
+    trainer = classifier_trainer or train_topic_classifier
+    classifier, classifier_metrics, cv_records = trainer(
+        embeddings,
+        reduced_topics,
+        random_seed=random_seed,
+        cv_folds=classifier_cv_folds,
+        jobs=classifier_jobs,
+        test_size=classifier_test_size,
+    )
+    classifier_path = output / "topic_classifier.joblib"
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError(
+            "Topic classifier support requires joblib. Install the topics extras."
+        ) from exc
+    joblib.dump(classifier, classifier_path)
+    classifier_metrics_path = output / "classifier_metrics.json"
+    _atomic_json(classifier_metrics_path, classifier_metrics)
+    classifier_cv_path = output / "classifier_cv_results.csv"
+    _write_classifier_cv_results(classifier_cv_path, cv_records)
+
+    classifications_path = output / "article_topic_classifications.parquet"
+    classified_articles, full_topic_counts = _write_full_classifications(
+        classifications_path,
+        store,
+        classifier,
+        batch_size=classification_batch_size,
+    )
     topic_list_path = output / "topic_list.csv"
-    topic_records = _write_topic_list(topic_list_path, topic_info, reduced_topics)
+    topic_records = _write_topic_list(
+        topic_list_path,
+        topic_info,
+        topic_counts=full_topic_counts,
+    )
     detailed_path = output / "detailed_topics.csv"
     _write_detailed_topics(detailed_path, topic_model, topic_records)
 
     files = [
         classifications_path.name,
+        sample_classifications_path.name,
         topic_list_path.name,
         detailed_path.name,
+        classifier_path.name,
+        classifier_metrics_path.name,
+        classifier_cv_path.name,
     ]
     if hierarchy:
         hierarchical_topics = topic_model.hierarchical_topics(documents)
@@ -231,11 +292,24 @@ def assign_topics(
         files.append(model_path.name)
 
     unique_topics = sorted({int(topic) for topic in reduced_topics if int(topic) != -1})
-    outliers = int(np.count_nonzero(reduced_topics == -1))
+    outliers = int(full_topic_counts.get(-1, 0))
     manifest = {
         "artifact_version": ARTIFACT_VERSION,
         "article_assignments": classifications_path.name,
-        "articles": len(article_ids),
+        "articles": classified_articles,
+        "sample_articles": len(article_ids),
+        "sample_assignments": sample_classifications_path.name,
+        "classifier": {
+            "algorithm": "MLPClassifier",
+            "cross_validation_folds": classifier_metrics["cross_validation_folds"],
+            "cv_macro_f1": classifier_metrics["cv_macro_f1"],
+            "held_out_macro_f1": classifier_metrics["held_out_macro_f1"],
+            "held_out_weighted_f1": classifier_metrics[
+                "held_out_weighted_f1"
+            ],
+            "model": classifier_path.name,
+        },
+        "classification_batch_size": classification_batch_size,
         "embedding_artifact": str(Path(embeddings_path).expanduser().resolve()),
         "embedding_manifest_sha256": _manifest_digest(store.manifest_path),
         "files": files,
@@ -257,18 +331,55 @@ def assign_topics(
     return manifest
 
 
-def select_article_ids(
-    available_ids: Sequence[int],
+def select_topic_sample(
+    source: Path,
+    store: EmbeddingStore,
     sample_size: int | None,
-    random_seed: int,
 ) -> list[int]:
-    """Return a deterministic sorted sample of available article IDs."""
-    ids = np.asarray(available_ids, dtype=np.int64)
-    if sample_size is None or sample_size >= len(ids):
-        return sorted(int(article_id) for article_id in ids)
-    rng = np.random.default_rng(random_seed)
-    chosen = rng.choice(ids, size=sample_size, replace=False)
-    return sorted(int(article_id) for article_id in chosen)
+    """Select sample membership exclusively from the corpus random order."""
+    if sample_size is None:
+        return list(store.iter_article_ids())
+    with _connect_readonly(source) as connection:
+        table_exists = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'articles_order'
+            """
+        ).fetchone()
+        if not table_exists:
+            raise ValueError(
+                "The source database has no articles_order table. Create it "
+                "with `openalex random-order <db-path>` before assigning topics."
+            )
+        ordered_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM articles_order"
+            ).fetchone()[0]
+        )
+        embedding_count = store.count()
+        if ordered_count != embedding_count:
+            raise ValueError(
+                "articles_order is stale: it contains "
+                f"{ordered_count} rows but the embedding artifact contains "
+                f"{embedding_count}. Rebuild it with `openalex random-order "
+                "<db-path>`."
+            )
+        rows = connection.execute(
+            """
+            SELECT article_id
+            FROM articles_order
+            ORDER BY random_rank
+            LIMIT ?
+            """,
+            (sample_size,),
+        )
+        selected = [int(row[0]) for row in rows]
+    logger.info(
+        "Selected %s articles from the corpus articles_order table",
+        len(selected),
+    )
+    return sorted(selected)
 
 
 def load_topic_inputs(
@@ -328,6 +439,286 @@ def topic_probabilities(probabilities, topics: np.ndarray) -> np.ndarray:
     return result
 
 
+def train_topic_classifier(
+    embeddings: np.ndarray,
+    topics: np.ndarray,
+    *,
+    random_seed: int,
+    cv_folds: int,
+    jobs: int,
+    test_size: float,
+) -> tuple[object, dict[str, Any], list[dict[str, Any]]]:
+    """Select and evaluate an MLP, then refit it on the complete BERTopic sample."""
+    try:
+        from sklearn.base import clone
+        from sklearn.metrics import classification_report, f1_score
+        from sklearn.model_selection import GridSearchCV, train_test_split
+        from sklearn.neural_network import MLPClassifier
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+    except ImportError as exc:
+        raise RuntimeError(
+            "Topic classifier support requires scikit-learn. "
+            "Install the topics extras."
+        ) from exc
+
+    all_features = np.asarray(embeddings, dtype=np.float32)
+    all_targets = np.asarray(topics, dtype=np.int64)
+    semantic_mask = all_targets != -1
+    excluded_outliers = int(np.count_nonzero(~semantic_mask))
+    features = all_features[semantic_mask]
+    targets = all_targets[semantic_mask]
+    classes, class_counts = np.unique(targets, return_counts=True)
+    if len(classes) < 2:
+        raise ValueError("At least two BERTopic classes are required to train the MLP")
+    if int(class_counts.min()) < 2:
+        raise ValueError(
+            "Every BERTopic class needs at least two sampled articles for "
+            "stratified classifier evaluation"
+        )
+
+    minimum_test_fraction = len(classes) / len(targets)
+    effective_test_size = max(test_size, minimum_test_fraction)
+    if effective_test_size >= 1:
+        raise ValueError("The BERTopic sample is too small for a held-out test set")
+    train_features, test_features, train_targets, test_targets = train_test_split(
+        features,
+        targets,
+        test_size=effective_test_size,
+        random_state=random_seed,
+        stratify=targets,
+    )
+    _, training_class_counts = np.unique(train_targets, return_counts=True)
+    effective_cv_folds = min(cv_folds, int(training_class_counts.min()))
+    if effective_cv_folds < 2:
+        raise ValueError(
+            "The BERTopic sample is too small for stratified cross-validation"
+        )
+
+    pipeline = Pipeline(
+        [
+            ("scale", StandardScaler()),
+            (
+                "mlp",
+                MLPClassifier(
+                    batch_size=512,
+                    early_stopping=True,
+                    max_iter=200,
+                    n_iter_no_change=10,
+                    random_state=random_seed,
+                ),
+            ),
+        ]
+    )
+    parameter_grid = {
+        "mlp__hidden_layer_sizes": [(128,), (256,), (256, 128)],
+        "mlp__alpha": [1e-4, 1e-3],
+        "mlp__learning_rate_init": [1e-3],
+    }
+    search = GridSearchCV(
+        pipeline,
+        parameter_grid,
+        scoring={"macro_f1": "f1_macro", "weighted_f1": "f1_weighted"},
+        refit="macro_f1",
+        cv=effective_cv_folds,
+        n_jobs=jobs,
+        return_train_score=False,
+        verbose=2,
+    )
+    logger.info(
+        "Selecting an MLP with %s-fold cross-validation over %s candidates",
+        effective_cv_folds,
+        len(parameter_grid["mlp__hidden_layer_sizes"])
+        * len(parameter_grid["mlp__alpha"]),
+    )
+    search.fit(train_features, train_targets)
+    test_predictions = search.best_estimator_.predict(test_features)
+    held_out_macro_f1 = float(
+        f1_score(test_targets, test_predictions, average="macro")
+    )
+    held_out_weighted_f1 = float(
+        f1_score(test_targets, test_predictions, average="weighted")
+    )
+    report = classification_report(
+        test_targets,
+        test_predictions,
+        output_dict=True,
+        zero_division=0,
+    )
+    best_params = {
+        key.removeprefix("mlp__"): value
+        for key, value in search.best_params_.items()
+    }
+    cv_records = []
+    for index, params in enumerate(search.cv_results_["params"]):
+        cv_records.append(
+            {
+                "params": {
+                    key.removeprefix("mlp__"): value
+                    for key, value in params.items()
+                },
+                "mean_macro_f1": float(
+                    search.cv_results_["mean_test_macro_f1"][index]
+                ),
+                "std_macro_f1": float(
+                    search.cv_results_["std_test_macro_f1"][index]
+                ),
+                "mean_weighted_f1": float(
+                    search.cv_results_["mean_test_weighted_f1"][index]
+                ),
+                "rank_macro_f1": int(
+                    search.cv_results_["rank_test_macro_f1"][index]
+                ),
+            }
+        )
+    metrics = _json_safe(
+        {
+            "algorithm": "MLPClassifier",
+            "selection_metric": "macro_f1",
+            "cross_validation_folds": effective_cv_folds,
+            "cv_macro_f1": float(search.best_score_),
+            "held_out_macro_f1": held_out_macro_f1,
+            "held_out_weighted_f1": held_out_weighted_f1,
+            "held_out_articles": len(test_targets),
+            "training_articles": len(train_targets),
+            "classifier_labeled_articles": len(targets),
+            "bertopic_sample_articles": len(all_targets),
+            "excluded_sample_outliers": excluded_outliers,
+            "best_params": best_params,
+            "classification_report": report,
+        }
+    )
+    logger.info(
+        "Selected MLP %s; CV macro-F1 %.4f; held-out macro-F1 %.4f; "
+        "held-out weighted-F1 %.4f",
+        best_params,
+        search.best_score_,
+        held_out_macro_f1,
+        held_out_weighted_f1,
+    )
+    classifier = clone(search.best_estimator_)
+    classifier.set_params(mlp__early_stopping=False)
+    classifier.fit(features, targets)
+    return classifier, metrics, cv_records
+
+
+def _write_full_classifications(
+    path: Path,
+    store: EmbeddingStore,
+    classifier,
+    *,
+    batch_size: int,
+) -> tuple[int, Counter]:
+    """Predict every embedding with the MLP into compressed Parquet row groups."""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "Full-corpus topic export requires pyarrow. Install the topics extras."
+        ) from exc
+
+    classes = np.asarray(classifier.classes_, dtype=np.int64)
+    counts: Counter = Counter()
+    processed = 0
+    total = store.count()
+    schema = pa.schema(
+        [
+            pa.field("article_id", pa.int64(), nullable=False),
+            pa.field("topic", pa.int32(), nullable=False),
+            pa.field("probability", pa.float32(), nullable=False),
+        ]
+    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with pq.ParquetWriter(
+            temporary,
+            schema,
+            compression="zstd",
+            use_dictionary=["topic"],
+            write_statistics=True,
+        ) as writer:
+            for article_ids, embeddings in store.iter_batches(batch_size):
+                probabilities = np.asarray(
+                    classifier.predict_proba(embeddings), dtype=np.float32
+                )
+                best_indices = probabilities.argmax(axis=1)
+                predicted_topics = classes[best_indices].astype(
+                    np.int32, copy=False
+                )
+                predicted_probabilities = probabilities[
+                    np.arange(len(article_ids)), best_indices
+                ].astype(np.float32, copy=False)
+                counts.update(
+                    {
+                        int(topic): int(count)
+                        for topic, count in zip(
+                            *np.unique(predicted_topics, return_counts=True),
+                            strict=True,
+                        )
+                    }
+                )
+                table = pa.Table.from_arrays(
+                    [
+                        pa.array(article_ids, type=pa.int64()),
+                        pa.array(predicted_topics, type=pa.int32()),
+                        pa.array(predicted_probabilities, type=pa.float32()),
+                    ],
+                    schema=schema,
+                )
+                writer.write_table(table, row_group_size=len(article_ids))
+                processed += len(article_ids)
+                logger.info(
+                    "Classified %s/%s article embeddings",
+                    processed,
+                    total,
+                )
+        if processed != total:
+            raise RuntimeError(
+                f"Classified {processed} embeddings, expected {total}"
+            )
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return processed, counts
+
+
+def _write_classifier_cv_results(
+    path: Path, records: Sequence[dict[str, Any]]
+) -> None:
+    fieldnames = [
+        "rank_macro_f1",
+        "mean_macro_f1",
+        "std_macro_f1",
+        "mean_weighted_f1",
+        "params",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in sorted(records, key=lambda value: value["rank_macro_f1"]):
+            writer.writerow(
+                {
+                    **{key: record[key] for key in fieldnames if key != "params"},
+                    "params": json.dumps(
+                        _json_safe(record["params"]), sort_keys=True
+                    ),
+                }
+            )
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def topic_labels(topic_info) -> dict[int, str]:
     labels: dict[int, str] = {-1: "Outlier"}
     for row in topic_info.to_dict("records"):
@@ -361,12 +752,25 @@ def _write_classifications(
             )
 
 
-def _write_topic_list(path: Path, topic_info, topics: np.ndarray) -> list[dict]:
+def _write_topic_list(
+    path: Path,
+    topic_info,
+    topics: np.ndarray | None = None,
+    *,
+    topic_counts: Counter | None = None,
+) -> list[dict]:
     records = topic_info.to_dict("records")
-    counts = {
-        int(topic): int(count)
-        for topic, count in zip(*np.unique(topics, return_counts=True), strict=True)
-    }
+    if topic_counts is not None:
+        counts = {int(topic): int(count) for topic, count in topic_counts.items()}
+    elif topics is not None:
+        counts = {
+            int(topic): int(count)
+            for topic, count in zip(
+                *np.unique(topics, return_counts=True), strict=True
+            )
+        }
+    else:
+        raise ValueError("topics or topic_counts is required")
     normalized = []
     for row in records:
         normalized_row = dict(row)
@@ -473,6 +877,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metric", default="cosine")
     parser.add_argument("--umap-components", type=int, default=10)
     parser.add_argument("--outlier-threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--classification-batch-size",
+        type=int,
+        default=DEFAULT_CLASSIFICATION_BATCH_SIZE,
+        help="Embedding rows predicted per full-corpus MLP batch.",
+    )
+    parser.add_argument(
+        "--classifier-cv-folds",
+        type=int,
+        default=DEFAULT_CLASSIFIER_CV_FOLDS,
+        help="Stratified folds used to select MLP hyperparameters.",
+    )
+    parser.add_argument(
+        "--classifier-jobs",
+        type=int,
+        default=DEFAULT_CLASSIFIER_JOBS,
+        help="Parallel cross-validation jobs; use -1 for every CPU.",
+    )
+    parser.add_argument(
+        "--classifier-test-size",
+        type=float,
+        default=0.2,
+        help="Held-out fraction used only for final classifier evaluation.",
+    )
     parser.add_argument("--no-hierarchy", action="store_true")
     parser.add_argument("--no-visualizations", action="store_true")
     parser.add_argument("--no-save-model", action="store_true")
@@ -497,6 +925,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         hierarchy=not args.no_hierarchy,
         visualizations=not args.no_visualizations,
         save_model=not args.no_save_model,
+        classification_batch_size=args.classification_batch_size,
+        classifier_cv_folds=args.classifier_cv_folds,
+        classifier_jobs=args.classifier_jobs,
+        classifier_test_size=args.classifier_test_size,
     )
     print(json.dumps(manifest, indent=2))
     return 0

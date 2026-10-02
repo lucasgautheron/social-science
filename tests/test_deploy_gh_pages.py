@@ -59,7 +59,7 @@ value = int(counter.read_text() if counter.exists() else "0") + 1
 counter.write_text(str(value), encoding="utf-8")
 Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="utf-8")
 (output / "index.html").write_text(f"site {value}\\n", encoding="utf-8")
-(output / "dendrogram.html").write_text("tree\\n", encoding="utf-8")
+(output / "clusters.html").write_text("clusters\\n", encoding="utf-8")
 """,
         encoding="utf-8",
     )

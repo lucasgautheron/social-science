@@ -111,6 +111,8 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     site_dir.mkdir()
     (site_dir / "progress.html").write_text("stale", encoding="utf-8")
     (site_dir / "app.js").write_text("stale keywords", encoding="utf-8")
+    (site_dir / "dendrogram.html").write_text("stale hierarchy", encoding="utf-8")
+    (site_dir / "dendrogram.js").write_text("stale hierarchy", encoding="utf-8")
     summary = build_website(
         event_dir,
         output_dir=site_dir,
@@ -120,16 +122,19 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     )
     assert summary["dendrogram_keywords"] == 3
     index = (site_dir / "index.html").read_text(encoding="utf-8")
-    assert "dendrogram.html" in index
+    assert "clusters.html" in index
+    assert "dendrogram" not in index
     assert "Top keywords" not in index
-    assert (site_dir / "dendrogram.html").is_file()
+    assert not (site_dir / "dendrogram.html").exists()
+    assert not (site_dir / "dendrogram.js").exists()
     assert (site_dir / "clusters.html").is_file()
     assert (site_dir / "link-distances.html").is_file()
     assert not (site_dir / "app.js").exists()
     assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
-    for page in ("dendrogram.html", "clusters.html", "link-distances.html"):
+    for page in ("clusters.html", "link-distances.html"):
         assert "Top keywords" not in (site_dir / page).read_text(encoding="utf-8")
+        assert "dendrogram" not in (site_dir / page).read_text(encoding="utf-8")
     payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
     assert "top_keywords" not in payload
     assert payload["cluster_list"] is None
@@ -410,9 +415,7 @@ def test_yearly_curves_use_database_article_counts(tmp_path):
     assert cluster["yearly"] == expected
     assert cluster["papers"] == 4
     assert cluster["share"] == pytest.approx(4 / 30)
-    dendrogram = (site_dir / "dendrogram.js").read_text(encoding="utf-8")
     clusters_js = (site_dir / "clusters.js").read_text(encoding="utf-8")
-    assert "y(Number(item.share)" in dendrogram
     assert "y(Number(item.share)" in clusters_js
 
 

@@ -30,7 +30,6 @@ body {
   justify-content: space-between;
   gap: 2rem;
 }
-.toolbar-actions { display: flex; align-items: end; justify-content: flex-end; gap: 1rem; }
 .eyebrow {
   margin: 0 0 .3rem;
   color: var(--accent);
@@ -72,23 +71,6 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .bar-track { height: .45rem; margin-top: .35rem; overflow: hidden; border-radius: 999px; background: #edf1ef; }
 .cluster-chart { display: block; width: 100%; height: 6.5rem; margin-top: .55rem; }
 .bar { height: 100%; min-width: 2px; border-radius: inherit; background: var(--accent); }
-.workspace { display: grid; min-height: 0; grid-template-columns: minmax(0, 1fr) minmax(20rem, 25rem); }
-.tree-panel, .graph-panel {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
-  background:
-    linear-gradient(rgb(25 72 68 / 4%) 1px, transparent 1px),
-    linear-gradient(90deg, rgb(25 72 68 / 4%) 1px, transparent 1px),
-    #fbfcfa;
-  background-size: 32px 32px;
-}
-#tree { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
-#tree:active { cursor: grabbing; }
-.tree-link { fill: none; stroke: #9aa8a5; stroke-width: 1.25; vector-effect: non-scaling-stroke; }
-.tree-node { fill: var(--accent); stroke: #fff; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.tree-node.leaf { fill: #2b998c; }
-.tree-node.active { fill: #102f2b; }
 .tooltip {
   position: absolute;
   z-index: 2;
@@ -112,18 +94,6 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .series-point { fill: #fff; stroke: var(--accent); stroke-width: 2; }
 .axis-label { fill: var(--muted); font-size: 10px; }
 .axis-label.end { text-anchor: end; }
-#reset {
-  height: 2.6rem;
-  padding: 0 1rem;
-  border: 1px solid var(--line);
-  border-radius: .65rem;
-  background: #fff;
-  cursor: pointer;
-  font: inherit;
-  font-size: .8rem;
-  font-weight: 700;
-}
-#reset:disabled { cursor: wait; opacity: .5; }
 
 .link-workspace {
   display: grid;
@@ -286,8 +256,6 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 @media (max-width: 800px) {
   .app { height: auto; min-height: 100vh; }
   .toolbar { align-items: start; flex-direction: column; gap: .75rem; }
-  .toolbar-actions { align-items: start; flex-direction: column; }
-  .workspace { grid-template-columns: 1fr; grid-template-rows: 65vh auto; }
   .details { border-top: 1px solid var(--line); border-left: 0; }
   .link-workspace { grid-template-columns: 1fr; }
   .link-details { min-height: 24rem; }

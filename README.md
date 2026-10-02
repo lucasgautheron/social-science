@@ -63,12 +63,22 @@ openalex topics \
   --output-dir output/topics
 ```
 
-The default deterministic sample contains up to 100,000 articles; pass
-`--sample-size all` for every embedded article. Results include per-article
-assignments, topic labels and words, a hierarchy, HTML visualizations, the
-saved BERTopic model, and a manifest tied to the embedding artifact. Use
-`--no-hierarchy`, `--no-visualizations`, or `--no-save-model` to omit optional
-outputs.
+BERTopic discovers topics on a deterministic random sample of 100,000
+articles selected exclusively from the corpus `articles_order` table. The
+command rejects missing or stale random-order tables instead of silently using
+a different sample. A standardized MLP is then selected by stratified cross-validation,
+evaluated on a held-out portion of that sample, refit on all sample labels, and
+used to classify every stored embedding in chunks. Results include full-corpus
+and sample assignments, macro/weighted F1 metrics, cross-validation results,
+the fitted classifier, topic labels and words, a hierarchy, visualizations,
+the saved BERTopic model, and a manifest tied to the embedding artifact. The
+canonical `article_topic_classifications.parquet` contains MLP predictions for
+every article—including the training sample—as `int64` article IDs, `int32`
+topics, and `float32` confidence, compressed with Zstandard. The separate
+sample CSV preserves BERTopic's training targets for auditing. Use
+`--sample-size` to change the discovery sample and `--no-hierarchy`,
+`--no-visualizations`, or `--no-save-model` to omit optional outputs.
+These full-corpus classifier outputs use topic artifact schema version 2.
 
 ## Corpus and event pipeline
 
@@ -242,10 +252,8 @@ openalex build-website \
 python -m http.server --directory output/website 8000
 ```
 
-The site root opens `dendrogram.html`, which shows the complete-linkage
-keyword hierarchy and a sidebar with each node's share of that year's articles
-and its descendant keywords. `clusters.html` lists every
-cluster from `cluster-events`. A cluster's size is the number of documents
+The site root opens `clusters.html`, which lists every cluster from
+`cluster-events`. A cluster's size is the number of documents
 that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year. `link-distances.html` interactively
 plots cluster paper count on a logarithmic x-axis against the two mean-distance
@@ -259,8 +267,8 @@ sizes with FDR-adjusted q-values. The
 cluster search matches labels, member keywords, and cluster ids, and filters
 the scatter points immediately.
 
-When genuine classifications are available, the dendrogram and cluster list
-use those keywords. Artefact-labelled members are left out of a cluster.
+When genuine classifications are available, the cluster list uses those
+keywords. Artefact-labelled members are left out of a cluster.
 
 The builder filters words below `--min-document-frequency` (default 10),
 normalizes nonzero co-occurrence rows to unit L2 norm, uses cosine distance,

@@ -26,10 +26,8 @@ DEFAULT_MIN_DOCUMENT_FREQUENCY = 10
 DEFAULT_MAX_DENDROGRAM_KEYWORDS = 500
 SITE_ASSETS = (
     "index.html",
-    "dendrogram.html",
     "clusters.html",
     "link-distances.html",
-    "dendrogram.js",
     "clusters.js",
     "link-distances.js",
     "style.css",
@@ -954,14 +952,13 @@ def build_website(
     output.mkdir(parents=True, exist_ok=True)
     expected_html = {
         "index.html",
-        "dendrogram.html",
         "clusters.html",
         "link-distances.html",
     }
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
             stale_html.unlink()
-    for retired in ("app.js", "graph.js"):
+    for retired in ("app.js", "graph.js", "dendrogram.js"):
         retired_path = output / retired
         if retired_path.is_file():
             retired_path.unlink()
