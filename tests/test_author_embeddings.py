@@ -37,6 +37,7 @@ def write_corpus(path):
 
 def write_embeddings(path, *, complete=True):
     path.mkdir()
+    source = path.parent / "articles.db"
     database = path / "embeddings.db"
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -63,6 +64,8 @@ def write_embeddings(path, *, complete=True):
                 "dimension": 2,
                 "model": "test-model",
                 "rows": 2,
+                "source_database": str(source.resolve()),
+                "source_size": source.stat().st_size,
             }
         )
     )
@@ -252,6 +255,8 @@ def test_author_embeddings_chunks_more_than_sqlite_parameter_limit(tmp_path):
                 "dimension": 1,
                 "model": "test-model",
                 "rows": count,
+                "source_database": str(corpus.resolve()),
+                "source_size": corpus.stat().st_size,
             }
         )
     )
@@ -284,6 +289,45 @@ def test_author_embeddings_reject_incomplete_or_unmanifested_input(tmp_path):
     (embeddings / "manifest.json").unlink()
     with pytest.raises(ValueError, match="manifest-backed"):
         build_author_embeddings(corpus, embeddings, tmp_path / "output")
+
+
+def test_author_embeddings_reject_mismatched_corpus_provenance(tmp_path):
+    corpus = tmp_path / "articles.db"
+    embeddings = tmp_path / "embeddings"
+    write_corpus(corpus)
+    write_embeddings(embeddings)
+    manifest_path = embeddings / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source_database"] = str(tmp_path / "another.db")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="corpus provenance"):
+        build_author_embeddings(corpus, embeddings, tmp_path / "output")
+
+
+def test_author_embeddings_resume_rejects_changed_embedding_payload(
+    tmp_path, monkeypatch
+):
+    corpus = tmp_path / "articles.db"
+    embeddings = tmp_path / "embeddings"
+    output = tmp_path / "author_embeddings"
+    write_corpus(corpus)
+    write_embeddings(embeddings)
+    monkeypatch.setattr(
+        author_embeddings_module,
+        "_write_author_database",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
+    )
+    with pytest.raises(RuntimeError, match="stop"):
+        build_author_embeddings(corpus, embeddings, output)
+
+    with sqlite3.connect(embeddings / "embeddings.db") as connection:
+        connection.execute(
+            "UPDATE embeddings SET embedding = ? WHERE article_id = 1",
+            (encode_embedding(np.asarray([9.0, 9.0])),),
+        )
+    with pytest.raises(ValueError, match="embedding_database_sha256"):
+        build_author_embeddings(corpus, embeddings, output, resume=True)
 
 
 def test_author_embedding_command_is_registered():

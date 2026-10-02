@@ -20,6 +20,7 @@ from openalex.analysis.author_aggregation import (
     configure_writable_sqlite,
     connect_readonly,
     fetch_authorships,
+    file_sha256,
     flatten_authorships,
     manifest_sha256,
     read_json,
@@ -71,6 +72,8 @@ def build_author_embeddings(
         or store.root.is_relative_to(output)
     ):
         raise ValueError("--output-dir must not overlap --embeddings-dir")
+    source_info = source_metadata(source)
+    _validate_corpus_provenance(store.manifest, source, source_info)
 
     manifest_path = output / "manifest.json"
     database_path = output / DATABASE_NAME
@@ -81,9 +84,10 @@ def build_author_embeddings(
         "database": DATABASE_NAME,
         "dimension": int(store.dimension),
         "embedding_encoding": ENCODING,
+        "embedding_database_sha256": file_sha256(store.database_path),
         "embedding_manifest_sha256": manifest_sha256(store.manifest_path),
         "model": store.manifest.get("model"),
-        **source_metadata(source),
+        **source_info,
     }
 
     existing = read_json(manifest_path) if manifest_path.is_file() else None
@@ -402,6 +406,34 @@ def _validate_resume(existing: dict, config: dict) -> None:
                 f"Existing author embedding artifact used "
                 f"{key}={existing.get(key)!r}, not {expected!r}"
             )
+
+
+def _validate_corpus_provenance(
+    embedding_manifest: dict,
+    source: Path,
+    source_info: dict[str, int | str],
+) -> None:
+    upstream_sha256 = embedding_manifest.get("source_sha256")
+    if upstream_sha256 is not None:
+        if upstream_sha256 != source_info["source_sha256"]:
+            raise ValueError(
+                "The embedding artifact was built from a different corpus"
+            )
+        return
+    upstream_source = embedding_manifest.get("source_database")
+    if upstream_source is None or (
+        Path(str(upstream_source)).expanduser().resolve() != source
+    ):
+        raise ValueError(
+            "The embedding artifact has no matching corpus provenance"
+        )
+    upstream_size = embedding_manifest.get("source_size")
+    if upstream_size is not None and int(upstream_size) != int(
+        source_info["source_size"]
+    ):
+        raise ValueError(
+            "The embedding artifact was built from a different corpus size"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

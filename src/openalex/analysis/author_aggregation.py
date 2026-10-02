@@ -108,18 +108,25 @@ def build_author_index(
     )
     cursor = connection.execute("SELECT author_id FROM authors ORDER BY author_id")
     offset = 0
+    previous_author_id: int | None = None
     while rows := cursor.fetchmany(fetch_size):
         values = np.fromiter(
             (int(row[0]) for row in rows),
             dtype=np.int64,
             count=len(rows),
         )
+        if (
+            (previous_author_id is not None and values[0] <= previous_author_id)
+            or (len(values) > 1 and np.any(values[1:] <= values[:-1]))
+        ):
+            raise ValueError(
+                "authors.author_id must be unique and strictly increasing"
+            )
         author_ids[offset : offset + len(values)] = values
         offset += len(values)
+        previous_author_id = int(values[-1])
     if offset != total:
         raise RuntimeError(f"Read {offset} authors, expected {total}")
-    if total > 1 and np.any(author_ids[1:] <= author_ids[:-1]):
-        raise ValueError("authors.author_id must be unique and strictly increasing")
     author_ids.flush()
     del author_ids
     os.replace(temporary, destination)
@@ -176,10 +183,20 @@ def manifest_sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def file_sha256(path: str | Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Hash a payload incrementally without loading it into memory."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def source_metadata(path: Path) -> dict[str, int | str]:
     source = path.expanduser().resolve()
     return {
         "source_database": str(source),
+        "source_sha256": file_sha256(source),
         "source_size": source.stat().st_size,
     }
 

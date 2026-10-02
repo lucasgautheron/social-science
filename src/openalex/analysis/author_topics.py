@@ -19,6 +19,7 @@ from openalex.analysis.author_aggregation import (
     configure_writable_sqlite,
     connect_readonly,
     fetch_authorships,
+    file_sha256,
     flatten_authorships,
     manifest_sha256,
     read_json,
@@ -80,6 +81,13 @@ def build_author_topics(
         raise FileNotFoundError(
             f"Topic classification Parquet not found: {assignments_path}"
         )
+    topic_list_path = topics_root / "topic_list.csv"
+    if not topic_list_path.is_file():
+        raise FileNotFoundError(
+            f"Canonical topic labels not found: {topic_list_path}"
+        )
+    source_info = source_metadata(source)
+    _validate_corpus_provenance(topic_manifest, source, source_info)
 
     manifest_path = output / "manifest.json"
     database_path = output / DATABASE_NAME
@@ -89,9 +97,11 @@ def build_author_topics(
         "artifact_version": ARTIFACT_VERSION,
         "aggregation": AGGREGATION,
         "database": DATABASE_NAME,
+        "topic_assignments_sha256": file_sha256(assignments_path),
+        "topic_labels_sha256": file_sha256(topic_list_path),
         "topic_manifest_sha256": manifest_sha256(topic_manifest_path),
         "topic_artifact_version": REQUIRED_TOPIC_ARTIFACT_VERSION,
-        **source_metadata(source),
+        **source_info,
     }
 
     existing = read_json(manifest_path) if manifest_path.is_file() else None
@@ -212,7 +222,7 @@ def build_author_topics(
     author_count, pair_count = _write_final_database(
         database_path,
         accumulator_path,
-        topics_root / "topic_list.csv",
+        topic_list_path,
         config,
     )
     if expected_articles and processed_articles != expected_articles:
@@ -387,18 +397,15 @@ def _write_final_database(
                 ("source", json.dumps(metadata, sort_keys=True)),
             ],
         )
-        if topic_list_path.is_file():
-            with topic_list_path.open(
-                newline="", encoding="utf-8"
-            ) as handle:
-                topic_labels = {
-                    int(row["Topic"]): str(row.get("Name", row["Topic"]))
-                    for row in csv.DictReader(handle)
-                }
-            connection.executemany(
-                "INSERT INTO topics(topic, label) VALUES (?, ?)",
-                sorted(topic_labels.items()),
-            )
+        with topic_list_path.open(newline="", encoding="utf-8") as handle:
+            topic_labels = {
+                int(row["Topic"]): str(row.get("Name", row["Topic"]))
+                for row in csv.DictReader(handle)
+            }
+        connection.executemany(
+            "INSERT INTO topics(topic, label) VALUES (?, ?)",
+            sorted(topic_labels.items()),
+        )
         connection.execute("ATTACH DATABASE ? AS accumulator", (str(accumulator),))
         connection.execute(
             """
@@ -445,6 +452,23 @@ def _write_final_database(
             raise RuntimeError(
                 f"{invalid} author-topic distributions do not sum to one"
             )
+        missing_labels = [
+            int(row[0])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT a.topic
+                FROM author_topics a
+                LEFT JOIN topics t ON t.topic = a.topic
+                WHERE t.topic IS NULL
+                ORDER BY a.topic
+                """
+            )
+        ]
+        if missing_labels:
+            raise ValueError(
+                "Canonical topic labels are missing topics: "
+                + ", ".join(str(topic) for topic in missing_labels)
+            )
         connection.execute(
             "CREATE INDEX idx_author_topics_topic ON author_topics(topic)"
         )
@@ -471,6 +495,28 @@ def _validate_resume(existing: dict, config: dict) -> None:
                 f"Existing author-topic artifact used "
                 f"{key}={existing.get(key)!r}, not {expected!r}"
             )
+
+
+def _validate_corpus_provenance(
+    topic_manifest: dict,
+    source: Path,
+    source_info: dict[str, int | str],
+) -> None:
+    upstream_sha256 = topic_manifest.get("source_sha256")
+    if upstream_sha256 is not None:
+        if upstream_sha256 != source_info["source_sha256"]:
+            raise ValueError("The topic artifact was built from a different corpus")
+        return
+    upstream_source = topic_manifest.get("source_database")
+    if upstream_source is None or (
+        Path(str(upstream_source)).expanduser().resolve() != source
+    ):
+        raise ValueError("The topic artifact has no matching corpus provenance")
+    upstream_size = topic_manifest.get("source_size")
+    if upstream_size is not None and int(upstream_size) != int(
+        source_info["source_size"]
+    ):
+        raise ValueError("The topic artifact was built from a different corpus size")
 
 
 def build_parser() -> argparse.ArgumentParser:

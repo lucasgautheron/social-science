@@ -36,6 +36,7 @@ def write_corpus(path):
 
 def write_topics(path, *, artifact_version=2):
     path.mkdir()
+    source = path.parent / "articles.db"
     table = pa.table(
         {
             "article_id": pa.array([1, 2], type=pa.int64()),
@@ -59,6 +60,8 @@ def write_topics(path, *, artifact_version=2):
                     "article_topic_classifications.parquet"
                 ),
                 "articles": 2,
+                "source_database": str(source.resolve()),
+                "source_size": source.stat().st_size,
             }
         )
     )
