@@ -48,6 +48,21 @@
       description: "frequency-weighted author-pair occurrences with embeddings",
       semantic: true,
     },
+    diversity: {
+      distance: "rao_stirling_diversity",
+      distribution: "topic_distribution",
+      label: "Rao–Stirling topic diversity",
+      description: "paper-topic diversity using c-TF-IDF cosine dissimilarity",
+      diversity: true,
+    },
+    "author-diversity": {
+      distance: "author_rao_stirling_diversity",
+      distribution: "author_topic_distribution",
+      label: "Author primary-topic diversity",
+      description: "fractionally weighted author primary-topic diversity",
+      diversity: true,
+      authorDiversity: true,
+    },
   };
 
   function svgNode(name, attrs = {}) {
@@ -65,6 +80,11 @@
   function formatDistance(value) {
     if (value == null) return "—";
     return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+
+  function formatDiversity(value) {
+    if (value == null) return "—";
+    return Number(value).toLocaleString(undefined, { maximumFractionDigits: 3 });
   }
 
   function formatProbability(value) {
@@ -128,7 +148,7 @@
       <div class="empty">
         <p class="eyebrow">Event cluster</p>
         <h2>Explore the points</h2>
-        <p>Each visible point is one matching cluster. Hover it to see its temporal curves and distance distribution.</p>
+        <p>Each visible point is one matching cluster. Hover it to see its temporal curves and detailed distribution.</p>
       </div>
     `;
   }
@@ -247,8 +267,95 @@
     return chart;
   }
 
+  function orderedTopics(values, valueField = "papers") {
+    return [...(values || [])].sort(
+      (left, right) => Number(right[valueField]) - Number(left[valueField])
+        || Number(left.topic_id) - Number(right.topic_id),
+    );
+  }
+
+  function topicDistributionChart(row) {
+    const config = measures[state.measure];
+    const valueField = config.authorDiversity ? "weight" : "papers";
+    const values = orderedTopics(row[config.distribution], valueField);
+    const wrapper = document.createElement("div");
+    wrapper.className = "topic-histogram-scroll";
+    const width = Math.max(340, 54 + values.length * 38);
+    const chart = svgNode("svg", {
+      class: "line-chart topic-detail-chart",
+      viewBox: `0 0 ${width} 210`,
+      role: "img",
+    });
+    chart.style.width = `${width}px`;
+    if (!values.length) {
+      const message = svgNode("text", { class: "axis-label", x: 16, y: 30 });
+      message.textContent = "No topic assignments";
+      chart.append(message);
+      wrapper.append(chart);
+      return wrapper;
+    }
+    const padding = { left: 46, right: 12, top: 16, bottom: 46 };
+    const maxShare = Math.max(...values.map((item) => Number(item.share))) || 1;
+    const step = (width - padding.left - padding.right) / values.length;
+    const barWidth = Math.max(5, Math.min(24, step * 0.68));
+    const x = (index) => padding.left + step * (index + 0.5);
+    const y = (share) => 210 - padding.bottom
+      - (Number(share) / maxShare) * (210 - padding.top - padding.bottom);
+    chart.append(svgNode("path", {
+      class: "axis",
+      d: `M ${padding.left} ${padding.top} V ${210 - padding.bottom} H ${width - padding.right}`,
+    }));
+    values.forEach((item, index) => {
+      const bar = svgNode("rect", {
+        class: "topic-bar",
+        x: x(index) - barWidth / 2,
+        y: y(item.share),
+        width: barWidth,
+        height: Math.max(0, 210 - padding.bottom - y(item.share)),
+      });
+      const title = svgNode("title");
+      title.textContent = config.authorDiversity
+        ? `${item.label}: ${Number(item.authors).toLocaleString()} authors, ${Number(item.weight).toLocaleString(undefined, { maximumFractionDigits: 2 })} fractional paper weight (${formatPercent(item.share)})`
+        : `${item.label}: ${Number(item.papers).toLocaleString()} papers (${formatPercent(item.share)})`;
+      bar.append(title);
+      const label = svgNode("text", {
+        class: "axis-label",
+        x: x(index),
+        y: 181,
+        "text-anchor": "middle",
+      });
+      label.textContent = `T${item.topic_id}`;
+      chart.append(bar, label);
+    });
+    const maximum = svgNode("text", {
+      class: "axis-label",
+      x: 3,
+      y: padding.top + 4,
+    });
+    maximum.textContent = formatPercent(maxShare);
+    const xLabel = svgNode("text", {
+      class: "axis-label",
+      x: (padding.left + width - padding.right) / 2,
+      y: 204,
+      "text-anchor": "middle",
+    });
+    xLabel.textContent = config.authorDiversity
+      ? "Primary topics, ordered by fractional author weight"
+      : "Topics, ordered by frequency";
+    chart.append(maximum, xLabel);
+    chart.setAttribute(
+      "aria-label",
+      `${config.authorDiversity ? "Author primary-topic" : "Topic"} distribution for ${row.label}, ordered by frequency: ${values.map(
+        (item) => `${item.label} ${formatPercent(item.share)}`,
+      ).join(", ")}`,
+    );
+    wrapper.append(chart);
+    return wrapper;
+  }
+
   function distributionChart(row) {
     const config = measures[state.measure];
+    if (config.diversity) return topicDistributionChart(row);
     if (config.semantic) return semanticDistributionChart(row, config);
     const selected = distributionMap(row[config.distribution], state.measure);
     const baseline = distributionMap(row[config.baselineDistribution], state.measure);
@@ -461,7 +568,34 @@
     const stats = document.createElement("div");
     stats.className = "link-stats";
     const values = [["Cluster size", `${Number(row.paper_count).toLocaleString()} papers`]];
-    if (config.semantic) {
+    if (config.authorDiversity) {
+      const authors = Number(row.author_count || 0);
+      const covered = Number(row.author_primary_topic_count || 0);
+      const missing = Number(row.author_primary_topic_missing_count || 0);
+      const totalWeight = Number(row.author_weight || 0);
+      const coveredWeight = Number(row.author_primary_topic_weight || 0);
+      values.push(
+        ["Rao–Stirling diversity", formatDiversity(row[config.distance])],
+        ["Involved authors", authors.toLocaleString()],
+        ["Classified authors", covered.toLocaleString()],
+        ["Missing primary topics", missing.toLocaleString()],
+        ["Fractional paper weight", formatDiversity(totalWeight)],
+        ["Classified weight", formatDiversity(coveredWeight)],
+        ["Weighted coverage", formatProbability(totalWeight ? coveredWeight / totalWeight : null)],
+      );
+    } else if (config.diversity) {
+      const covered = Number(row.topic_observation_count || 0);
+      const missing = Number(row.topic_missing_count || 0);
+      const outliers = Number(row.topic_outlier_count || 0);
+      const total = covered + missing + outliers;
+      values.push(
+        ["Rao–Stirling diversity", formatDiversity(row[config.distance])],
+        ["Assigned papers", covered.toLocaleString()],
+        ["Missing topics", missing.toLocaleString()],
+        ["Topic outliers", outliers.toLocaleString()],
+        ["Topic coverage", formatProbability(total ? covered / total : null)],
+      );
+    } else if (config.semantic) {
       const covered = Number(row.semantic_link_observation_count || 0);
       const missing = Number(row.semantic_link_missing_embedding_count || 0);
       const coverage = covered + missing ? covered / (covered + missing) : null;
@@ -527,9 +661,13 @@
       ? "Mean semantic distance by year"
       : "Mean distance by year";
     const distanceTitle = document.createElement("h3");
-    distanceTitle.textContent = config.semantic
-      ? "Semantic-distance distribution"
-      : "Connected-distance distribution";
+    distanceTitle.textContent = config.authorDiversity
+      ? "Author primary-topic distribution"
+      : config.diversity
+        ? "Paper-topic distribution"
+      : config.semantic
+        ? "Semantic-distance distribution"
+        : "Connected-distance distribution";
     const legend = document.createElement("div");
     legend.className = "distance-legend";
     legend.innerHTML = config.semantic
@@ -542,12 +680,16 @@
       stats,
       chartTitle,
       lineChart(row.yearly || []),
-      yearlyDistanceTitle,
-      distanceYearChart(row[config.yearly] || []),
-      distanceTitle,
-      legend,
-      distributionChart(row),
     ];
+    if (!config.diversity) {
+      detailNodes.push(
+        yearlyDistanceTitle,
+        distanceYearChart(row[config.yearly] || []),
+      );
+    }
+    detailNodes.push(distanceTitle);
+    if (!config.diversity) detailNodes.push(legend);
+    detailNodes.push(distributionChart(row));
     details.append(...detailNodes);
     if (row.keywords && row.keywords.length) {
       const wordTitle = document.createElement("h3");
@@ -602,7 +744,7 @@
     state.points = [];
     if (!domain.length) {
       const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
-      message.textContent = "No clusters have connected distance observations";
+      message.textContent = `No clusters have ${config.description} observations`;
       svg.append(message);
       return;
     }
@@ -612,7 +754,10 @@
     const minDistance = Math.min(0, ...domain.map((row) => row[config.distance]));
     const maxDistance = Math.max(...domain.map((row) => row[config.distance]));
     const x = (count) => padding.left + ((Math.log10(count) - minLog) / Math.max(0.1, maxLog - minLog)) * (width - padding.left - padding.right);
-    const y = (distance) => height - padding.bottom - ((distance - minDistance) / Math.max(1, maxDistance - minDistance)) * (height - padding.top - padding.bottom);
+    const verticalSpan = config.diversity
+      ? Math.max(0.05, maxDistance - minDistance)
+      : Math.max(1, maxDistance - minDistance);
+    const y = (distance) => height - padding.bottom - ((distance - minDistance) / verticalSpan) * (height - padding.top - padding.bottom);
 
     const grid = svgNode("g", { class: "plot-grid" });
     const axes = svgNode("g");
@@ -621,7 +766,7 @@
       const py = y(value);
       grid.append(svgNode("line", { x1: padding.left, y1: py, x2: width - padding.right, y2: py }));
       const label = svgNode("text", { class: "plot-tick", x: padding.left - 10, y: py + 4, "text-anchor": "end" });
-      label.textContent = formatDistance(value);
+      label.textContent = config.diversity ? formatDiversity(value) : formatDistance(value);
       axes.append(label);
     }
     const firstPower = Math.ceil(minLog);
@@ -658,7 +803,7 @@
     const marks = svgNode("g");
     if (!rows.length) {
       const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
-      message.textContent = "No matching clusters have connected distance observations";
+      message.textContent = `No matching clusters have ${config.description} observations`;
       marks.append(message);
     }
     for (const row of rows) {
@@ -672,7 +817,7 @@
         tabindex: 0,
         "data-cluster-id": row.cluster_id,
         "data-type": row.cluster_type || "",
-        "aria-label": `${row.label}, ${row.cluster_type || "unclassified"}: ${Number(row.paper_count).toLocaleString()} papers, mean distance ${formatDistance(row[config.distance])}`,
+        "aria-label": `${row.label}, ${row.cluster_type || "unclassified"}: ${Number(row.paper_count).toLocaleString()} papers, ${config.label} ${config.diversity ? formatDiversity(row[config.distance]) : formatDistance(row[config.distance])}`,
       });
       circle.addEventListener("focus", () => {
         show(row);
@@ -712,7 +857,14 @@
       state.measure = tab.dataset.measure;
       for (const button of tabs) button.setAttribute("aria-pressed", String(button === tab));
       updateSummary();
-      if (state.hovered) show(state.hovered);
+      if (
+        state.hovered
+        && Number.isFinite(state.hovered[measures[state.measure].distance])
+      ) {
+        show(state.hovered);
+      } else {
+        clearSelection();
+      }
       draw();
     });
   }
@@ -738,16 +890,36 @@
       return response.json();
     })
     .then((data) => {
-      if (!data.link_distances) {
-        summary.textContent = "No link summary was supplied. Pass --new-link-visualizations-dir when building the site.";
+      const rowsByCluster = new Map();
+      for (const row of data.link_distances || []) {
+        rowsByCluster.set(Number(row.cluster_id), { ...row });
+      }
+      for (const row of data.cluster_topics || []) {
+        const clusterId = Number(row.cluster_id);
+        rowsByCluster.set(clusterId, {
+          ...(rowsByCluster.get(clusterId) || {}),
+          ...row,
+        });
+      }
+      state.rows = [...rowsByCluster.values()];
+      if (!state.rows.length) {
+        summary.textContent = "No link or cluster-topic summary was supplied.";
         draw();
         return;
       }
-      state.rows = data.link_distances;
+      if (!(data.link_distances || []).length && (data.cluster_topics || []).length) {
+        state.measure = "diversity";
+        for (const button of tabs) {
+          button.setAttribute(
+            "aria-pressed",
+            String(button.dataset.measure === state.measure),
+          );
+        }
+      }
       updateSummary();
       draw();
     })
     .catch((error) => {
-      summary.textContent = `Unable to load link distances: ${error.message}`;
+      summary.textContent = `Unable to load cluster measures: ${error.message}`;
     });
 })();

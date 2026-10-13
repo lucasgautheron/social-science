@@ -58,6 +58,15 @@ if [[ -n "${OPENALEX_NEW_LINK_VISUALIZATIONS_DIR:-}" ]]; then
     --new-link-visualizations-dir "$OPENALEX_NEW_LINK_VISUALIZATIONS_DIR"
   )
 fi
+if [[ -n "${OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR:-}" ]]; then
+  if [[ ! -f "$OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR/cluster_topic_summary.csv" ]]; then
+    echo "Cluster-topic summary not found: $OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR/cluster_topic_summary.csv" >&2
+    exit 2
+  fi
+  BUILD_ARGS+=(
+    --cluster-topic-visualizations-dir "$OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR"
+  )
+fi
 if [[ -n "${OPENALEX_INCIDENCE_WORKERS:-}" ]]; then
   if [[ ! "$OPENALEX_INCIDENCE_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
     echo "OPENALEX_INCIDENCE_WORKERS must be a positive integer" >&2

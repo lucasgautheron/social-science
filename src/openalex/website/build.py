@@ -803,6 +803,127 @@ def load_link_distance_summary(
     return rows
 
 
+def load_cluster_topic_summary(
+    visualizations_dir: str | Path,
+    clusters: Sequence[Mapping[str, Any]] | None,
+    cluster_types: Mapping[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Load per-cluster topic histograms and Rao--Stirling diversity."""
+    path = (
+        Path(visualizations_dir).expanduser().resolve()
+        / "cluster_topic_summary.csv"
+    )
+    clusters_by_group = {
+        int(cluster["group"]): cluster
+        for cluster in (clusters or [])
+    }
+    integer_fields = (
+        "paper_count",
+        "topic_observation_count",
+        "topic_missing_count",
+        "topic_outlier_count",
+    )
+    required = {
+        "cluster_id",
+        "label",
+        *integer_fields,
+        "rao_stirling_diversity",
+        "topic_distribution",
+    }
+    author_integer_fields = (
+        "author_count",
+        "author_primary_topic_count",
+        "author_primary_topic_missing_count",
+    )
+    author_float_fields = (
+        "author_weight",
+        "author_primary_topic_weight",
+        "author_primary_topic_missing_weight",
+    )
+    author_fields = {
+        *author_integer_fields,
+        *author_float_fields,
+        "author_rao_stirling_diversity",
+        "author_topic_distribution",
+    }
+    rows: list[dict[str, Any]] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "Cluster-topic summary is missing columns: "
+                + ", ".join(sorted(missing))
+            )
+        has_author_fields = author_fields <= set(reader.fieldnames or [])
+        for source in reader:
+            cluster_id = int(source["cluster_id"])
+            cluster = clusters_by_group.get(cluster_id)
+            distribution = json.loads(source["topic_distribution"])
+            parsed_distribution = [
+                {
+                    "topic_id": int(item["topic_id"]),
+                    "label": str(item["label"]),
+                    "papers": int(item["papers"]),
+                    "share": float(item["share"]),
+                }
+                for item in distribution
+            ]
+            parsed_distribution.sort(
+                key=lambda item: (-item["papers"], item["topic_id"])
+            )
+            value = float(source["rao_stirling_diversity"])
+            row: dict[str, Any] = {
+                "cluster_id": cluster_id,
+                "label": source["label"],
+                "keywords": [] if cluster is None else list(cluster["keywords"]),
+                "yearly": [] if cluster is None else list(cluster["yearly"]),
+                "cluster_type": None
+                if cluster_types is None
+                else cluster_types.get(cluster_id),
+                "rao_stirling_diversity": value if math.isfinite(value) else None,
+                "topic_distribution": parsed_distribution,
+            }
+            row.update({field: int(source[field]) for field in integer_fields})
+            if has_author_fields:
+                author_distribution = [
+                    {
+                        "topic_id": int(item["topic_id"]),
+                        "label": str(item["label"]),
+                        "authors": int(item["authors"]),
+                        "weight": float(item["weight"]),
+                        "share": float(item["share"]),
+                    }
+                    for item in json.loads(source["author_topic_distribution"])
+                ]
+                author_distribution.sort(
+                    key=lambda item: (-item["weight"], item["topic_id"])
+                )
+                author_diversity = float(
+                    source["author_rao_stirling_diversity"]
+                )
+                row.update(
+                    {
+                        **{
+                            field: int(source[field])
+                            for field in author_integer_fields
+                        },
+                        **{
+                            field: float(source[field])
+                            for field in author_float_fields
+                        },
+                        "author_rao_stirling_diversity": (
+                            author_diversity
+                            if math.isfinite(author_diversity)
+                            else None
+                        ),
+                        "author_topic_distribution": author_distribution,
+                    }
+                )
+            rows.append(row)
+    return rows
+
+
 def _yearly_payload(
     counts: dict[int, int],
     papers_by_year: Mapping[int, int],
@@ -849,6 +970,7 @@ def build_website(
     filtered_dir: str | Path | None = None,
     db_path: str | Path | None = None,
     new_link_visualizations_dir: str | Path | None = None,
+    cluster_topic_visualizations_dir: str | Path | None = None,
     trends: str | Path | None = None,
     incidence_workers: int = 1,
 ) -> dict[str, Any]:
@@ -931,20 +1053,56 @@ def build_website(
             papers_by_year,
             total_documents,
         )
+    cluster_types = None
+    if (
+        (new_link_visualizations_dir is not None or cluster_topic_visualizations_dir is not None)
+        and clusters_dir is not None
+        and prepared_clusters is not None
+    ):
+        cluster_types = load_cluster_types(
+            clusters_dir,
+            int(prepared_clusters["level"]),
+            trends,
+        )
     link_distances = None
     if new_link_visualizations_dir is not None:
-        cluster_types = None
-        if clusters_dir is not None and prepared_clusters is not None:
-            cluster_types = load_cluster_types(
-                clusters_dir,
-                int(prepared_clusters["level"]),
-                trends,
-            )
         link_distances = load_link_distance_summary(
             new_link_visualizations_dir,
             cluster_list,
             cluster_types,
         )
+    cluster_topics = None
+    if cluster_topic_visualizations_dir is not None:
+        cluster_topics = load_cluster_topic_summary(
+            cluster_topic_visualizations_dir,
+            cluster_list,
+            cluster_types,
+        )
+        topics_by_group = {
+            int(row["cluster_id"]): row
+            for row in cluster_topics
+        }
+        for cluster in cluster_list or []:
+            topic_row = topics_by_group.get(int(cluster["group"]))
+            if topic_row is None:
+                continue
+            for field in (
+                "topic_observation_count",
+                "topic_missing_count",
+                "topic_outlier_count",
+                "rao_stirling_diversity",
+                "topic_distribution",
+                "author_count",
+                "author_primary_topic_count",
+                "author_primary_topic_missing_count",
+                "author_weight",
+                "author_primary_topic_weight",
+                "author_primary_topic_missing_weight",
+                "author_rao_stirling_diversity",
+                "author_topic_distribution",
+            ):
+                if field in topic_row:
+                    cluster[field] = topic_row[field]
     payload = {
         "meta": {
             "processed_papers": processed,
@@ -960,6 +1118,7 @@ def build_website(
         "coarse_matrix": _sparse_payload(clustered["coarse"]),
         "cluster_list": cluster_list,
         "link_distances": link_distances,
+        "cluster_topics": cluster_topics,
     }
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -992,6 +1151,9 @@ def build_website(
         ),
         "link_clusters": (
             0 if payload["link_distances"] is None else len(payload["link_distances"])
+        ),
+        "topic_clusters": (
+            0 if payload["cluster_topics"] is None else len(payload["cluster_topics"])
         ),
         "keyword_filter": payload["meta"]["keyword_filter"],
         "genuine_keywords": None if allowed is None else len(allowed),
@@ -1033,6 +1195,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional visualize-new-links output used by link-distances.html."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-topic-visualizations-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional visualize-cluster-topics output used for topic histograms "
+            "and diversity."
         ),
     )
     parser.add_argument(
@@ -1089,6 +1260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         filtered_dir=args.filtered_dir,
         db_path=args.db_path,
         new_link_visualizations_dir=args.new_link_visualizations_dir,
+        cluster_topic_visualizations_dir=args.cluster_topic_visualizations_dir,
         trends=args.trends,
         incidence_workers=args.incidence_workers,
     )

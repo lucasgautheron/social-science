@@ -290,6 +290,72 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert "observableRows()" in script
 
 
+def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    plots_dir = tmp_path / "cluster_topic_visualizations"
+    site_dir = tmp_path / "site"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    plots_dir.mkdir()
+    (plots_dir / "cluster_topic_summary.csv").write_text(
+        "cluster_id,label,paper_count,topic_observation_count,"
+        "topic_missing_count,topic_outlier_count,rao_stirling_diversity,"
+        "topic_distribution,author_count,author_primary_topic_count,"
+        "author_primary_topic_missing_count,author_weight,"
+        "author_primary_topic_weight,author_primary_topic_missing_weight,"
+        "author_rao_stirling_diversity,author_topic_distribution\n"
+        '0,beta,4,4,0,0,0.375,"[{""topic_id"":2,""label"":""Two"",'
+        '""papers"":1,""share"":0.25},{""topic_id"":1,""label"":""One"",'
+        '""papers"":2,""share"":0.5},{""topic_id"":0,""label"":""Zero"",'
+        '""papers"":1,""share"":0.25}]",3,3,0,4.0,4.0,0.0,0.42,'
+        '"[{""topic_id"":2,""label"":""Two"",""authors"":1,""weight"":1.0,'
+        '""share"":0.25},{""topic_id"":1,""label"":""One"",""authors"":2,'
+        '""weight"":3.0,""share"":0.75}]"\n'
+        '1,gamma,2,1,0,1,nan,"[{""topic_id"":3,""label"":""Three"",'
+        '""papers"":1,""share"":1.0}]",1,0,1,1.0,0.0,1.0,nan,[]\n',
+        encoding="utf-8",
+    )
+    (clusters_dir / "cluster_trends.csv").write_text(
+        "level,group,compatible\n0,0,shock\n",
+        encoding="utf-8",
+    )
+
+    summary = build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        cluster_topic_visualizations_dir=plots_dir,
+        output_dir=site_dir,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+    )
+
+    assert summary["topic_clusters"] == 2
+    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    first, second = payload["cluster_topics"]
+    assert first["cluster_id"] == 0
+    assert first["rao_stirling_diversity"] == pytest.approx(0.375)
+    assert first["cluster_type"] == "shock"
+    assert [item["topic_id"] for item in first["topic_distribution"]] == [1, 0, 2]
+    assert first["author_rao_stirling_diversity"] == pytest.approx(0.42)
+    assert [item["topic_id"] for item in first["author_topic_distribution"]] == [1, 2]
+    assert second["rao_stirling_diversity"] is None
+    assert second["author_rao_stirling_diversity"] is None
+    card = next(item for item in payload["cluster_list"] if item["group"] == 0)
+    assert card["topic_observation_count"] == 4
+    assert card["rao_stirling_diversity"] == pytest.approx(0.375)
+    assert card["topic_distribution"] == first["topic_distribution"]
+    assert card["author_topic_distribution"] == first["author_topic_distribution"]
+    html = (site_dir / "link-distances.html").read_text(encoding="utf-8")
+    script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
+    clusters_script = (site_dir / "clusters.js").read_text(encoding="utf-8")
+    assert 'data-measure="diversity"' in html
+    assert 'data-measure="author-diversity"' in html
+    assert "rao_stirling_diversity" in script
+    assert "author_rao_stirling_diversity" in script
+    assert "topicHistogram" in clusters_script
+
+
 def test_cluster_list_counts_documents_once(tmp_path):
     event_dir = tmp_path / "events"
     clusters_dir = tmp_path / "clusters"

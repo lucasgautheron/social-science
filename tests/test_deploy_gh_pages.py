@@ -27,6 +27,7 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     events = tmp_path / "events"
     clusters = tmp_path / "clusters"
     visualizations = tmp_path / "new_link_visualizations"
+    topic_visualizations = tmp_path / "cluster_topic_visualizations"
     fake_python = tmp_path / "python"
     git(tmp_path, "init", "--bare", str(remote))
     git(tmp_path, "init", "--initial-branch=main", str(root))
@@ -42,6 +43,11 @@ def test_deploy_replaces_gh_pages_history(tmp_path):
     (clusters / "manifest.json").write_text("{}\n", encoding="utf-8")
     visualizations.mkdir()
     (visualizations / "cluster_link_distance_summary.csv").write_text(
+        "cluster_id\n",
+        encoding="utf-8",
+    )
+    topic_visualizations.mkdir()
+    (topic_visualizations / "cluster_topic_summary.csv").write_text(
         "cluster_id\n",
         encoding="utf-8",
     )
@@ -74,6 +80,7 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
             "OPENALEX_CLUSTERS_DIR": str(clusters),
             "OPENALEX_DB_PATH": str(database),
             "OPENALEX_NEW_LINK_VISUALIZATIONS_DIR": str(visualizations),
+            "OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR": str(topic_visualizations),
             "OPENALEX_INCIDENCE_WORKERS": "16",
             "GIT_AUTHOR_NAME": "Test",
             "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -93,6 +100,10 @@ Path(os.environ["BUILD_ARGS_PATH"]).write_text("\\n".join(sys.argv), encoding="u
     assert (
         arguments[arguments.index("--new-link-visualizations-dir") + 1]
         == str(visualizations)
+    )
+    assert (
+        arguments[arguments.index("--cluster-topic-visualizations-dir") + 1]
+        == str(topic_visualizations)
     )
     assert arguments[arguments.index("--incidence-workers") + 1] == "16"
     assert "--trends" not in arguments
