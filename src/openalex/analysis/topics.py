@@ -19,11 +19,14 @@ import numpy as np
 
 from openalex.analysis.author_aggregation import file_sha256
 from openalex.analysis.embeddings import DEFAULT_MODEL, EmbeddingStore
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 2
+ARTIFACT_VERSION = 3
 DEFAULT_OUTPUT_DIR = Path("output/topics")
+TOPIC_VECTOR_IDS_FILENAME = "topic_vector_ids.npy"
+TOPIC_VECTORS_FILENAME = "topic_vectors.npz"
 DEFAULT_SAMPLE_SIZE = 100_000
 DEFAULT_CLASSIFICATION_BATCH_SIZE = 10_000
 DEFAULT_CLASSIFIER_CV_FOLDS = 3
@@ -215,6 +218,9 @@ def assign_topics(
     assignment_probabilities = topic_probabilities(probabilities, reduced_topics)
 
     output.mkdir(parents=True, exist_ok=True)
+    topic_vector_ids_path, topic_vectors_path = _write_topic_vectors(
+        output, topic_model
+    )
     topic_info = topic_model.get_topic_info()
     labels = topic_labels(topic_info)
     sample_classifications_path = output / "sample_topic_classifications.csv"
@@ -272,6 +278,8 @@ def assign_topics(
         classifier_path.name,
         classifier_metrics_path.name,
         classifier_cv_path.name,
+        topic_vector_ids_path.name,
+        topic_vectors_path.name,
     ]
     if hierarchy:
         hierarchical_topics = topic_model.hierarchical_topics(documents)
@@ -340,6 +348,7 @@ def assign_topics(
         "classification_batch_size": classification_batch_size,
         "embedding_artifact": str(Path(embeddings_path).expanduser().resolve()),
         "embedding_manifest_sha256": _manifest_digest(store.manifest_path),
+        "complete": True,
         "files": files,
         "hierarchy": hierarchy,
         "min_cluster_size": min_cluster_size,
@@ -353,12 +362,23 @@ def assign_topics(
         "source_sha256": source_sha256,
         "source_size": source.stat().st_size,
         "topics": len(unique_topics),
+        "topic_vector_ids": topic_vector_ids_path.name,
+        "topic_vectors": topic_vectors_path.name,
         "umap_components": umap_components,
         "umap_metric": metric,
         "visualizations": visualizations,
     }
-    _atomic_json(output / "manifest.json", manifest)
-    return manifest
+    return complete_manifest(
+        output,
+        manifest,
+        stage="topics",
+        inputs=[
+            {
+                "role": "embeddings",
+                "manifest_sha256": _manifest_digest(store.manifest_path),
+            }
+        ],
+    )
 
 
 def _write_optional_visualization(
@@ -375,6 +395,77 @@ def _write_optional_visualization(
         logger.exception("Skipping optional topic visualization %s", filename)
         return
     files.append(filename)
+
+
+def _normalized_topic_vectors(topic_model: object):
+    try:
+        from scipy import sparse
+    except ImportError as exc:
+        raise RuntimeError("Saving topic vectors requires scipy") from exc
+    vectors = getattr(topic_model, "c_tf_idf_", None)
+    get_topics = getattr(topic_model, "get_topics", None)
+    if vectors is None or get_topics is None:
+        raise ValueError("BERTopic model has no c-TF-IDF topic vectors")
+    matrix = sparse.csr_matrix(vectors, dtype=np.float64)
+    topic_ids = np.asarray(
+        sorted(int(topic) for topic in get_topics()), dtype=np.int32
+    )
+    if matrix.shape[0] != topic_ids.size:
+        raise ValueError("BERTopic c-TF-IDF rows do not align with topic ids")
+    norms = np.sqrt(np.asarray(matrix.multiply(matrix).sum(axis=1)).ravel())
+    if np.any(norms <= 0):
+        invalid = topic_ids[norms <= 0]
+        raise ValueError(
+            "BERTopic has zero-length c-TF-IDF vectors for topics: "
+            + ", ".join(str(int(topic)) for topic in invalid)
+        )
+    return topic_ids, (sparse.diags(1.0 / norms) @ matrix).tocsr()
+
+
+def _write_topic_vectors(output: Path, topic_model: object) -> tuple[Path, Path]:
+    from scipy import sparse
+
+    topic_ids, vectors = _normalized_topic_vectors(topic_model)
+    ids_path = output / TOPIC_VECTOR_IDS_FILENAME
+    vectors_path = output / TOPIC_VECTORS_FILENAME
+    np.save(ids_path, topic_ids, allow_pickle=False)
+    sparse.save_npz(vectors_path, vectors, compressed=True)
+    return ids_path, vectors_path
+
+
+def export_existing_topic_vectors(output_dir: str | Path) -> dict[str, object]:
+    """Upgrade an existing saved BERTopic export without fitting it again."""
+    output = Path(output_dir).expanduser().resolve()
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    model_path = output / "bertopic_model"
+    if not model_path.exists():
+        raise ValueError(
+            "Cannot export c-TF-IDF vectors: the legacy artifact has no bertopic_model"
+        )
+    try:
+        from bertopic import BERTopic
+    except ImportError as exc:
+        raise RuntimeError("Install the topics extra to load BERTopic") from exc
+    ids_path, vectors_path = _write_topic_vectors(output, BERTopic.load(model_path))
+    files = list(manifest.get("files", []))
+    for path in (ids_path, vectors_path):
+        if path.name not in files:
+            files.append(path.name)
+    manifest.update(
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "complete": True,
+            "files": files,
+            "topic_vector_ids": ids_path.name,
+            "topic_vectors": vectors_path.name,
+            "upgraded_from_saved_model": True,
+        }
+    )
+    inputs = manifest.get("inputs", [])
+    if not isinstance(inputs, list):
+        inputs = []
+    return complete_manifest(output, manifest, stage="topics", inputs=inputs)
 
 
 def finalize_existing_topics(
@@ -465,10 +556,26 @@ def finalize_existing_topics(
 
     logger.info("Fingerprinting source corpus %s", source)
     source_sha256 = file_sha256(source)
+    vector_ids_path = output / TOPIC_VECTOR_IDS_FILENAME
+    vectors_path = output / TOPIC_VECTORS_FILENAME
+    if not (vector_ids_path.is_file() and vectors_path.is_file()):
+        model_path = output / "bertopic_model"
+        if model_path.exists():
+            try:
+                from bertopic import BERTopic
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Install the topics extra to recover vectors from bertopic_model"
+                ) from exc
+            vector_ids_path, vectors_path = _write_topic_vectors(
+                output, BERTopic.load(model_path)
+            )
+    has_vectors = vector_ids_path.is_file() and vectors_path.is_file()
     files = sorted(
         path.name
         for path in output.iterdir()
-        if path.name != "manifest.json" and not path.name.endswith(".tmp")
+        if path.name not in {"manifest.json", "_artifact_inventory.json"}
+        and not path.name.endswith(".tmp")
     )
     candidate_embedding_manifest = (
         Path(embeddings_path).expanduser().resolve() / "manifest.json"
@@ -482,7 +589,7 @@ def finalize_existing_topics(
         else None
     )
     manifest = {
-        "artifact_version": ARTIFACT_VERSION,
+        "artifact_version": ARTIFACT_VERSION if has_vectors else 2,
         "article_assignments": required["article_assignments"].name,
         "articles": int(parquet.metadata.num_rows),
         "classifier": {
@@ -514,8 +621,28 @@ def finalize_existing_topics(
             path.suffix == ".html" for path in output.iterdir()
         ),
     }
-    _atomic_json(manifest_path, manifest)
-    return manifest
+    if has_vectors:
+        manifest.update(
+            {
+                "topic_vector_ids": vector_ids_path.name,
+                "topic_vectors": vectors_path.name,
+            }
+        )
+    return complete_manifest(
+        output,
+        manifest,
+        stage="topics",
+        inputs=(
+            [
+                {
+                    "role": "embeddings",
+                    "manifest_sha256": manifest["embedding_manifest_sha256"],
+                }
+            ]
+            if manifest["embedding_manifest_sha256"]
+            else []
+        ),
+    )
 
 
 def select_topic_sample(
@@ -1099,13 +1226,22 @@ def build_parser() -> argparse.ArgumentParser:
             "manifest without refitting"
         ),
     )
+    parser.add_argument(
+        "--export-topic-vectors",
+        action="store_true",
+        help="Upgrade a legacy saved BERTopic model with reusable c-TF-IDF vectors.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = build_parser().parse_args(argv)
-    if args.finalize_existing:
+    if args.finalize_existing and args.export_topic_vectors:
+        raise SystemExit("--finalize-existing and --export-topic-vectors are mutually exclusive")
+    if args.export_topic_vectors:
+        manifest = export_existing_topic_vectors(args.output_dir)
+    elif args.finalize_existing:
         manifest = finalize_existing_topics(
             args.db_path,
             args.output_dir,

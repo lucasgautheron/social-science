@@ -1,7 +1,6 @@
 import argparse
 import gc
 import hashlib
-import json
 import logging
 import multiprocessing as mp
 import os
@@ -24,6 +23,8 @@ from scipy import sparse, stats
 from sklearn.feature_extraction.text import CountVectorizer
 from sqlalchemy import create_engine, text
 from sqlalchemy import event as sqlalchemy_event
+
+from openalex.artifacts.manifest import complete_manifest
 
 
 def build_arg_parser():
@@ -1273,13 +1274,7 @@ class EventExtractor:
                 for year, count in sorted(self.year_doc_counts.items())
             },
         }
-        manifest_path = self.output_dir / "manifest.json"
-        temporary = manifest_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(manifest_path)
+        complete_manifest(self.output_dir, manifest, stage="events")
 
         logger.info(f"Exported co-occurrence matrix with {self.cooccurrence_matrix.nnz:,} nonzero pairs")
         return self.cooccurrence_matrix.nnz

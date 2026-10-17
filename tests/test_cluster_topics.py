@@ -258,6 +258,43 @@ def test_cluster_topic_summary_counts_each_paper_once_and_orders_topics(tmp_path
     assert manifest["author_diversity"] is True
 
 
+def test_cluster_topic_summary_uses_exported_vectors_without_saved_model(tmp_path):
+    events, clusters, topics, database, author_topics = write_inputs(tmp_path)
+    np.save(
+        topics / "topic_vector_ids.npy",
+        np.array([-1, 0, 1], dtype=np.int32),
+        allow_pickle=False,
+    )
+    vectors = FakeTopicModel().c_tf_idf_
+    norms = np.sqrt(np.asarray(vectors.multiply(vectors).sum(axis=1)).ravel())
+    sparse.save_npz(
+        topics / "topic_vectors.npz",
+        sparse.diags(1.0 / norms) @ vectors,
+    )
+    (topics / "bertopic_model").rmdir()
+    manifest = json.loads((topics / "manifest.json").read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "artifact_version": 3,
+            "topic_vector_ids": "topic_vector_ids.npy",
+            "topic_vectors": "topic_vectors.npz",
+        }
+    )
+    (topics / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = build_cluster_topic_summary(
+        events,
+        clusters,
+        topics,
+        tmp_path / "output",
+        db_path=database,
+        author_topics_dir=author_topics,
+        topic_model_loader=lambda _path: pytest.fail("model loader was used"),
+    )
+
+    assert summary.is_file()
+
+
 def test_summarize_cluster_topics_rejects_topic_without_vector():
     with pytest.raises(ValueError, match="no c-TF-IDF vectors: 7"):
         summarize_cluster_topics(

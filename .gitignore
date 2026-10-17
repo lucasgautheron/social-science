@@ -18,6 +18,7 @@ articles.db
 /*.pickle
 /*.gpickle
 /*.json
+!.openalex-artifacts.lock.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

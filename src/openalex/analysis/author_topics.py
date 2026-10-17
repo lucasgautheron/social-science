@@ -25,6 +25,7 @@ from openalex.analysis.author_aggregation import (
     read_json,
     source_metadata,
 )
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +69,11 @@ def build_author_topics(
             f"Topic artifact manifest not found: {topic_manifest_path}"
         )
     topic_manifest = read_json(topic_manifest_path)
-    if int(topic_manifest.get("artifact_version", 0)) != (
-        REQUIRED_TOPIC_ARTIFACT_VERSION
-    ):
+    topic_artifact_version = int(topic_manifest.get("artifact_version", 0))
+    if topic_artifact_version < REQUIRED_TOPIC_ARTIFACT_VERSION:
         raise ValueError(
             "Author topics require topic artifact schema version "
-            f"{REQUIRED_TOPIC_ARTIFACT_VERSION}"
+            f"{REQUIRED_TOPIC_ARTIFACT_VERSION} or newer"
         )
     assignments_name = topic_manifest.get("article_assignments")
     assignments_path = topics_root / str(assignments_name)
@@ -104,7 +104,7 @@ def build_author_topics(
         "topic_assignments_sha256": assignments_sha256,
         "topic_labels_sha256": labels_sha256,
         "topic_manifest_sha256": manifest_sha256(topic_manifest_path),
-        "topic_artifact_version": REQUIRED_TOPIC_ARTIFACT_VERSION,
+        "topic_artifact_version": topic_artifact_version,
         **source_info,
     }
 
@@ -241,8 +241,18 @@ def build_author_topics(
         "complete": True,
         "files": [DATABASE_NAME],
     }
-    atomic_json(manifest_path, final_manifest)
     shutil.rmtree(scratch)
+    final_manifest = complete_manifest(
+        output,
+        final_manifest,
+        stage="author-topics",
+        inputs=[
+            {
+                "role": "topics",
+                "manifest_sha256": final_manifest["topic_manifest_sha256"],
+            }
+        ],
+    )
     return final_manifest
 
 

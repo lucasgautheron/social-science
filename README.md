@@ -302,6 +302,57 @@ within each of four size quantiles, the most positive and negative residuals
 from a regression on log paper count are highlighted in red and labeled with
 the cluster's highest-frequency keyword.
 
+Summarize the BERTopic assignments of papers involved in each event cluster:
+
+```bash
+openalex visualize-cluster-topics \
+  --events-dir output/events \
+  --clusters-dir output/event_clusters \
+  --topics-dir output/topics \
+  --author-topics-dir output/author_topics \
+  --db-path articles.db \
+  --output-dir output/cluster_topic_visualizations
+```
+
+This joins hard full-corpus paper-topic assignments to event-cluster incidence,
+counts each paper once per cluster, and writes frequency-ranked categorical
+topic histograms. Rao--Stirling diversity uses cosine dissimilarity between
+the saved BERTopic model's c-TF-IDF vectors. Classifier confidence is not used;
+papers with missing assignments and topic outliers are reported as coverage
+counts but excluded from the diversity distribution. The saved BERTopic model
+is required, so topic artifacts built with `--no-save-model` cannot be used.
+The same artifact also groups involved authors by their primary topic. For each
+cluster, an author's primary topic is inferred after subtracting that cluster's
+papers from the author's full topic profile. Each cluster-paper authorship
+contributes `1/n` for a paper with `n` authors, including weight one for
+single-author papers. Author Rao--Stirling diversity applies the same c-TF-IDF
+topic dissimilarities to this fractional primary-topic distribution.
+
+On Slurm, submit the same analysis without occupying a login node:
+
+```bash
+sbatch --job-name=cluster-topic-viz --cpus-per-task=1 --mem=64G --time=04:00:00 \
+  --output=slurm-cluster-topic-viz-%j.out \
+  --wrap='PYTHONPATH=src python -m openalex.visualizations.cluster_topics --events-dir output/events --clusters-dir output/event_clusters --topics-dir output/topics --author-topics-dir output/author_topics --db-path articles.db --output-dir output/cluster_topic_visualizations'
+```
+
+Or run it on the configured AWS CPU worker:
+
+```bash
+openalex-aws submit --worker cpu \
+  --input output/events \
+  --input output/event_clusters \
+  --input output/topics \
+  --input output/author_topics \
+  -- openalex visualize-cluster-topics \
+  --events-dir output/events \
+  --clusters-dir output/event_clusters \
+  --topics-dir output/topics \
+  --author-topics-dir output/author_topics \
+  --db-path articles.db \
+  --output-dir output/cluster_topic_visualizations
+```
+
 ## Website
 
 Build the site:
@@ -311,6 +362,7 @@ openalex build-website \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
   --new-link-visualizations-dir output/new_link_visualizations \
+  --cluster-topic-visualizations-dir output/cluster_topic_visualizations \
   --db-path /path/to/articles.db \
   --output-dir output/website
 python -m http.server --directory output/website 8000
@@ -319,10 +371,14 @@ python -m http.server --directory output/website 8000
 The site root opens `clusters.html`, which lists every cluster from
 `cluster-events`. A cluster's size is the number of documents
 that contain any of its keywords, divided by the total number of documents,
-and each row plots that share by year. `link-distances.html` interactively
-plots cluster paper count on a logarithmic x-axis against three mean-distance
-measures from `visualize-new-links`: first-link network distance,
-all-paper-link network distance, and author-embedding cosine distance. Its
+and each row plots that share by year plus paper-topic and weighted
+author-primary-topic histograms, ordered from most to least frequent topic.
+`link-distances.html` interactively plots
+cluster paper count on a logarithmic x-axis against three mean-distance
+measures from `visualize-new-links` and two Rao--Stirling diversity measures:
+first-link network distance, all-paper-link network distance,
+author-embedding cosine distance, paper-topic diversity, and author
+primary-topic diversity. Its
 points use one neutral style rather
 than the static plots' residual highlights; hovering a point shows the cluster,
 its share-of-papers curve by year, the mean connected distance by year for the
@@ -349,7 +405,9 @@ by the number of articles published that year. The count is one read-only
 `GROUP BY publication_year` over `idx_publication_year`, so the article rows
 are not read. Without `--db-path`, the curves use the processed-paper totals
 stored in the event manifest. Omitting `--new-link-visualizations-dir` leaves
-the link-distance page in an empty state. `--trends` is the cluster-trends
+the three link-distance measures empty; omitting
+`--cluster-topic-visualizations-dir` omits topic histograms and diversity.
+`--trends` is the cluster-trends
 CSV that classifies those points. Without it, the builder uses
 `cluster_trends.csv` inside `--clusters-dir` when that file exists.
 `scripts/deploy-website.slurm` passes the file only in that case.
@@ -359,6 +417,7 @@ Publish a fresh orphan `gh-pages` commit with:
 ```bash
 OPENALEX_CLUSTERS_DIR=output/event_clusters \
 OPENALEX_NEW_LINK_VISUALIZATIONS_DIR=output/new_link_visualizations \
+OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR=output/cluster_topic_visualizations \
 OPENALEX_DB_PATH=/path/to/articles.db \
 OPENALEX_CLUSTER_TRENDS=output/event_clusters/cluster_trends.csv \
   scripts/deploy-gh-pages.sh output/events
@@ -428,16 +487,13 @@ preserving their paths. It asks for confirmation when the destination already
 exists; pass `--yes` to confirm non-interactively or `--output-dir` to choose a
 different destination.
 
-Stage local artifact directories from the submitting machine with repeatable
-`--input` options. Each directory must contain `manifest.json`; it is
-content-addressed in S3, cached on the worker's NVMe storage, and exposed at
-the same relative path inside the isolated run:
+Pipeline inputs are discovered from the `openalex` command automatically.
+Each manifest-backed directory is checksum-validated, content-addressed in S3,
+cached on the worker's NVMe storage, and exposed at the same relative path
+inside the isolated run:
 
 ```bash
 openalex-aws submit \
-  --input output/events \
-  --input output/event_clusters \
-  --input output/author_embeddings \
   -- openalex new-links \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
@@ -448,7 +504,6 @@ The author pipelines use the same staging mechanism:
 
 ```bash
 openalex-aws submit --worker cpu \
-  --input output/embeddings \
   -- openalex author-embeddings \
   --db-path articles.db \
   --embeddings-dir output/embeddings \
@@ -456,7 +511,6 @@ openalex-aws submit --worker cpu \
   --resume
 
 openalex-aws submit --worker cpu \
-  --input output/topics \
   -- openalex author-topics \
   --db-path articles.db \
   --topics-dir output/topics \
@@ -464,12 +518,47 @@ openalex-aws submit --worker cpu \
   --resume
 ```
 
+Explicit repeatable `--input` options remain supported for custom commands,
+and `--no-auto-inputs` disables dependency discovery.
+
 The first submission publishes and downloads each artifact. Later submissions
 with the same manifests reuse both the S3 objects and the worker cache without
 transferring their contents again. The cache is repopulated from S3 after the
 instance is stopped or terminated. Staged paths beneath `output/` are excluded
 when run results are synchronized, so inputs are not copied into every run's
-output prefix.
+output prefix. Completed manifest-backed outputs are automatically promoted to
+the immutable artifact store.
+
+Artifact pins live in `.openalex-artifacts.lock.json`. Local commands
+automatically repair missing or corrupt declared inputs from the cache/S3 when
+`.aws_runner_state.json` and a pin are present. Inspect, pin, publish, or fetch
+artifacts explicitly with:
+
+```bash
+openalex artifacts inspect output/topics
+openalex artifacts publish output/topics
+openalex artifacts hydrate output/topics
+```
+
+Older exports remain valid. Publishing one creates a checksum inventory
+without rerunning the analysis. To recover an artifact directly from a
+historical AWS run and promote it for future local and AWS jobs:
+
+```bash
+openalex artifacts pin output/topics --from-run RUN_ID
+```
+
+For legacy topic exports, cluster diversity first uses exported sparse
+c-TF-IDF vectors and falls back to `bertopic_model`. Upgrade an existing model
+without refitting:
+
+```bash
+openalex topics --output-dir output/topics --export-topic-vectors
+```
+
+Set `OPENALEX_AUTO_HYDRATE=0` to disable local preflight. Cache, lockfile, and
+state paths can be overridden with `OPENALEX_ARTIFACT_CACHE`,
+`OPENALEX_ARTIFACT_LOCK`, and `OPENALEX_ARTIFACT_STATE`.
 
 `status` reads the durable run state from S3. Add `--live` to query the worker
 directly through SSM and display the process state, fast-storage usage, database

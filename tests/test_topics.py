@@ -101,6 +101,7 @@ class FakeTopicModel:
         self.documents = None
         self.embeddings = None
         self.updated = None
+        self.c_tf_idf_ = np.asarray([[1.0, 0.0], [0.0, 2.0]])
 
     def fit_transform(self, documents, embeddings):
         self.documents = list(documents)
@@ -125,6 +126,9 @@ class FakeTopicModel:
 
     def get_topic(self, topic):
         return [(f"word-{topic}", 0.75)]
+
+    def get_topics(self):
+        return {0: self.get_topic(0), 1: self.get_topic(1)}
 
     def hierarchical_topics(self, documents):
         assert documents == self.documents
@@ -261,7 +265,9 @@ def test_topic_assignment_restores_legacy_outputs_and_keeps_corpus_read_only(tmp
     assert str(parquet.schema_arrow.field("topic").type) == "int32"
     assert str(parquet.schema_arrow.field("probability").type) == "float"
     assert parquet.metadata.row_group(0).column(0).compression == "ZSTD"
-    assert json.loads((output / "manifest.json").read_text())["artifact_version"] == 2
+    assert json.loads((output / "manifest.json").read_text())["artifact_version"] == 3
+    assert (output / "topic_vector_ids.npy").is_file()
+    assert (output / "topic_vectors.npz").is_file()
 
     with pytest.raises(FileExistsError, match="new --output-dir"):
         assign_topics(

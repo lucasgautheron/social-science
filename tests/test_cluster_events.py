@@ -132,7 +132,7 @@ def test_cluster_events_command_is_registered():
 
 def test_cluster_events_defaults_to_the_dendrogram(tmp_path):
     args = build_parser().parse_args([])
-    assert args.n_clusters == 20
+    assert args.n_clusters == 300
 
     events = tmp_path / "events"
     output = tmp_path / "clusters"
@@ -141,7 +141,7 @@ def test_cluster_events_defaults_to_the_dendrogram(tmp_path):
     assert summary["method"] == "complete-linkage-cosine"
     assert summary["keywords"] == 3
     assert summary["groups"] == 3
-    assert summary["target_clusters"] == 20
+    assert summary["target_clusters"] == 300
     assert summary["cluster_similarity"] == pytest.approx(1.0)
     assert summary["levels"] == 1
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shlex
 import subprocess
@@ -14,6 +13,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
+
+from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
+from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
+from openalex.artifacts.resolver import ArtifactResolver
+from openalex.artifacts.s3_store import S3ArtifactStore
+from openalex.artifacts.specs import (
+    dependency_paths,
+    remote_openalex_invocation,
+    validate_dependency,
+)
 
 from .workers import (
     DEFAULT_WORKER,
@@ -166,39 +175,21 @@ def publish_input_artifacts(
             raise SystemExit(
                 f"Input artifact {destination!r} must be a directory containing manifest.json"
             )
-        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
-        artifact_prefix = prefixed_key(
-            state["prefix"], f"{INPUT_ARTIFACTS_DIR}/{digest}"
+        store = S3ArtifactStore(s3, bucket, state["prefix"])
+        try:
+            published = store.publish(source)
+        except ValueError as exc:
+            raise SystemExit(f"Input artifact {destination!r} is invalid: {exc}") from exc
+        digest = published["manifest_sha256"]
+        print(
+            f"Prepared input {destination} at "
+            f"{published['s3_uri']} ({digest[:12]})."
         )
-        manifest_key = f"{artifact_prefix}/manifest.json"
-        if not _s3_object_exists(s3, bucket, manifest_key):
-            files = sorted(
-                (
-                    path
-                    for path in source.rglob("*")
-                    if path.is_file() and path != manifest
-                ),
-                key=lambda path: path.relative_to(source).as_posix(),
-            )
-            print(
-                f"Publishing input {destination} to "
-                f"{s3_uri(bucket, artifact_prefix)}/ ..."
-            )
-            for path in files:
-                relative_file = path.relative_to(source).as_posix()
-                s3.upload_file(
-                    str(path),
-                    bucket,
-                    f"{artifact_prefix}/{relative_file}",
-                )
-            s3.upload_file(str(manifest), bucket, manifest_key)
-        else:
-            print(f"Reusing published input {destination} ({digest[:12]}).")
         artifacts.append(
             {
                 "path": destination,
                 "manifest_sha256": digest,
-                "s3_uri": f"{s3_uri(bucket, artifact_prefix)}/",
+                "s3_uri": published["s3_uri"],
             }
         )
     return artifacts
@@ -729,6 +720,7 @@ WORKER={q(worker)}
 INSTANCE_TYPE={q(instance_type)}
 GPU_WORKER={q("1" if gpu_worker else "0")}
 BUCKET={q(bucket)}
+ARTIFACT_PREFIX={q(state["prefix"])}
 RUN_S3_PREFIX={q(run_s3_prefix)}
 AWS_REGION={q(region)}
 NOTIFICATION_TOPIC_ARN={q(notification_topic_arn)}
@@ -837,6 +829,16 @@ sync_artifacts() {{
 sync_output() {{
   if [ -d "${{RUN_DIR}}/output" ]; then
     aws s3 sync "${{RUN_DIR}}/output" "s3://${{BUCKET}}/${{RUN_S3_PREFIX}}/output/"{output_input_options} >/dev/null 2>&1 || true
+  fi
+}}
+
+promote_output_artifacts() {{
+  if [ -d "${{RUN_DIR}}/output" ]; then
+    python -m openalex.artifacts.remote_publish \
+      "${{RUN_DIR}}/output" \
+      --bucket "$BUCKET" \
+      --prefix "$ARTIFACT_PREFIX" >>"$LAUNCHER_LOG" 2>&1 || \
+      echo "Artifact promotion failed; run outputs remain available under the run prefix." >>"$LAUNCHER_LOG"
   fi
 }}
 
@@ -1071,6 +1073,34 @@ print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 }}
 
+validate_artifact_payload() {{
+  python3 - "$1" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+inventory_path = root / "_artifact_inventory.json"
+if not inventory_path.is_file():
+    raise SystemExit(0)  # Legacy artifacts are validated by their stage loader.
+inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+for record in inventory.get("files", []):
+    relative = Path(str(record["path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(f"Unsafe artifact payload path: {{relative}}")
+    path = root / relative
+    if not path.is_file() or path.stat().st_size != int(record["size"]):
+        raise SystemExit(f"Missing or truncated artifact payload: {{relative}}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    if digest.hexdigest() != str(record["sha256"]):
+        raise SystemExit(f"Artifact payload checksum mismatch: {{relative}}")
+PY
+}}
+
 stage_input() {{
   local relative_path="$1"
   local expected_digest="$2"
@@ -1082,7 +1112,7 @@ stage_input() {{
 
   if [ -f "${{cache_root}}/manifest.json" ]; then
     actual_digest="$(manifest_sha256 "${{cache_root}}/manifest.json")"
-    if [ "$actual_digest" != "$expected_digest" ]; then
+    if [ "$actual_digest" != "$expected_digest" ] || ! validate_artifact_payload "$cache_root"; then
       rm -rf "$cache_root"
     fi
   fi
@@ -1098,6 +1128,10 @@ stage_input() {{
     actual_digest="$(manifest_sha256 "${{temporary}}/manifest.json")"
     if [ "$actual_digest" != "$expected_digest" ]; then
       echo "Input $relative_path manifest digest changed during download" >>"$LAUNCHER_LOG"
+      return 1
+    fi
+    if ! validate_artifact_payload "$temporary"; then
+      echo "Input $relative_path payload validation failed" >>"$LAUNCHER_LOG"
       return 1
     fi
     rm -rf "$cache_root"
@@ -1218,6 +1252,7 @@ on_error() {{
   set -e
   sync_output
   if [ "$exit_code" -eq 0 ]; then
+    promote_output_artifacts
     terminal_status="success"
     terminal_message="Pipeline completed successfully"
   else
@@ -1400,10 +1435,33 @@ def command_submit(args: argparse.Namespace) -> int:
     command = pipeline_command(args)
     bucket = state["bucket"]
     prefix = run_prefix(state, run_id)
+    input_paths = list(args.input)
+    invocation = (
+        None
+        if args.no_auto_inputs
+        else remote_openalex_invocation(args.remote_command)
+    )
+    if invocation is not None:
+        pipeline_name, pipeline_args = invocation
+        for path in dependency_paths(pipeline_name, pipeline_args):
+            if path not in input_paths:
+                input_paths.append(path)
+        resolver = ArtifactResolver(
+            cache=ArtifactCache(args.artifact_cache),
+            lock=ArtifactLock(args.artifact_lock),
+            store=S3ArtifactStore(s3, bucket, state["prefix"]),
+        )
+        for path in input_paths:
+            resolver.resolve(
+                path,
+                validator=lambda root: validate_dependency(
+                    pipeline_name, pipeline_args, root
+                ),
+            )
     args.prepared_inputs = publish_input_artifacts(
         s3,
         state,
-        args.input,
+        input_paths,
     )
 
     if not args.no_start:
@@ -1733,6 +1791,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Publish and stage a local manifest artifact at the same relative path. "
             "Repeat for multiple inputs."
         ),
+    )
+    submit.add_argument(
+        "--no-auto-inputs",
+        action="store_true",
+        help="Stage only explicit --input paths instead of deriving OpenAlex command inputs.",
+    )
+    submit.add_argument(
+        "--artifact-lock",
+        default=str(DEFAULT_LOCK_PATH),
+        help="Immutable artifact lockfile used to hydrate missing automatic inputs.",
+    )
+    submit.add_argument(
+        "--artifact-cache",
+        default=str(DEFAULT_CACHE_DIR),
+        help="Local content-addressed artifact cache.",
     )
     submit.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="Remote local scratch directory.")
     submit.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor.")

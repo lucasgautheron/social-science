@@ -33,6 +33,7 @@ from scipy import sparse
 
 from openalex.analysis.author_aggregation import file_sha256
 from openalex.analysis.event_papers import load_event_paper_clusters
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,13 @@ def build_new_links(
         )
     if existing is not None and _is_complete(existing, output):
         shutil.rmtree(scratch, ignore_errors=True)
+        if not existing.get("inventory"):
+            complete_manifest(
+                output,
+                existing,
+                stage="new-links",
+                inputs=_new_link_inputs(existing),
+            )
         logger.info("New-link artifacts already built in %s", output)
         return
     if existing is None and not resume and _output_exists(output):
@@ -406,7 +414,25 @@ def build_new_links(
         semantic_excluded_population,
     )
     shutil.rmtree(scratch, ignore_errors=True)
+    manifest["complete"] = True
+    complete_manifest(
+        output,
+        manifest,
+        stage="new-links",
+        inputs=_new_link_inputs(manifest),
+    )
     logger.info("Wrote first-link records for %s years to %s", len(years), output)
+
+
+def _new_link_inputs(manifest: dict) -> list[dict[str, str]]:
+    return [
+        {
+            "role": role,
+            "manifest_sha256": str(manifest[f"{role}_manifest_sha256"]),
+        }
+        for role in ("events", "clusters", "author_embeddings")
+        if manifest.get(f"{role}_manifest_sha256")
+    ]
 
 
 def load_new_links(

@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
+from openalex.artifacts.manifest import complete_manifest, manifest_sha256
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DPI = 180
@@ -437,6 +439,27 @@ def build_cluster_link_plots(
         title="Event-cluster size and average distance across all paper links",
         y_label="Average link distance (connected only; existing links = 1)",
         dpi=dpi,
+    )
+    source_digest = manifest_sha256(root / "manifest.json")
+    complete_manifest(
+        output,
+        {
+            "artifact_version": 1,
+            "new_links_manifest_sha256": source_digest,
+            "summary": summary_path.name,
+            "plots": [
+                "cluster_new_link_distance.png",
+                "cluster_semantic_link_distance.png",
+                "cluster_all_link_distance.png",
+            ],
+        },
+        stage="visualize-new-links",
+        inputs=[
+            {
+                "role": "new_links",
+                "manifest_sha256": source_digest,
+            }
+        ],
     )
     logger.info("Wrote cluster-link visualizations to %s", output)
     return summary_path

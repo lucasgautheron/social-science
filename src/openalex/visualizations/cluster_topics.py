@@ -19,10 +19,11 @@ import numpy as np
 from scipy import sparse
 
 from openalex.analysis.event_papers import load_event_paper_clusters
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 DEFAULT_OUTPUT_DIR = Path("output/cluster_topic_visualizations")
 
 TopicModelLoader = Callable[[Path], object]
@@ -57,17 +58,27 @@ def build_cluster_topic_summary(
         raise ValueError(f"Topic assignments not found: {assignments_path}")
     if not topic_list_path.is_file():
         raise ValueError(f"Topic list not found: {topic_list_path}")
-    if not model_path.exists():
-        raise ValueError(
-            "BERTopic model not found. Rao--Stirling diversity requires the saved "
-            "c-TF-IDF vectors; rebuild topics without --no-save-model."
-        )
 
     article_ids, article_topics = _load_topic_assignments(assignments_path)
     labels = _load_topic_labels(topic_list_path)
-    loader = topic_model_loader or _load_bertopic_model
-    topic_model = loader(model_path)
-    topic_ids, topic_vectors = _normalized_topic_vectors(topic_model)
+    vector_ids_value = topic_manifest.get("topic_vector_ids")
+    vectors_value = topic_manifest.get("topic_vectors")
+    if vector_ids_value and vectors_value:
+        topic_ids, topic_vectors = _load_topic_vectors(
+            topics / str(vector_ids_value),
+            topics / str(vectors_value),
+        )
+        topic_vector_source = str(topics / str(vectors_value))
+    else:
+        if not model_path.exists():
+            raise ValueError(
+                "Topic artifact has neither reusable c-TF-IDF vectors nor a saved "
+                "BERTopic model. Hydrate a complete legacy export or rerun topics."
+            )
+        loader = topic_model_loader or _load_bertopic_model
+        topic_model = loader(model_path)
+        topic_ids, topic_vectors = _normalized_topic_vectors(topic_model)
+        topic_vector_source = str(model_path)
 
     (
         event_ids,
@@ -147,7 +158,7 @@ def build_cluster_topic_summary(
         "topics_manifest_sha256": _file_sha256(topic_manifest_path),
         "summary": summary_path.name,
         "topic_assignment": "hard full-corpus BERTopic classifier label",
-        "topic_model": str(model_path),
+        "topic_vectors": topic_vector_source,
         "author_diversity": author_manifest_path is not None,
         "author_weighting": "sum(1 / paper_author_count) over cluster papers",
         "author_primary_topic": (
@@ -161,7 +172,26 @@ def build_cluster_topic_summary(
                 "source_database": str(source_database),
             }
         )
-    _atomic_json(output / "manifest.json", manifest)
+    inputs = [
+        {
+            "role": role,
+            "manifest_sha256": manifest[f"{role}_manifest_sha256"],
+        }
+        for role in ("events", "clusters", "topics")
+    ]
+    if author_manifest_path is not None:
+        inputs.append(
+            {
+                "role": "author_topics",
+                "manifest_sha256": manifest["author_topics_manifest_sha256"],
+            }
+        )
+    complete_manifest(
+        output,
+        manifest,
+        stage="visualize-cluster-topics",
+        inputs=inputs,
+    )
     logger.info("Wrote cluster-topic summary for %s clusters to %s", len(rows), output)
     return summary_path
 
@@ -490,6 +520,27 @@ def _normalized_topic_vectors(topic_model: object) -> tuple[np.ndarray, sparse.c
     return topic_ids, normalized.tocsr()
 
 
+def _load_topic_vectors(
+    ids_path: Path, vectors_path: Path
+) -> tuple[np.ndarray, sparse.csr_matrix]:
+    if not ids_path.is_file() or not vectors_path.is_file():
+        raise ValueError(
+            f"Topic vector artifact is incomplete: {ids_path}, {vectors_path}"
+        )
+    topic_ids = np.load(ids_path, allow_pickle=False).astype(np.int32, copy=False)
+    vectors = sparse.load_npz(vectors_path).tocsr().astype(np.float64)
+    if topic_ids.ndim != 1 or vectors.shape[0] != topic_ids.size:
+        raise ValueError("Topic vector ids and c-TF-IDF rows do not align")
+    if topic_ids.size and np.any(topic_ids[1:] <= topic_ids[:-1]):
+        raise ValueError("Topic vector ids must be unique and increasing")
+    norms = np.sqrt(np.asarray(vectors.multiply(vectors).sum(axis=1)).ravel())
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 0):
+        raise ValueError("Topic vector artifact contains invalid rows")
+    if not np.allclose(norms, 1.0, rtol=1e-5, atol=1e-7):
+        vectors = sparse.diags(1.0 / norms) @ vectors
+    return topic_ids, vectors.tocsr()
+
+
 def _load_topic_assignments(path: Path) -> tuple[np.ndarray, np.ndarray]:
     try:
         import pyarrow.parquet as pq
@@ -598,15 +649,6 @@ def _file_sha256(path: Path) -> str:
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
 
 
 def build_parser() -> argparse.ArgumentParser:

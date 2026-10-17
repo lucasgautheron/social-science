@@ -28,6 +28,7 @@ from openalex.analysis.author_aggregation import (
     source_metadata,
 )
 from openalex.analysis.embeddings import EmbeddingStore
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -265,8 +266,18 @@ def build_author_embeddings(
         raise RuntimeError(
             f"Processed {processed_articles} embeddings, expected {store.count()}"
         )
-    atomic_json(manifest_path, final_manifest)
     shutil.rmtree(scratch)
+    final_manifest = complete_manifest(
+        output,
+        final_manifest,
+        stage="author-embeddings",
+        inputs=[
+            {
+                "role": "embeddings",
+                "manifest_sha256": final_manifest["embedding_manifest_sha256"],
+            }
+        ],
+    )
     return final_manifest
 
 

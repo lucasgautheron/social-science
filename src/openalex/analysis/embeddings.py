@@ -21,6 +21,7 @@ from urllib.parse import quote
 import numpy as np
 
 from openalex.analysis.author_aggregation import file_sha256
+from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +509,7 @@ def build_embeddings(
     _atomic_json(manifest_path, manifest)
     if not manifest["complete"]:
         raise RuntimeError(f"Stored {final_count} embeddings for {total} source articles")
-    return manifest
+    return complete_manifest(output, manifest, stage="embeddings")
 
 
 def _source_batches(database: Path, batch_size: int) -> Iterator[list[sqlite3.Row]]:

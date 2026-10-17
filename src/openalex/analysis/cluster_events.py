@@ -26,6 +26,7 @@ from scipy import sparse
 from scipy.cluster.hierarchy import fcluster
 
 from openalex.analysis.filter_events import find_filtered_events, genuine_ngrams
+from openalex.artifacts.manifest import complete_manifest, manifest_sha256
 from openalex.website.build import cosine_complete_linkage, load_event_artifacts
 
 logger = logging.getLogger(__name__)
@@ -558,6 +559,7 @@ def _write_outputs(
     _write_clusters(output / "clusters.csv", keywords, groups_by_level)
     _write_yearly(output / "cluster_by_year.csv", yearly, papers_by_year)
     manifest = {
+        "artifact_version": 1,
         "method": DENDROGRAM_METHOD,
         "keywords": "keywords.npy",
         "groups_by_level": "groups_by_level.npy",
@@ -582,8 +584,21 @@ def _write_outputs(
         "target_clusters": fitted.target_clusters,
         "linkage": "complete",
         "profile": "l2-normalized-cooccurrence-cosine",
+        "events_manifest_sha256": manifest_sha256(
+            Path(artifacts["root"]) / "manifest.json"
+        ),
     }
-    _atomic_json(output / "manifest.json", manifest)
+    complete_manifest(
+        output,
+        manifest,
+        stage="cluster-events",
+        inputs=[
+            {
+                "role": "events",
+                "manifest_sha256": manifest["events_manifest_sha256"],
+            }
+        ],
+    )
 
 
 def _event_field_map(events_dir: Path) -> dict[str, dict[str, str]]:
@@ -692,16 +707,6 @@ def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str
         writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(temporary, path)
-
-
-def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
     os.replace(temporary, path)
 
 

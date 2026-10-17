@@ -25,6 +25,7 @@ class FakePaginator:
 class FakeS3:
     def __init__(self, objects):
         self.objects = objects
+        self.metadata = {}
         self.downloads = []
         self.uploads = []
 
@@ -43,11 +44,15 @@ class FakeS3:
             error = RuntimeError("not found")
             error.response = {"Error": {"Code": "404"}}
             raise error
-        return {"ContentLength": self.objects[Key]}
+        return {
+            "ContentLength": self.objects[Key],
+            "Metadata": self.metadata.get(Key, {}),
+        }
 
-    def upload_file(self, filename, bucket, key):
+    def upload_file(self, filename, bucket, key, ExtraArgs=None):
         self.uploads.append((filename, bucket, key))
         self.objects[key] = Path(filename).stat().st_size
+        self.metadata[key] = (ExtraArgs or {}).get("Metadata", {})
 
 
 class FakeSSM:
@@ -148,7 +153,11 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(published[0]["s3_uri"], f"s3://bucket/{prefix}/")
             self.assertEqual(
                 [key for _, _, key in s3.uploads],
-                [f"{prefix}/data.npy", f"{prefix}/manifest.json"],
+                [
+                    f"{prefix}/data.npy",
+                    f"{prefix}/_artifact_inventory.json",
+                    f"{prefix}/manifest.json",
+                ],
             )
 
             upload_count = len(s3.uploads)
