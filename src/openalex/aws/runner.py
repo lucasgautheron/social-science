@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
 from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
+from openalex.artifacts.manifest import manifest_sha256
 from openalex.artifacts.resolver import ArtifactResolver
 from openalex.artifacts.s3_store import S3ArtifactStore
 from openalex.artifacts.specs import (
@@ -150,6 +151,7 @@ def publish_input_artifacts(
     input_paths: List[str],
     *,
     base_dir: Optional[Path] = None,
+    artifact_lock: ArtifactLock | None = None,
 ) -> List[Dict[str, str]]:
     """Publish complete local artifact directories under immutable manifest digests."""
     root = (base_dir or Path.cwd()).resolve()
@@ -171,20 +173,55 @@ def publish_input_artifacts(
         seen_destinations.append(relative)
         source = root.joinpath(*relative.parts)
         manifest = source / "manifest.json"
+        pin = None if artifact_lock is None else artifact_lock.get(destination)
+        if not manifest.is_file() and pin is not None:
+            store = S3ArtifactStore(s3, bucket, state["prefix"])
+            manifest_key = (
+                f"{store.artifact_prefix(pin.manifest_sha256)}/manifest.json"
+            )
+            if _s3_object_exists(s3, bucket, manifest_key):
+                artifacts.append(
+                    {
+                        "path": destination,
+                        "manifest_sha256": pin.manifest_sha256,
+                        "s3_uri": store.artifact_uri(pin.manifest_sha256),
+                    }
+                )
+                print(
+                    f"Reusing pinned S3 input {destination} "
+                    f"({pin.manifest_sha256[:12]})."
+                )
+                continue
         if not source.is_dir() or not manifest.is_file():
             raise SystemExit(
                 f"Input artifact {destination!r} must be a directory containing manifest.json"
             )
         store = S3ArtifactStore(s3, bucket, state["prefix"])
-        try:
-            published = store.publish(source)
-        except ValueError as exc:
-            raise SystemExit(f"Input artifact {destination!r} is invalid: {exc}") from exc
-        digest = published["manifest_sha256"]
-        print(
-            f"Prepared input {destination} at "
-            f"{published['s3_uri']} ({digest[:12]})."
+        digest = manifest_sha256(manifest)
+        artifact_prefix = prefixed_key(
+            state["prefix"], f"{INPUT_ARTIFACTS_DIR}/{digest}"
         )
+        manifest_key = f"{artifact_prefix}/manifest.json"
+        if _s3_object_exists(s3, bucket, manifest_key):
+            published = {
+                "manifest_sha256": digest,
+                "s3_uri": f"{s3_uri(bucket, artifact_prefix)}/",
+            }
+            print(
+                f"Reusing S3 input {destination} "
+                f"({digest[:12]})."
+            )
+        else:
+            try:
+                published = store.publish(source)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"Input artifact {destination!r} is invalid: {exc}"
+                ) from exc
+            print(
+                f"Published input {destination} at "
+                f"{published['s3_uri']} ({digest[:12]})."
+            )
         artifacts.append(
             {
                 "path": destination,
@@ -1446,12 +1483,28 @@ def command_submit(args: argparse.Namespace) -> int:
         for path in dependency_paths(pipeline_name, pipeline_args):
             if path not in input_paths:
                 input_paths.append(path)
+        artifact_lock = ArtifactLock(args.artifact_lock)
+        artifact_store = S3ArtifactStore(s3, bucket, state["prefix"])
         resolver = ArtifactResolver(
             cache=ArtifactCache(args.artifact_cache),
-            lock=ArtifactLock(args.artifact_lock),
-            store=S3ArtifactStore(s3, bucket, state["prefix"]),
+            lock=artifact_lock,
+            store=artifact_store,
         )
         for path in input_paths:
+            local_manifest = Path(path) / "manifest.json"
+            digest = (
+                manifest_sha256(local_manifest)
+                if local_manifest.is_file()
+                else None
+            )
+            pin = artifact_lock.get(path)
+            digest = digest or (None if pin is None else pin.manifest_sha256)
+            if digest is not None and _s3_object_exists(
+                s3,
+                bucket,
+                f"{artifact_store.artifact_prefix(digest)}/manifest.json",
+            ):
+                continue
             resolver.resolve(
                 path,
                 validator=lambda root: validate_dependency(
@@ -1462,6 +1515,9 @@ def command_submit(args: argparse.Namespace) -> int:
         s3,
         state,
         input_paths,
+        artifact_lock=(
+            artifact_lock if invocation is not None else ArtifactLock(args.artifact_lock)
+        ),
     )
 
     if not args.no_start:
