@@ -884,11 +884,18 @@
     });
   }
 
-  fetch("data.json")
-    .then((response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.json();
-    })
+  async function fetchCompressedJson(url) {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("This browser does not support gzip decompression");
+    }
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.body) throw new Error("The data response has no body");
+    const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
+    return new Response(stream).json();
+  }
+
+  fetchCompressedJson("data.json.gz")
     .then((data) => {
       const rowsByCluster = new Map();
       for (const row of data.link_distances || []) {

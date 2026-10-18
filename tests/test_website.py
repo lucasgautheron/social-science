@@ -1,3 +1,4 @@
+import gzip
 import json
 import sqlite3
 
@@ -14,6 +15,11 @@ from openalex.website.build import (
     load_event_artifacts,
     select_keywords,
 )
+
+
+def read_site_payload(site_dir):
+    with gzip.open(site_dir / "data.json.gz", "rt", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def write_event_fixture(root):
@@ -132,10 +138,16 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     assert not (site_dir / "app.js").exists()
     assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
+    assert (site_dir / "data.json.gz").is_file()
+    assert not (site_dir / "data.json").exists()
+    for script in ("clusters.js", "link-distances.js"):
+        content = (site_dir / script).read_text(encoding="utf-8")
+        assert 'fetchCompressedJson("data.json.gz")' in content
+        assert 'new DecompressionStream("gzip")' in content
     for page in ("clusters.html", "link-distances.html"):
         assert "Top keywords" not in (site_dir / page).read_text(encoding="utf-8")
         assert "dendrogram" not in (site_dir / page).read_text(encoding="utf-8")
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     assert "top_keywords" not in payload
     assert payload["cluster_list"] is None
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
@@ -193,7 +205,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     )
 
     assert summary["link_clusters"] == 2
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     first, second = payload["link_distances"]
     assert first["label"] == "beta"
     assert first["keywords"] == ["beta", "alpha"]
@@ -248,7 +260,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         min_document_frequency=2,
         max_dendrogram_keywords=10,
     )
-    labeled = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    labeled = read_site_payload(site_dir)
     assert labeled["link_distances"][0]["cluster_type"] == "step"
     with pytest.raises(ValueError, match="Cluster trends not found"):
         build_website(
@@ -331,7 +343,7 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
     )
 
     assert summary["topic_clusters"] == 2
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     first, second = payload["cluster_topics"]
     assert first["cluster_id"] == 0
     assert first["rao_stirling_diversity"] == pytest.approx(0.375)
@@ -389,7 +401,7 @@ def test_cluster_list_counts_documents_once(tmp_path):
         max_dendrogram_keywords=10,
     )
     assert summary["event_clusters"] == 2
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     assert payload["cluster_list"][0]["papers"] == 4
     assert "canvas" not in (site_dir / "clusters.html").read_text(encoding="utf-8")
     assert not (site_dir / "graph.html").exists()
@@ -424,7 +436,7 @@ def test_website_uses_genuine_keywords_when_available(tmp_path):
     assert summary["genuine_keywords"] == 2
     assert summary["dendrogram_keywords"] == 2
     assert summary["event_clusters"] == 1
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))
     assert set(root["keywords"]) == {"alpha", "beta"}
     assert payload["cluster_list"][0]["keywords"] == ["beta", "alpha"]
@@ -494,7 +506,7 @@ def test_yearly_curves_use_database_article_counts(tmp_path):
         max_dendrogram_keywords=10,
     )
     assert summary["yearly_denominator"] == "database"
-    payload = json.loads((site_dir / "data.json").read_text(encoding="utf-8"))
+    payload = read_site_payload(site_dir)
     assert payload["meta"]["yearly_denominator"] == "database"
     assert payload["meta"]["total_documents"] == 30
     root = max(payload["dendrogram"]["nodes"], key=lambda node: len(node["keywords"]))

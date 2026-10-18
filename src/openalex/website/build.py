@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import math
 import multiprocessing
@@ -959,6 +960,13 @@ def write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_bytes(content)
+    temporary.replace(path)
+
+
 def build_website(
     events_dir: str | Path = "output/events",
     *,
@@ -1138,10 +1146,14 @@ def build_website(
     for asset in SITE_ASSETS:
         write_text(output / asset, site.joinpath(asset).read_text(encoding="utf-8"))
     write_text(output / ".nojekyll", "")
-    write_text(
-        output / "data.json",
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    data = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    write_bytes(
+        output / "data.json.gz",
+        gzip.compress(data, compresslevel=9, mtime=0),
     )
+    (output / "data.json").unlink(missing_ok=True)
     return {
         "output_dir": str(output),
         "dendrogram_keywords": len(selected),
