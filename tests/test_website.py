@@ -370,6 +370,8 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
     assert "rao_stirling_diversity" in script
     assert "author_rao_stirling_diversity" in script
     assert "topicHistogram" in clusters_script
+    assert "function topicTopWord(item)" in script
+    assert "label.textContent = topicTopWord(item)" in script
 
 
 def test_cluster_list_counts_documents_once(tmp_path):

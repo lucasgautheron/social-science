@@ -274,6 +274,11 @@
     );
   }
 
+  function topicTopWord(item) {
+    const label = String(item.label || "").replace(/^-?\d+[_\s-]+/, "");
+    return label.split("_").find((word) => word.length) || `T${item.topic_id}`;
+  }
+
   function topicDistributionChart(row) {
     const config = measures[state.measure];
     const valueField = config.authorDiversity ? "weight" : "papers";
@@ -281,9 +286,10 @@
     const wrapper = document.createElement("div");
     wrapper.className = "topic-histogram-scroll";
     const width = Math.max(340, 54 + values.length * 38);
+    const height = 250;
     const chart = svgNode("svg", {
       class: "line-chart topic-detail-chart",
-      viewBox: `0 0 ${width} 210`,
+      viewBox: `0 0 ${width} ${height}`,
       role: "img",
     });
     chart.style.width = `${width}px`;
@@ -294,16 +300,17 @@
       wrapper.append(chart);
       return wrapper;
     }
-    const padding = { left: 46, right: 12, top: 16, bottom: 46 };
+    const padding = { left: 46, right: 12, top: 16, bottom: 92 };
+    const baseline = height - padding.bottom;
     const maxShare = Math.max(...values.map((item) => Number(item.share))) || 1;
     const step = (width - padding.left - padding.right) / values.length;
     const barWidth = Math.max(5, Math.min(24, step * 0.68));
     const x = (index) => padding.left + step * (index + 0.5);
-    const y = (share) => 210 - padding.bottom
-      - (Number(share) / maxShare) * (210 - padding.top - padding.bottom);
+    const y = (share) => baseline
+      - (Number(share) / maxShare) * (height - padding.top - padding.bottom);
     chart.append(svgNode("path", {
       class: "axis",
-      d: `M ${padding.left} ${padding.top} V ${210 - padding.bottom} H ${width - padding.right}`,
+      d: `M ${padding.left} ${padding.top} V ${baseline} H ${width - padding.right}`,
     }));
     values.forEach((item, index) => {
       const bar = svgNode("rect", {
@@ -311,7 +318,7 @@
         x: x(index) - barWidth / 2,
         y: y(item.share),
         width: barWidth,
-        height: Math.max(0, 210 - padding.bottom - y(item.share)),
+        height: Math.max(0, baseline - y(item.share)),
       });
       const title = svgNode("title");
       title.textContent = config.authorDiversity
@@ -321,10 +328,11 @@
       const label = svgNode("text", {
         class: "axis-label",
         x: x(index),
-        y: 181,
-        "text-anchor": "middle",
+        y: baseline + 12,
+        "text-anchor": "end",
+        transform: `rotate(-45 ${x(index)} ${baseline + 12})`,
       });
-      label.textContent = `T${item.topic_id}`;
+      label.textContent = topicTopWord(item);
       chart.append(bar, label);
     });
     const maximum = svgNode("text", {
@@ -336,7 +344,7 @@
     const xLabel = svgNode("text", {
       class: "axis-label",
       x: (padding.left + width - padding.right) / 2,
-      y: 204,
+      y: height - 8,
       "text-anchor": "middle",
     });
     xLabel.textContent = config.authorDiversity
