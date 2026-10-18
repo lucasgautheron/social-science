@@ -102,7 +102,22 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .axis { fill: none; stroke: #a9b4b1; stroke-width: 1; }
 .series { fill: none; stroke: var(--accent); stroke-width: 2.5; }
 .series-point { fill: #fff; stroke: var(--accent); stroke-width: 2; }
-.axis-label { fill: var(--muted); font-size: 10px; }
+.axis-label { fill: var(--muted); font-size: 10px; pointer-events: none; }
+.topic-chart-frame { position: relative; }
+.topic-hit { fill: transparent; cursor: pointer; }
+.topic-tooltip {
+  position: absolute;
+  z-index: 4;
+  max-width: 18rem;
+  padding: .35rem .55rem;
+  border: 1px solid var(--line);
+  border-radius: .45rem;
+  background: rgb(255 255 255 / 96%);
+  color: var(--ink);
+  font-size: .75rem;
+  line-height: 1.35;
+  pointer-events: none;
+}
 .axis-label.end { text-anchor: end; }
 
 .link-workspace {
@@ -262,6 +277,7 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .distance-bar { fill: var(--accent); fill-opacity: .68; }
 .topic-bar { fill: var(--accent); fill-opacity: .76; }
 .topic-histogram-scroll {
+  position: relative;
   width: 100%;
   margin-top: 0;
   overflow-x: auto;

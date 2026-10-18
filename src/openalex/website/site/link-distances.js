@@ -285,6 +285,9 @@
     const values = orderedTopics(row[config.distribution], valueField);
     const wrapper = document.createElement("div");
     wrapper.className = "topic-histogram-scroll";
+    const tooltip = document.createElement("div");
+    tooltip.className = "topic-tooltip";
+    tooltip.hidden = true;
     const width = Math.max(340, 54 + values.length * 38);
     const height = 250;
     const chart = svgNode("svg", {
@@ -297,7 +300,7 @@
       const message = svgNode("text", { class: "axis-label", x: 16, y: 30 });
       message.textContent = "No topic assignments";
       chart.append(message);
-      wrapper.append(chart);
+      wrapper.append(chart, tooltip);
       return wrapper;
     }
     const padding = { left: 46, right: 12, top: 16, bottom: 92 };
@@ -320,11 +323,21 @@
         width: barWidth,
         height: Math.max(0, baseline - y(item.share)),
       });
-      const title = svgNode("title");
-      title.textContent = config.authorDiversity
+      const hit = svgNode("rect", {
+        class: "topic-hit",
+        x: padding.left + step * index,
+        y: padding.top,
+        width: step,
+        height: baseline - padding.top,
+      });
+      const detail = config.authorDiversity
         ? `${item.label}: ${Number(item.authors).toLocaleString()} authors, ${Number(item.weight).toLocaleString(undefined, { maximumFractionDigits: 2 })} fractional paper weight (${formatPercent(item.share)})`
         : `${item.label}: ${Number(item.papers).toLocaleString()} papers (${formatPercent(item.share)})`;
-      bar.append(title);
+      hit.addEventListener("pointerenter", (event) => showTopicTooltip(wrapper, tooltip, event, detail));
+      hit.addEventListener("pointermove", (event) => showTopicTooltip(wrapper, tooltip, event, detail));
+      hit.addEventListener("pointerleave", () => {
+        tooltip.hidden = true;
+      });
       const label = svgNode("text", {
         class: "axis-label",
         x: x(index),
@@ -333,7 +346,7 @@
         transform: `rotate(-45 ${x(index)} ${baseline + 12})`,
       });
       label.textContent = topicTopWord(item);
-      chart.append(bar, label);
+      chart.append(bar, hit, label);
     });
     const maximum = svgNode("text", {
       class: "axis-label",
@@ -357,8 +370,16 @@
         (item) => `${item.label} ${formatPercent(item.share)}`,
       ).join(", ")}`,
     );
-    wrapper.append(chart);
+    wrapper.append(chart, tooltip);
     return wrapper;
+  }
+
+  function showTopicTooltip(frame, tooltip, event, text) {
+    const bounds = frame.getBoundingClientRect();
+    tooltip.hidden = false;
+    tooltip.textContent = text;
+    tooltip.style.left = `${event.clientX - bounds.left + frame.scrollLeft + 12}px`;
+    tooltip.style.top = `${event.clientY - bounds.top - 28}px`;
   }
 
   function distributionChart(row) {

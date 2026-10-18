@@ -35,16 +35,22 @@
     const ordered = orderedTopics(values, valueField);
     const width = 480;
     const height = 180;
+    const frame = document.createElement("div");
+    frame.className = "topic-chart-frame";
+    const tooltip = document.createElement("div");
+    tooltip.className = "topic-tooltip";
+    tooltip.hidden = true;
     const chart = svgNode("svg", {
       class: "line-chart cluster-topic-chart",
       viewBox: `0 0 ${width} ${height}`,
       role: "img",
     });
+    frame.append(chart, tooltip);
     if (!ordered.length) {
       const message = svgNode("text", { class: "axis-label", x: 8, y: 24 });
       message.textContent = "No topic assignments";
       chart.append(message);
-      return chart;
+      return frame;
     }
     const shown = ordered.slice(0, 10);
     if (ordered.length > shown.length) {
@@ -77,12 +83,22 @@
         width: barWidth,
         height: Math.max(0, baseline - y(item[valueField])),
       });
-      const title = svgNode("title");
-      title.textContent = `${item.label}: ${Number(item[valueField]).toLocaleString(
+      const hit = svgNode("rect", {
+        class: "topic-hit",
+        x: padding.left + step * index,
+        y: padding.top,
+        width: step,
+        height: baseline - padding.top,
+      });
+      const detail = `${item.label}: ${Number(item[valueField]).toLocaleString(
         undefined,
         { maximumFractionDigits: 2 },
       )} ${unit}`;
-      bar.append(title);
+      hit.addEventListener("pointerenter", (event) => showTopicTooltip(frame, tooltip, event, detail));
+      hit.addEventListener("pointermove", (event) => showTopicTooltip(frame, tooltip, event, detail));
+      hit.addEventListener("pointerleave", () => {
+        tooltip.hidden = true;
+      });
       const label = svgNode("text", {
         class: "axis-label",
         x,
@@ -91,7 +107,7 @@
         transform: `rotate(-45 ${x} ${baseline + 12})`,
       });
       label.textContent = topicTopWord(item);
-      chart.append(bar, label);
+      chart.append(bar, hit, label);
     });
     const maximumLabel = svgNode("text", {
       class: "axis-label",
@@ -109,7 +125,15 @@
         (item) => `${item.label} ${item[valueField]}`,
       ).join(", ")}`,
     );
-    return chart;
+    return frame;
+  }
+
+  function showTopicTooltip(frame, tooltip, event, text) {
+    const bounds = frame.getBoundingClientRect();
+    tooltip.hidden = false;
+    tooltip.textContent = text;
+    tooltip.style.left = `${event.clientX - bounds.left + 12}px`;
+    tooltip.style.top = `${event.clientY - bounds.top - 28}px`;
   }
 
   function lineChart(values) {
