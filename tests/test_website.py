@@ -144,6 +144,10 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
         content = (site_dir / script).read_text(encoding="utf-8")
         assert 'fetchCompressedJson("data.json.gz")' in content
         assert 'new DecompressionStream("gzip")' in content
+    clusters_script = (site_dir / "clusters.js").read_text(encoding="utf-8")
+    assert "function topicTopWord(item)" in clusters_script
+    assert "label.textContent = topicTopWord(item)" in clusters_script
+    assert "rotate(-45" in clusters_script
     for page in ("clusters.html", "link-distances.html"):
         assert "Top keywords" not in (site_dir / page).read_text(encoding="utf-8")
         assert "dendrogram" not in (site_dir / page).read_text(encoding="utf-8")

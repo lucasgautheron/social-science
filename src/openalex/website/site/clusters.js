@@ -24,11 +24,20 @@
     );
   }
 
+  function topicTopWord(item) {
+    if (item.topic_id == null) return "Other";
+    if (item.top_word) return String(item.top_word);
+    const label = String(item.label || "").replace(/^-?\d+[_\s-]+/, "");
+    return label.split("_").find((word) => word.length) || `T${item.topic_id}`;
+  }
+
   function topicHistogram(values, valueField = "papers", unit = "papers") {
     const ordered = orderedTopics(values, valueField);
+    const width = 480;
+    const height = 180;
     const chart = svgNode("svg", {
       class: "line-chart cluster-topic-chart",
-      viewBox: "0 0 360 132",
+      viewBox: `0 0 ${width} ${height}`,
       role: "img",
     });
     if (!ordered.length) {
@@ -48,15 +57,16 @@
         ),
       });
     }
-    const padding = { left: 40, right: 10, top: 12, bottom: 34 };
+    const padding = { left: 40, right: 10, top: 12, bottom: 72 };
     const maximum = Math.max(...shown.map((item) => Number(item[valueField]))) || 1;
-    const step = (360 - padding.left - padding.right) / shown.length;
+    const step = (width - padding.left - padding.right) / shown.length;
     const barWidth = Math.max(4, Math.min(22, step * 0.65));
-    const y = (count) => 132 - padding.bottom
-      - (Number(count) / maximum) * (132 - padding.top - padding.bottom);
+    const baseline = height - padding.bottom;
+    const y = (count) => baseline
+      - (Number(count) / maximum) * (height - padding.top - padding.bottom);
     chart.append(svgNode("path", {
       class: "axis",
-      d: `M ${padding.left} ${padding.top} V ${132 - padding.bottom} H ${360 - padding.right}`,
+      d: `M ${padding.left} ${padding.top} V ${baseline} H ${width - padding.right}`,
     }));
     shown.forEach((item, index) => {
       const x = padding.left + step * (index + 0.5);
@@ -65,7 +75,7 @@
         x: x - barWidth / 2,
         y: y(item[valueField]),
         width: barWidth,
-        height: Math.max(0, 132 - padding.bottom - y(item[valueField])),
+        height: Math.max(0, baseline - y(item[valueField])),
       });
       const title = svgNode("title");
       title.textContent = `${item.label}: ${Number(item[valueField]).toLocaleString(
@@ -76,10 +86,11 @@
       const label = svgNode("text", {
         class: "axis-label",
         x,
-        y: 116,
-        "text-anchor": "middle",
+        y: baseline + 12,
+        "text-anchor": "end",
+        transform: `rotate(-45 ${x} ${baseline + 12})`,
       });
-      label.textContent = item.topic_id == null ? "Other" : `T${item.topic_id}`;
+      label.textContent = topicTopWord(item);
       chart.append(bar, label);
     });
     const maximumLabel = svgNode("text", {
