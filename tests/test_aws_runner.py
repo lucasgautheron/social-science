@@ -6,10 +6,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from openalex.aws import configure as aws_configure
-from openalex.aws import runner as aws_run
 from openalex.artifacts.lockfile import ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import complete_manifest
+from openalex.aws import configure as aws_configure
+from openalex.aws import runner as aws_run
 
 
 class FakePaginator:

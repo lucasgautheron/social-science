@@ -1,10 +1,10 @@
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from openalex.artifacts.pipeline import STAGES
+from openalex.aws import cli as aws_cli
 from openalex.aws import website
 
 
@@ -53,6 +53,12 @@ def _pipeline_mocks(tmp_path):
 def test_parser_defaults_to_deploy_and_accepts_no_deploy():
     assert _args().deploy is True
     assert _args("--no-deploy").deploy is False
+
+
+def test_website_pipeline_is_registered_in_aws_cli():
+    with mock.patch.object(website, "main", return_value=0) as main:
+        assert aws_cli.main(["website", "--no-deploy"]) == 0
+    main.assert_called_once_with(["--no-deploy"])
 
 
 def test_pipeline_reuses_artifacts_and_only_runs_final_website(tmp_path):

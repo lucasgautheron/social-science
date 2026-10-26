@@ -11,11 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
 from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
-from openalex.artifacts.manifest import (
-    ArtifactValidationError,
-    read_json,
-    validate_artifact,
-)
+from openalex.artifacts.manifest import ArtifactValidationError, read_json
 from openalex.artifacts.pipeline import (
     WEBSITE_STAGES,
     StageSpec,

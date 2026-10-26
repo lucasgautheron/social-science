@@ -16,8 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
-from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
-from openalex.artifacts.lockfile import ArtifactPin
+from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import manifest_sha256
 from openalex.artifacts.resolver import ArtifactResolver
 from openalex.artifacts.s3_store import S3ArtifactStore
