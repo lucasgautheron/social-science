@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from openalex.artifacts.cache import ArtifactCache
@@ -10,6 +11,12 @@ from openalex.artifacts.manifest import (
     ArtifactValidationError,
     complete_manifest,
     validate_artifact,
+)
+from openalex.artifacts.pipeline import (
+    STAGES,
+    WEBSITE_STAGES,
+    adopt_local_artifact,
+    artifact_is_compatible,
 )
 from openalex.artifacts.resolver import ArtifactResolver
 from openalex.artifacts.s3_store import S3ArtifactStore
@@ -175,3 +182,68 @@ def test_cluster_topic_dependency_requires_vectors_or_legacy_model(tmp_path):
         ["--topics-dir", str(topics)],
         topics,
     )
+
+
+def test_website_pipeline_graph_and_workers_are_deterministic():
+    names = [stage.name for stage in WEBSITE_STAGES]
+    assert names.index("embeddings") < names.index("topics")
+    assert names.index("author-embeddings") < names.index("new-links")
+    assert names.index("new-links") < names.index("visualize-new-links")
+    assert names[-1] == "build-website"
+    assert STAGES["embeddings"].worker == "gpu"
+    assert all(
+        stage.worker == "cpu"
+        for stage in WEBSITE_STAGES
+        if stage.name != "embeddings"
+    )
+
+
+def test_artifact_compatibility_checks_selected_input_digests(tmp_path):
+    source = tmp_path / "events"
+    source.mkdir()
+    (source / "payload.bin").write_bytes(b"events")
+    source_manifest = complete_manifest(
+        source,
+        {"artifact_version": 1},
+        stage="events",
+    )
+    source_digest = validate_artifact(source).digest
+
+    clusters = tmp_path / "clusters"
+    clusters.mkdir()
+    (clusters / "payload.bin").write_bytes(b"clusters")
+    complete_manifest(
+        clusters,
+        {"artifact_version": 1},
+        stage="cluster-events",
+        inputs=[{"role": "events", "manifest_sha256": source_digest}],
+    )
+    validation = validate_artifact(clusters)
+    assert artifact_is_compatible(
+        STAGES["cluster-events"],
+        validation,
+        {"events": source_digest},
+    )
+    assert not artifact_is_compatible(
+        STAGES["cluster-events"],
+        validation,
+        {"events": "different"},
+    )
+    assert source_manifest["stage"] == "events"
+
+
+def test_missing_manifest_payload_is_adopted_without_recomputation(tmp_path):
+    events = tmp_path / "events"
+    events.mkdir()
+    np.save(events / "event_vocabulary.npy", np.asarray(["topic"]))
+    np.save(events / "event_document_frequency.npy", np.asarray([4]))
+    from scipy import sparse
+
+    sparse.save_npz(events / "event_cooccurrence.npz", sparse.csr_matrix([[0]]))
+
+    validation = adopt_local_artifact(STAGES["events"], events, {})
+
+    assert validation.manifest["adopted_local_payload"] is True
+    assert validation.manifest["stage"] == "events"
+    assert validation.manifest["artifact_version"] == 1
+    assert validation.file_count == 3

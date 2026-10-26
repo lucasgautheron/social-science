@@ -1,3 +1,5 @@
+import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -6,6 +8,8 @@ from unittest import mock
 
 from openalex.aws import configure as aws_configure
 from openalex.aws import runner as aws_run
+from openalex.artifacts.lockfile import ArtifactLock, ArtifactPin
+from openalex.artifacts.manifest import complete_manifest
 
 
 class FakePaginator:
@@ -45,9 +49,24 @@ class FakeS3:
             error.response = {"Error": {"Code": "404"}}
             raise error
         return {
-            "ContentLength": self.objects[Key],
+            "ContentLength": (
+                len(self.objects[Key])
+                if isinstance(self.objects[Key], bytes)
+                else self.objects[Key]
+            ),
             "Metadata": self.metadata.get(Key, {}),
         }
+
+    def get_object(self, Bucket, Key):
+        del Bucket
+        if Key not in self.objects:
+            error = RuntimeError("not found")
+            error.response = {"Error": {"Code": "404"}}
+            raise error
+        payload = self.objects[Key]
+        if not isinstance(payload, bytes):
+            payload = b"x" * payload
+        return {"Body": io.BytesIO(payload)}
 
     def upload_file(self, filename, bucket, key, ExtraArgs=None):
         self.uploads.append((filename, bucket, key))
@@ -185,6 +204,56 @@ class ArtifactTests(unittest.TestCase):
                 aws_run.publish_input_artifacts(
                     s3, self.state, ["missing-manifest"], base_dir=root
                 )
+
+    def test_publish_input_artifact_prefers_immutable_pin_over_local_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "output" / "events"
+            artifact.mkdir(parents=True)
+            (artifact / "payload.bin").write_bytes(b"local")
+            complete_manifest(
+                artifact,
+                {"artifact_version": 1},
+                stage="events",
+            )
+            lock = ArtifactLock(root / "lock.json")
+            lock.pin(ArtifactPin("output/events", "pinned", "events"))
+            s3 = FakeS3(
+                {"project/artifacts/pinned/manifest.json": b'{"stage":"events"}'}
+            )
+
+            prepared = aws_run.publish_input_artifacts(
+                s3,
+                self.state,
+                ["output/events"],
+                base_dir=root,
+                artifact_lock=lock,
+            )
+
+            self.assertEqual(prepared[0]["manifest_sha256"], "pinned")
+            self.assertEqual(s3.uploads, [])
+
+    def test_pin_run_artifact_records_promoted_digest_without_download(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = b'{"artifact_version": 1, "stage": "events"}'
+            digest = hashlib.sha256(manifest).hexdigest()
+            objects = {
+                "project/runs/run-1/output/events/manifest.json": manifest,
+                f"project/artifacts/{digest}/manifest.json": manifest,
+            }
+            s3 = FakeS3(objects)
+            lock = ArtifactLock(Path(temp_dir) / "lock.json")
+
+            pin = aws_run.pin_run_artifact(
+                s3,
+                self.state,
+                "run-1",
+                "output/events",
+                lock,
+            )
+
+            self.assertEqual(pin.manifest_sha256, digest)
+            self.assertEqual(lock.get("output/events"), pin)
 
     def test_refresh_script_collects_current_and_legacy_outputs(self):
         script = aws_run.build_artifact_refresh_script(
