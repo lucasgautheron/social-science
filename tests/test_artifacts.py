@@ -131,6 +131,24 @@ def test_resolver_hydrates_pinned_artifact_and_reuses_cache(tmp_path):
 
 def test_command_dependencies_share_local_and_aws_paths():
     assert dependency_paths(
+        "new-links",
+        [
+            "--events-dir",
+            "events",
+            "--clusters-dir",
+            "clusters",
+            "--embeddings-dir",
+            "embeddings",
+            "--author-embeddings-dir",
+            "author_embeddings",
+        ],
+    ) == [
+        "events",
+        "clusters",
+        "embeddings",
+        "author_embeddings",
+    ]
+    assert dependency_paths(
         "visualize-cluster-topics",
         ["--topics-dir", "custom/topics"],
     ) == [

@@ -11,6 +11,7 @@ from scipy import sparse
 from openalex.cli import COMMANDS
 from openalex.visualizations.cluster_topics import (
     build_cluster_topic_summary,
+    summarize_cluster_author_topics,
     summarize_cluster_topics,
 )
 
@@ -224,6 +225,12 @@ def test_cluster_topic_summary_counts_each_paper_once_and_orders_topics(tmp_path
     assert int(first["author_primary_topic_missing_count"]) == 0
     assert float(first["author_weight"]) == pytest.approx(4.0)
     assert float(first["author_rao_stirling_diversity"]) == pytest.approx(0.5)
+    assert int(first["author_collaboration_paper_count"]) == 2
+    assert int(first["author_within_collaboration_paper_count"]) == 2
+    assert int(first["author_within_collaboration_missing_paper_count"]) == 0
+    assert float(
+        first["author_within_collaboration_diversity"]
+    ) == pytest.approx(0.5)
     assert json.loads(first["author_topic_distribution"]) == [
         {
             "topic_id": 0,
@@ -247,11 +254,18 @@ def test_cluster_topic_summary_counts_each_paper_once_and_orders_topics(tmp_path
     assert float(second["author_primary_topic_weight"]) == pytest.approx(2.0)
     assert float(second["author_primary_topic_missing_weight"]) == pytest.approx(1.0)
     assert float(second["author_rao_stirling_diversity"]) == pytest.approx(0.375)
+    assert int(second["author_collaboration_paper_count"]) == 1
+    assert int(second["author_within_collaboration_paper_count"]) == 1
+    assert int(second["author_within_collaboration_missing_paper_count"]) == 0
+    assert float(
+        second["author_within_collaboration_diversity"]
+    ) == pytest.approx(0.5)
     assert [
         item["topic_id"]
         for item in json.loads(second["author_topic_distribution"])
     ] == [1, 0]
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_version"] == 3
     assert manifest["cluster_count"] == 2
     assert manifest["cluster_level"] == 0
     assert manifest["summary"] == "cluster_topic_summary.csv"
@@ -293,6 +307,35 @@ def test_cluster_topic_summary_uses_exported_vectors_without_saved_model(tmp_pat
     )
 
     assert summary.is_file()
+
+
+def test_within_collaboration_diversity_uses_covered_coauthors_only():
+    rows = summarize_cluster_author_topics(
+        event_ids=np.array([10, 11], dtype=np.int64),
+        event_offsets=np.array([0, 1, 2], dtype=np.int64),
+        event_clusters=np.array([0, 0], dtype=np.int32),
+        cluster_labels=np.array(["cluster"], dtype=np.str_),
+        event_authors=[
+            np.array([1, 2, 3], dtype=np.int64),
+            np.array([3, 4], dtype=np.int64),
+        ],
+        article_ids=np.array([10, 11], dtype=np.int64),
+        article_topics=np.array([-1, -1], dtype=np.int32),
+        author_profiles={
+            1: {0: 1.0},
+            2: {1: 1.0},
+        },
+        topic_ids=np.array([0, 1], dtype=np.int32),
+        topic_vectors=sparse.eye(2, format="csr"),
+        labels={0: "Zero", 1: "One"},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["author_collaboration_paper_count"] == 2
+    assert row["author_within_collaboration_paper_count"] == 1
+    assert row["author_within_collaboration_missing_paper_count"] == 1
+    assert row["author_within_collaboration_diversity"] == pytest.approx(0.5)
 
 
 def test_summarize_cluster_topics_rejects_topic_without_vector():

@@ -8,6 +8,7 @@ import pytest
 from scipy import sparse
 
 from openalex.analysis import new_links
+from openalex.analysis.embeddings import encode_embedding
 from openalex.analysis.network import build_parser as build_network_parser
 from openalex.analysis.new_links import (
     _bidirectional_exact_bfs,
@@ -99,21 +100,79 @@ def create_corpus(path):
 
 
 def create_author_embedding_artifacts(root, database, *, omitted=()):
-    root.mkdir()
-    vectors = {
-        1: [1.0, 0.0],
-        2: [1.0, 0.0],
-        3: [0.0, 1.0],
-        4: [-1.0, 0.0],
-        5: [0.0, -1.0],
-        10: [1.0, 1.0],
-        11: [1.0, 1.0],
-        12: [1.0, -1.0],
-        13: [1.0, -1.0],
-        20: [1.0, 0.0],
-        21: [0.0, 1.0],
-        22: [-1.0, 0.0],
+    article_vectors = {
+        article_id: np.asarray(
+            [
+                np.cos(article_id * 0.37),
+                np.sin(article_id * 0.37),
+            ],
+            dtype="<f4",
+        )
+        for article_id in range(1, 16)
     }
+    embeddings = root.parent / "embeddings"
+    embeddings.mkdir()
+    with sqlite3.connect(embeddings / "embeddings.db") as connection:
+        connection.execute(
+            """
+            CREATE TABLE embeddings(
+                article_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO embeddings VALUES (?, ?)",
+            [
+                (article_id, encode_embedding(vector))
+                for article_id, vector in article_vectors.items()
+            ],
+        )
+    embedding_manifest = {
+        "artifact_version": 1,
+        "complete": True,
+        "database": "embeddings.db",
+        "dimension": 2,
+        "model": "test-model",
+        "source_database": str(database.resolve()),
+        "source_size": database.stat().st_size,
+        "source_sha256": digest(database),
+    }
+    (embeddings / "manifest.json").write_text(
+        json.dumps(embedding_manifest),
+        encoding="utf-8",
+    )
+
+    root.mkdir()
+    sums = {}
+    weights = {}
+    paper_counts = {}
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT aa.article_id, aa.author_id, counts.author_count
+            FROM articles_authors aa
+            JOIN (
+                SELECT article_id, COUNT(*) AS author_count
+                FROM articles_authors
+                GROUP BY article_id
+            ) counts ON counts.article_id = aa.article_id
+            ORDER BY aa.article_id, aa.author_id
+            """
+        )
+        for article_id, author_id, author_count in rows:
+            vector = article_vectors.get(int(article_id))
+            if vector is None:
+                continue
+            weight = 1.0 / int(author_count)
+            sums.setdefault(
+                int(author_id), np.zeros(2, dtype=np.float64)
+            )
+            sums[int(author_id)] += weight * vector
+            weights[int(author_id)] = weights.get(int(author_id), 0.0) + weight
+            paper_counts[int(author_id)] = (
+                paper_counts.get(int(author_id), 0) + 1
+            )
     omitted = set(omitted)
     artifact_database = root / "author_embeddings.db"
     with sqlite3.connect(artifact_database) as connection:
@@ -144,11 +203,14 @@ def create_author_embedding_artifacts(root, database, *, omitted=()):
             [
                 (
                     author_id,
-                    np.asarray(vector, dtype="<f4").tobytes(),
-                    1,
-                    1.0,
+                    np.asarray(
+                        sums[author_id] / weights[author_id],
+                        dtype="<f4",
+                    ).tobytes(),
+                    paper_counts[author_id],
+                    weights[author_id],
                 )
-                for author_id, vector in vectors.items()
+                for author_id in sorted(sums)
                 if author_id not in omitted
             ],
         )
@@ -160,6 +222,9 @@ def create_author_embedding_artifacts(root, database, *, omitted=()):
                 "database": "author_embeddings.db",
                 "dimension": 2,
                 "embedding_encoding": "little-endian-float32",
+                "embedding_manifest_sha256": digest(
+                    embeddings / "manifest.json"
+                ),
                 "source_database": str(database.resolve()),
                 "source_size": database.stat().st_size,
                 "source_sha256": digest(database),
@@ -271,6 +336,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         events,
         clusters,
         output,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
         fetch_size=1,
@@ -291,7 +357,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
     assert 20 not in author_ids
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_version"] == 9
+    assert manifest["artifact_version"] == 10
     assert manifest["baseline_sample"] == 2_000
     assert manifest["completed_years"] == [2019, 2020, 2021]
     assert manifest["clustered_link_counts"]["2020"] == 1
@@ -318,10 +384,27 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert stats["reference_cluster_id"].tolist() == [0, 1, 0]
         assert stats["reference_distance"].tolist() == [2, 2, 2]
         assert stats["reference_sampling_weight"].tolist() == [1, 1, 1]
-        assert stats["semantic_reference_population"].tolist() == [4]
-        assert stats["semantic_reference_distance"].tolist() == pytest.approx(
-            [1, 1, 1, 1]
+        assert stats["semantic_reference_population"].tolist() == [4, 4]
+        assert stats["semantic_reference_cluster_id"].tolist() == [
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+        ]
+        assert np.all(
+            (stats["semantic_reference_distance"] >= 0)
+            & (stats["semantic_reference_distance"] <= 2)
         )
+        assert stats["first_semantic_pair_observations"].tolist() == [1, 0]
+        assert stats[
+            "first_semantic_missing_embedding_observations"
+        ].tolist() == [0, 0]
+        assert stats["first_semantic_cluster_id"].tolist() == [0]
+        assert stats["first_semantic_sampling_weight"].tolist() == [1]
     with np.load(output / "cluster_years" / "2021.npz", allow_pickle=False) as stats:
         assert stats["connected_pair_observations"].tolist() == [1, 0]
         assert stats["disconnected_pair_observations"].tolist() == [2, 3]
@@ -344,7 +427,17 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert reservoir["excluded_population"].tolist() == [0, 0]
         assert reservoir["offsets"].tolist() == [0, 5, 9]
         assert reservoir["distances"].tolist() == pytest.approx(
-            [1, 1, 2, 2, 1, 1, 1, 2, 2]
+            [
+                0.9753857255,
+                0.9753857255,
+                1.2755903006,
+                1.2755903006,
+                0.9753857255,
+                0.2736564279,
+                0.5380300283,
+                1.2740426064,
+                1.2740426064,
+            ]
         )
     assert not (output / "scratch").exists()
 
@@ -363,6 +456,7 @@ def test_resume_complete_needs_no_inputs(tmp_path):
         events,
         clusters,
         output,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
     )
@@ -376,6 +470,7 @@ def test_resume_complete_needs_no_inputs(tmp_path):
         events,
         clusters,
         output,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
         resume=True,
@@ -383,6 +478,39 @@ def test_resume_complete_needs_no_inputs(tmp_path):
 
     assert digest(year_path) == before
     assert year_path.stat().st_mtime_ns == modified
+
+
+def test_semantic_profiles_exclude_cluster_only_author_histories(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    events = tmp_path / "events"
+    clusters = tmp_path / "clusters"
+    output = tmp_path / "new_links"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    create_event_artifacts(events, clusters)
+
+    build_new_links(
+        database,
+        events,
+        clusters,
+        output,
+        embeddings_dir=tmp_path / "embeddings",
+        author_embeddings_dir=author_embeddings,
+        max_authors=0,
+    )
+
+    with np.load(
+        output / "cluster_years" / "2021.npz",
+        allow_pickle=False,
+    ) as stats:
+        assert stats[
+            "semantic_missing_embedding_observations"
+        ].tolist() == [3, 0]
+        assert stats[
+            "first_semantic_missing_embedding_observations"
+        ].tolist() == [3, 0]
+        assert 0 not in stats["first_semantic_cluster_id"]
 
 
 def test_old_event_artifacts_explain_required_regeneration(tmp_path):
@@ -400,6 +528,7 @@ def test_old_event_artifacts_explain_required_regeneration(tmp_path):
             events,
             clusters,
             tmp_path / "new_links",
+            embeddings_dir=tmp_path / "embeddings",
             author_embeddings_dir=author_embeddings,
             max_authors=2,
         )
@@ -523,6 +652,8 @@ def test_network_commands_default_to_sixteen_authors():
                 "events",
                 "--clusters-dir",
                 "clusters",
+                "--embeddings-dir",
+                "embeddings",
                 "--author-embeddings-dir",
                 "author_embeddings",
             ]
@@ -538,6 +669,8 @@ def test_network_commands_default_to_sixteen_authors():
                 "events",
                 "--clusters-dir",
                 "clusters",
+                "--embeddings-dir",
+                "embeddings",
                 "--author-embeddings-dir",
                 "author_embeddings",
             ]
@@ -553,6 +686,8 @@ def test_network_commands_default_to_sixteen_authors():
                 "events",
                 "--clusters-dir",
                 "clusters",
+                "--embeddings-dir",
+                "embeddings",
                 "--author-embeddings-dir",
                 "author_embeddings",
             ]
@@ -568,6 +703,8 @@ def test_network_commands_default_to_sixteen_authors():
                 "events",
                 "--clusters-dir",
                 "clusters",
+                "--embeddings-dir",
+                "embeddings",
                 "--author-embeddings-dir",
                 "author_embeddings",
             ]
@@ -583,6 +720,8 @@ def test_network_commands_default_to_sixteen_authors():
                 "events",
                 "--clusters-dir",
                 "clusters",
+                "--embeddings-dir",
+                "embeddings",
                 "--author-embeddings-dir",
                 "author_embeddings",
             ]
@@ -631,11 +770,18 @@ def test_semantic_sampling_weights_repeated_pairs_by_frequency_and_tracks_covera
         [repeated, repeated, repeated, distinct, missing],
         dtype=np.uint64,
     )
+    class Coverage:
+        def covered_pairs(self, pair_keys, _pair_clusters):
+            return new_links._embedding_covered_pairs(
+                pair_keys,
+                np.array([10, 20, 30, 40], dtype=np.int64),
+                np.array([10, 20, 30], dtype=np.int64),
+            )
+
     arguments = (
         event_keys,
         np.zeros(5, dtype=np.int32),
-        np.array([10, 20, 30, 40], dtype=np.int64),
-        np.array([10, 20, 30], dtype=np.int64),
+        Coverage(),
     )
     result = _sample_semantic_observations(
         *arguments,
@@ -865,6 +1011,7 @@ def test_unsampled_links_still_grow_the_cumulative_graph(tmp_path):
         events,
         clusters,
         output,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
         no_cluster_sample=0,
@@ -903,6 +1050,7 @@ def test_resume_restores_unsampled_edges_from_scratch(tmp_path, monkeypatch):
             events,
             clusters,
             output,
+            embeddings_dir=tmp_path / "embeddings",
             author_embeddings_dir=author_embeddings,
             max_authors=2,
             no_cluster_sample=1,
@@ -918,6 +1066,7 @@ def test_resume_restores_unsampled_edges_from_scratch(tmp_path, monkeypatch):
         events,
         clusters,
         output,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
         no_cluster_sample=1,
@@ -948,6 +1097,7 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
         events,
         clusters,
         links,
+        embeddings_dir=tmp_path / "embeddings",
         author_embeddings_dir=author_embeddings,
         max_authors=2,
     )
@@ -992,7 +1142,7 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert float(rows[1]["average_all_link_distance"]) == pytest.approx(2)
     assert int(rows[1]["all_link_disconnected_count"]) == 3
     assert float(rows[0]["average_semantic_link_distance"]) == pytest.approx(
-        1.4
+        1.0954675555
     )
     assert int(rows[0]["semantic_link_observation_count"]) == 5
     assert int(rows[0]["semantic_link_missing_embedding_count"]) == 0
@@ -1006,16 +1156,26 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     )
     assert sum(bin_[2] for bin_ in semantic_baseline) == pytest.approx(5)
     assert [bin_[2] for bin_ in semantic_baseline] == pytest.approx(
-        [3.8, 1.2]
+        [1.2, 1.0, 1.6, 1.2]
     )
     assert json.loads(rows[0]["semantic_link_distance_by_year"]) == [
-        [2020, 1.0],
-        [2021, 5 / 3],
+        [2020, pytest.approx(0.9753857255)],
+        [2021, pytest.approx(1.1755221089)],
     ]
+    assert float(
+        rows[0]["average_first_semantic_link_distance"]
+    ) == pytest.approx(0.9753857255)
+    assert int(rows[0]["first_semantic_link_observation_count"]) == 1
+    assert json.loads(
+        rows[0]["first_semantic_link_distance_by_year"]
+    ) == [[2020, pytest.approx(0.9753857255)]]
     assert rows[0]["label"] == "alpha"
     assert rows[0]["new_link_highlighted"] == "True"
     assert (plots / "cluster_new_link_distance.png").stat().st_size > 0
     assert (plots / "cluster_all_link_distance.png").stat().st_size > 0
+    assert (
+        plots / "cluster_first_semantic_link_distance.png"
+    ).stat().st_size > 0
     assert (plots / "cluster_semantic_link_distance.png").stat().st_size > 0
 
 

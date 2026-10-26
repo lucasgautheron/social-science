@@ -23,7 +23,7 @@ from openalex.artifacts.manifest import complete_manifest
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT_VERSION = 2
+ARTIFACT_VERSION = 3
 DEFAULT_OUTPUT_DIR = Path("output/cluster_topic_visualizations")
 
 TopicModelLoader = Callable[[Path], object]
@@ -163,6 +163,10 @@ def build_cluster_topic_summary(
         "author_weighting": "sum(1 / paper_author_count) over cluster papers",
         "author_primary_topic": (
             "largest fractional topic weight after subtracting current-cluster papers"
+        ),
+        "author_within_collaboration_diversity": (
+            "equal-paper mean Rao--Stirling diversity among covered coauthors; "
+            "requires at least two covered coauthors"
         ),
     }
     if author_manifest_path is not None and source_database is not None:
@@ -317,19 +321,24 @@ def summarize_cluster_author_topics(
     author_weights: list[defaultdict[int, float]] = [
         defaultdict(float) for _ in range(cluster_count)
     ]
+    cluster_paper_indices: list[list[int]] = [
+        [] for _ in range(cluster_count)
+    ]
     excluded_weights: list[dict[int, defaultdict[int, float]]] = [
         {} for _ in range(cluster_count)
     ]
     missing_sentinel = np.iinfo(np.int32).min
     for paper_index, authors_value in enumerate(event_authors):
         authors = np.asarray(authors_value, dtype=np.int64)
+        clusters = event_clusters[
+            event_offsets[paper_index] : event_offsets[paper_index + 1]
+        ]
+        for cluster_value in clusters:
+            cluster_paper_indices[int(cluster_value)].append(paper_index)
         if authors.size == 0:
             continue
         contribution = 1.0 / authors.size
         topic = int(paper_topics[paper_index])
-        clusters = event_clusters[
-            event_offsets[paper_index] : event_offsets[paper_index + 1]
-        ]
         for cluster_value in clusters:
             cluster = int(cluster_value)
             for author_value in authors:
@@ -348,6 +357,7 @@ def summarize_cluster_author_topics(
         topic_authors: Counter[int] = Counter()
         missing_weight = 0.0
         missing_authors = 0
+        primary_topics: dict[int, int] = {}
         for author, cluster_weight in author_weights[cluster].items():
             profile = author_profiles.get(author, {})
             excluded = excluded_weights[cluster].get(author, {})
@@ -367,9 +377,38 @@ def summarize_cluster_author_topics(
                 candidates,
                 key=lambda item: (-item[1], item[0]),
             )[0]
+            primary_topics[author] = primary_topic
             topic_weights[primary_topic] += cluster_weight
             topic_authors[primary_topic] += 1
 
+        collaboration_count = 0
+        eligible_collaboration_count = 0
+        within_diversities: list[float] = []
+        for paper_index in cluster_paper_indices[cluster]:
+            authors = event_authors[paper_index]
+            if authors.size < 2:
+                continue
+            collaboration_count += 1
+            covered_topics = [
+                primary_topics[int(author)]
+                for author in authors
+                if int(author) in primary_topics
+            ]
+            if len(covered_topics) < 2:
+                continue
+            eligible_collaboration_count += 1
+            within_diversities.append(
+                _rao_stirling_diversity(
+                    Counter(covered_topics),
+                    vector_lookup,
+                    topic_vectors,
+                )
+            )
+        within_diversity = (
+            float(np.mean(within_diversities))
+            if within_diversities
+            else float("nan")
+        )
         total_weight = float(sum(author_weights[cluster].values()))
         covered_weight = float(sum(topic_weights.values()))
         ordered = sorted(
@@ -399,6 +438,14 @@ def summarize_cluster_author_topics(
                     vector_lookup,
                     topic_vectors,
                 ),
+                "author_collaboration_paper_count": collaboration_count,
+                "author_within_collaboration_paper_count": (
+                    eligible_collaboration_count
+                ),
+                "author_within_collaboration_missing_paper_count": (
+                    collaboration_count - eligible_collaboration_count
+                ),
+                "author_within_collaboration_diversity": within_diversity,
                 "author_topic_distribution": distribution,
             }
         )
@@ -602,6 +649,10 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "author_primary_topic_weight",
         "author_primary_topic_missing_weight",
         "author_rao_stirling_diversity",
+        "author_collaboration_paper_count",
+        "author_within_collaboration_paper_count",
+        "author_within_collaboration_missing_paper_count",
+        "author_within_collaboration_diversity",
         "author_topic_distribution",
     ]
     temporary = path.with_suffix(".csv.tmp")
@@ -623,11 +674,27 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             output.setdefault("author_weight", 0.0)
             output.setdefault("author_primary_topic_weight", 0.0)
             output.setdefault("author_primary_topic_missing_weight", 0.0)
+            output.setdefault("author_collaboration_paper_count", 0)
+            output.setdefault("author_within_collaboration_paper_count", 0)
+            output.setdefault(
+                "author_within_collaboration_missing_paper_count", 0
+            )
             author_diversity = float(
                 output.get("author_rao_stirling_diversity", float("nan"))
             )
             output["author_rao_stirling_diversity"] = (
                 author_diversity if math.isfinite(author_diversity) else "nan"
+            )
+            within_diversity = float(
+                output.get(
+                    "author_within_collaboration_diversity",
+                    float("nan"),
+                )
+            )
+            output["author_within_collaboration_diversity"] = (
+                within_diversity
+                if math.isfinite(within_diversity)
+                else "nan"
             )
             output["author_topic_distribution"] = json.dumps(
                 output.get("author_topic_distribution", []),

@@ -229,6 +229,7 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 .scatter-frame { position: relative; min-width: 0; min-height: 24rem; }
 #link-scatter { display: block; width: 100%; height: 100%; min-height: 24rem; }
 .plot-grid line { stroke: #e4eae7; stroke-width: 1; }
+.comparison-line { stroke: #b16b3b; stroke-width: 1.5; stroke-dasharray: 5 4; }
 .plot-tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .plot-axis-title { fill: var(--ink); font-size: 11px; font-weight: 650; }
 .plot-empty { fill: var(--muted); font-size: 13px; text-anchor: middle; }
@@ -287,6 +288,19 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
   min-width: 100%;
   max-width: none;
   margin: 0;
+}
+.methodology {
+  margin-top: 1.2rem;
+  padding-top: .25rem;
+  border-top: 1px solid var(--line);
+}
+.methodology dl { margin: 0; }
+.methodology dt { margin-top: .8rem; font-size: .76rem; font-weight: 750; }
+.methodology dd {
+  margin: .2rem 0 0;
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.5;
 }
 .baseline-series { fill: none; stroke: #b16b3b; stroke-width: 2; }
 .baseline-point { fill: #fff; stroke: #b16b3b; stroke-width: 1.5; }

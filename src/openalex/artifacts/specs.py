@@ -22,6 +22,7 @@ COMMAND_INPUTS: dict[str, tuple[InputSpec, ...]] = {
     "new-links": (
         InputSpec("--events-dir"),
         InputSpec("--clusters-dir"),
+        InputSpec("--embeddings-dir"),
         InputSpec("--author-embeddings-dir"),
     ),
     "topics": (InputSpec("--embeddings-dir", "output/embeddings"),),

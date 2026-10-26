@@ -135,6 +135,18 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     assert not (site_dir / "dendrogram.js").exists()
     assert (site_dir / "clusters.html").is_file()
     assert (site_dir / "link-distances.html").is_file()
+    link_page = (site_dir / "link-distances.html").read_text(
+        encoding="utf-8"
+    )
+    assert link_page.index("First link (graph)") < link_page.index(
+        "First link (semantic)"
+    )
+    assert link_page.index("First link (semantic)") < link_page.index(
+        "All links (graph)"
+    )
+    assert link_page.index("All links (graph)") < link_page.index(
+        "All links (semantic)"
+    )
     assert not (site_dir / "app.js").exists()
     assert not (site_dir / "graph.html").exists()
     assert not (site_dir / "progress.html").exists()
@@ -175,23 +187,34 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "new_link_connected_count,new_link_disconnected_count,"
         "average_all_link_distance,all_link_connected_count,"
         "all_link_disconnected_count,all_link_existing_count,"
-        "all_link_observation_count,average_semantic_link_distance,"
+        "all_link_observation_count,average_first_semantic_link_distance,"
+        "first_semantic_link_observation_count,"
+        "first_semantic_link_missing_embedding_count,"
+        "first_semantic_link_distance_sample_count,"
+        "average_semantic_link_distance,"
         "semantic_link_observation_count,semantic_link_missing_embedding_count,"
         "semantic_link_distance_sample_count,new_link_distance_distribution,"
         "all_link_distance_distribution,new_link_baseline_distance_distribution,"
-        "all_link_baseline_distance_distribution,semantic_link_distance_distribution,"
+        "all_link_baseline_distance_distribution,"
+        "first_semantic_link_distance_distribution,"
+        "first_semantic_link_baseline_distance_distribution,"
+        "semantic_link_distance_distribution,"
         "semantic_link_baseline_distance_distribution,"
         "new_link_distance_by_year,all_link_distance_by_year,"
+        "first_semantic_link_distance_by_year,"
         "semantic_link_distance_by_year\n"
-        '0,beta,4,2.5,8,2,1.25,10,2,2,12,0.4,11,1,5,'
+        '0,beta,4,2.5,8,2,1.25,10,2,2,12,0.3,6,1,4,0.4,11,1,5,'
         '"[[1,8],[2,2]]","[[0,2],[2,8]]",'
         '"[[2,20],[3,5]]","[[1,4],[2,6]]",'
+        '"[[0.25,0.3,2],[0.3,0.35,2]]",'
+        '"[[0.2,0.25,3],[0.3,0.35,1]]",'
         '"[[0.35,0.4,3],[0.4,0.45,2]]",'
         '"[[0.2,0.25,3],[0.4,0.45,2]]",'
-        '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]","[[2020,0.4]]"\n'
-        '1,gamma,2,nan,0,3,3.0,4,3,1,7,nan,0,7,0,[],'
+        '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]",'
+        '"[[2020,0.3]]","[[2020,0.4]]"\n'
+        '1,gamma,2,nan,0,3,3.0,4,3,1,7,nan,0,3,0,nan,0,7,0,[],'
         '"[[0,1],[3,3]]",'
-        '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[]\n',
+        '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[],[],[],[]\n',
         encoding="utf-8",
     )
     (clusters_dir / "cluster_trends.csv").write_text(
@@ -222,6 +245,15 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     ]
     assert first["all_link_distance_by_year"] == [
         {"year": 2020, "distance": 1.25},
+    ]
+    assert first["average_first_semantic_link_distance"] == 0.3
+    assert first["first_semantic_link_observation_count"] == 6
+    assert first["first_semantic_link_distance_distribution"] == [
+        [0.25, 0.3, 2.0],
+        [0.3, 0.35, 2.0],
+    ]
+    assert first["first_semantic_link_distance_by_year"] == [
+        {"year": 2020, "distance": 0.3},
     ]
     assert first["average_semantic_link_distance"] == 0.4
     assert first["semantic_link_observation_count"] == 11
@@ -304,6 +336,17 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert "matchesType" in script
     assert "data-type" in script
     assert "observableRows()" in script
+    assert "Formula and methodology" in script
+    assert "methodologyPanel(state.measure)" in script
+    for definition in (
+        "First link",
+        "All-link observation",
+        "Leave-cluster-out author profile",
+        "Paper topic",
+        "Leave-cluster-out primary topic",
+        "Within-collaboration diversity (paper)",
+    ):
+        assert definition in script
 
 
 def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
@@ -320,16 +363,19 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
         "topic_distribution,author_count,author_primary_topic_count,"
         "author_primary_topic_missing_count,author_weight,"
         "author_primary_topic_weight,author_primary_topic_missing_weight,"
-        "author_rao_stirling_diversity,author_topic_distribution\n"
+        "author_rao_stirling_diversity,author_collaboration_paper_count,"
+        "author_within_collaboration_paper_count,"
+        "author_within_collaboration_missing_paper_count,"
+        "author_within_collaboration_diversity,author_topic_distribution\n"
         '0,beta,4,4,0,0,0.375,"[{""topic_id"":2,""label"":""Two"",'
         '""papers"":1,""share"":0.25},{""topic_id"":1,""label"":""One"",'
         '""papers"":2,""share"":0.5},{""topic_id"":0,""label"":""Zero"",'
-        '""papers"":1,""share"":0.25}]",3,3,0,4.0,4.0,0.0,0.42,'
+        '""papers"":1,""share"":0.25}]",3,3,0,4.0,4.0,0.0,0.42,3,2,1,0.25,'
         '"[{""topic_id"":2,""label"":""Two"",""authors"":1,""weight"":1.0,'
         '""share"":0.25},{""topic_id"":1,""label"":""One"",""authors"":2,'
         '""weight"":3.0,""share"":0.75}]"\n'
         '1,gamma,2,1,0,1,nan,"[{""topic_id"":3,""label"":""Three"",'
-        '""papers"":1,""share"":1.0}]",1,0,1,1.0,0.0,1.0,nan,[]\n',
+        '""papers"":1,""share"":1.0}]",1,0,1,1.0,0.0,1.0,nan,1,0,1,nan,[]\n',
         encoding="utf-8",
     )
     (clusters_dir / "cluster_trends.csv").write_text(
@@ -354,9 +400,16 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
     assert first["cluster_type"] == "shock"
     assert [item["topic_id"] for item in first["topic_distribution"]] == [1, 0, 2]
     assert first["author_rao_stirling_diversity"] == pytest.approx(0.42)
+    assert first["author_within_collaboration_diversity"] == pytest.approx(
+        0.25
+    )
+    assert first["author_collaboration_paper_count"] == 3
+    assert first["author_within_collaboration_paper_count"] == 2
+    assert first["author_within_collaboration_missing_paper_count"] == 1
     assert [item["topic_id"] for item in first["author_topic_distribution"]] == [1, 2]
     assert second["rao_stirling_diversity"] is None
     assert second["author_rao_stirling_diversity"] is None
+    assert second["author_within_collaboration_diversity"] is None
     card = next(item for item in payload["cluster_list"] if item["group"] == 0)
     assert card["topic_observation_count"] == 4
     assert card["rao_stirling_diversity"] == pytest.approx(0.375)
@@ -367,8 +420,11 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
     clusters_script = (site_dir / "clusters.js").read_text(encoding="utf-8")
     assert 'data-measure="diversity"' in html
     assert 'data-measure="author-diversity"' in html
+    assert 'data-measure="within-collaboration-diversity"' in html
     assert "rao_stirling_diversity" in script
     assert "author_rao_stirling_diversity" in script
+    assert "author_within_collaboration_diversity" in script
+    assert "comparison-line" in script
     assert "topicHistogram" in clusters_script
     assert "function topicTopWord(item)" in script
     assert "label.textContent = topicTopWord(item)" in script

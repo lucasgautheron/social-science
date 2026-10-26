@@ -698,6 +698,9 @@ def load_link_distance_summary(
         "all_link_disconnected_count",
         "all_link_existing_count",
         "all_link_observation_count",
+        "first_semantic_link_observation_count",
+        "first_semantic_link_missing_embedding_count",
+        "first_semantic_link_distance_sample_count",
         "semantic_link_observation_count",
         "semantic_link_missing_embedding_count",
         "semantic_link_distance_sample_count",
@@ -705,6 +708,7 @@ def load_link_distance_summary(
     distance_fields = (
         "average_new_link_distance",
         "average_all_link_distance",
+        "average_first_semantic_link_distance",
         "average_semantic_link_distance",
     )
     comparison_suffixes = (
@@ -739,12 +743,15 @@ def load_link_distance_summary(
         "all_link_distance_distribution",
         "new_link_baseline_distance_distribution",
         "all_link_baseline_distance_distribution",
+        "first_semantic_link_distance_distribution",
+        "first_semantic_link_baseline_distance_distribution",
         "semantic_link_distance_distribution",
         "semantic_link_baseline_distance_distribution",
     )
     yearly_distance_fields = (
         "new_link_distance_by_year",
         "all_link_distance_by_year",
+        "first_semantic_link_distance_by_year",
         "semantic_link_distance_by_year",
     )
     rows: list[dict[str, Any]] = []
@@ -784,7 +791,7 @@ def load_link_distance_summary(
                 row[field] = value if math.isfinite(value) else None
             for field in distribution_fields:
                 distribution = json.loads(source[field])
-                if field.startswith("semantic_link_"):
+                if "semantic_link_" in field:
                     row[field] = [
                         [float(left), float(right), float(count)]
                         for left, right, count in distribution
@@ -835,6 +842,9 @@ def load_cluster_topic_summary(
         "author_count",
         "author_primary_topic_count",
         "author_primary_topic_missing_count",
+        "author_collaboration_paper_count",
+        "author_within_collaboration_paper_count",
+        "author_within_collaboration_missing_paper_count",
     )
     author_float_fields = (
         "author_weight",
@@ -845,6 +855,7 @@ def load_cluster_topic_summary(
         *author_integer_fields,
         *author_float_fields,
         "author_rao_stirling_diversity",
+        "author_within_collaboration_diversity",
         "author_topic_distribution",
     }
     rows: list[dict[str, Any]] = []
@@ -903,6 +914,9 @@ def load_cluster_topic_summary(
                 author_diversity = float(
                     source["author_rao_stirling_diversity"]
                 )
+                within_collaboration_diversity = float(
+                    source["author_within_collaboration_diversity"]
+                )
                 row.update(
                     {
                         **{
@@ -916,6 +930,13 @@ def load_cluster_topic_summary(
                         "author_rao_stirling_diversity": (
                             author_diversity
                             if math.isfinite(author_diversity)
+                            else None
+                        ),
+                        "author_within_collaboration_diversity": (
+                            within_collaboration_diversity
+                            if math.isfinite(
+                                within_collaboration_diversity
+                            )
                             else None
                         ),
                         "author_topic_distribution": author_distribution,
@@ -1107,6 +1128,10 @@ def build_website(
                 "author_primary_topic_weight",
                 "author_primary_topic_missing_weight",
                 "author_rao_stirling_diversity",
+                "author_collaboration_paper_count",
+                "author_within_collaboration_paper_count",
+                "author_within_collaboration_missing_paper_count",
+                "author_within_collaboration_diversity",
                 "author_topic_distribution",
             ):
                 if field in topic_row:

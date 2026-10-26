@@ -20,6 +20,7 @@ import os
 import shutil
 import sqlite3
 import time
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ from numba import njit
 from scipy import sparse
 
 from openalex.analysis.author_aggregation import file_sha256
+from openalex.analysis.embeddings import EmbeddingStore
 from openalex.analysis.event_papers import load_event_paper_clusters
 from openalex.artifacts.manifest import complete_manifest
 
@@ -72,72 +74,280 @@ class AuthorEmbeddingStore:
     database_path: Path
     dimension: int
     author_ids: np.ndarray
+    paper_counts: np.ndarray
+    embedding_manifest_sha256: str
     manifest_sha256: str
+
+class ClusterExcludedEmbeddingStore:
+    """Build author vectors after removing every paper in one event cluster."""
+
+    def __init__(
+        self,
+        base: AuthorEmbeddingStore,
+        articles: EmbeddingStore,
+        source_database: Path,
+        event_ids: np.ndarray,
+        event_offsets: np.ndarray,
+        event_clusters: np.ndarray,
+        link_author_ids: np.ndarray,
+        cluster_count: int,
+    ) -> None:
+        self.base = base
+        self.articles = articles
+        self.event_ids = np.asarray(event_ids, dtype=np.int64)
+        self.event_offsets = np.asarray(event_offsets, dtype=np.int64)
+        self.event_clusters = np.asarray(event_clusters, dtype=np.int32)
+        self.link_author_ids = np.asarray(link_author_ids, dtype=np.int64)
+        self.cluster_count = cluster_count
+        self.event_authors = _load_event_authors(
+            source_database,
+            self.event_ids,
+        )
+        embedded_ids = np.fromiter(
+            articles.iter_article_ids(),
+            dtype=np.int64,
+        )
+        embedded_ids.sort()
+        positions = np.searchsorted(embedded_ids, self.event_ids)
+        covered = positions < embedded_ids.size
+        covered_indices = np.flatnonzero(covered)
+        covered[covered_indices] &= (
+            embedded_ids[positions[covered_indices]]
+            == self.event_ids[covered_indices]
+        )
+
+        author_papers: dict[int, list[int]] = defaultdict(list)
+        excluded_counts: list[dict[int, int]] = [
+            defaultdict(int) for _ in range(cluster_count)
+        ]
+        for paper_index in np.flatnonzero(covered):
+            authors = self.event_authors[int(paper_index)]
+            if authors.size == 0:
+                continue
+            clusters = self.event_clusters[
+                self.event_offsets[paper_index] :
+                self.event_offsets[paper_index + 1]
+            ]
+            for author_value in authors:
+                author = int(author_value)
+                author_papers[author].append(int(paper_index))
+                for cluster_value in clusters:
+                    excluded_counts[int(cluster_value)][author] += 1
+        self.author_papers = {
+            author: np.asarray(papers, dtype=np.int64)
+            for author, papers in author_papers.items()
+        }
+        self.invalid_link_indices = self._invalid_indices(excluded_counts)
+        self._global_profiles: dict[int, tuple[np.ndarray, float]] = {}
+        self._unit_vectors: dict[tuple[int, int], np.ndarray] = {}
+
+    def _invalid_indices(
+        self,
+        excluded_counts: Sequence[dict[int, int]],
+    ) -> list[np.ndarray]:
+        result: list[np.ndarray] = []
+        for by_author in excluded_counts:
+            invalid: list[int] = []
+            for author, excluded_count in by_author.items():
+                profile_position = int(
+                    np.searchsorted(self.base.author_ids, author)
+                )
+                if (
+                    profile_position >= self.base.author_ids.size
+                    or int(self.base.author_ids[profile_position]) != author
+                    or excluded_count
+                    < int(self.base.paper_counts[profile_position])
+                ):
+                    continue
+                link_position = int(
+                    np.searchsorted(self.link_author_ids, author)
+                )
+                if (
+                    link_position < self.link_author_ids.size
+                    and int(self.link_author_ids[link_position]) == author
+                ):
+                    invalid.append(link_position)
+            result.append(np.asarray(invalid, dtype=np.int32))
+        return result
+
+    def covered_pairs(
+        self,
+        pair_keys: np.ndarray,
+        pair_clusters: np.ndarray,
+    ) -> np.ndarray:
+        """Return coverage after removing the cluster named by each record."""
+        if pair_keys.shape != pair_clusters.shape:
+            raise ValueError("Semantic pair keys and clusters do not align")
+        left, right = _decode_pairs(pair_keys)
+        left_ids = self.link_author_ids[left]
+        right_ids = self.link_author_ids[right]
+        covered = _authors_present(self.base.author_ids, left_ids)
+        covered &= _authors_present(self.base.author_ids, right_ids)
+        for cluster_value in np.unique(pair_clusters):
+            cluster = int(cluster_value)
+            if cluster < 0 or cluster >= self.cluster_count:
+                raise ValueError(f"Invalid semantic cluster id {cluster}")
+            members = pair_clusters == cluster
+            invalid = self.invalid_link_indices[cluster]
+            if invalid.size:
+                covered[members] &= ~_sorted_contains(
+                    invalid, left[members]
+                )
+                covered[members] &= ~_sorted_contains(
+                    invalid, right[members]
+                )
+        return covered
+
+    def covered_pairs_for_cluster(
+        self,
+        pair_keys: np.ndarray,
+        cluster: int,
+    ) -> np.ndarray:
+        return self.covered_pairs(
+            pair_keys,
+            np.full(pair_keys.size, cluster, dtype=np.int32),
+        )
 
     def distances(
         self,
         pair_keys: np.ndarray,
-        link_author_ids: np.ndarray,
+        pair_clusters: np.ndarray,
     ) -> np.ndarray:
-        """Return cosine distances for pair occurrences, preserving duplicates."""
+        """Return cosine distances using cluster-excluded author profiles."""
+        if pair_keys.shape != pair_clusters.shape:
+            raise ValueError("Semantic pair keys and clusters do not align")
         if pair_keys.size == 0:
             return np.empty(0, dtype=np.float32)
-        result = np.empty(pair_keys.size, dtype=np.float32)
-        with _connect_readonly(self.database_path) as connection:
-            for start in range(0, pair_keys.size, 10_000):
-                stop = min(start + 10_000, pair_keys.size)
-                left, right = _decode_pairs(pair_keys[start:stop])
-                left_ids = link_author_ids[left]
-                right_ids = link_author_ids[right]
-                requested = np.unique(np.concatenate((left_ids, right_ids)))
-                vectors: dict[int, np.ndarray] = {}
-                for chunk in _chunks(requested, _SQLITE_IN_LIMIT):
-                    placeholders = ",".join("?" for _ in chunk)
-                    rows = connection.execute(
-                        f"""
-                        SELECT author_id, embedding
-                        FROM author_embeddings
-                        WHERE author_id IN ({placeholders})
-                        """,
-                        [int(value) for value in chunk],
-                    )
-                    for author_id, payload in rows:
-                        vector = np.frombuffer(payload, dtype="<f4")
-                        if vector.shape != (self.dimension,):
-                            raise ValueError(
-                                f"Author {author_id} embedding has dimension "
-                                f"{vector.size}, expected {self.dimension}"
-                            )
-                        vectors[int(author_id)] = vector
-                if len(vectors) != requested.size:
-                    missing = next(
-                        int(author_id)
-                        for author_id in requested
-                        if int(author_id) not in vectors
-                    )
+        left, right = _decode_pairs(pair_keys)
+        requested = {
+            (int(cluster), int(self.link_author_ids[index]))
+            for cluster, index in zip(
+                np.concatenate((pair_clusters, pair_clusters)),
+                np.concatenate((left, right)),
+                strict=True,
+            )
+        }
+        self._prepare_vectors(requested)
+        first = np.vstack(
+            [
+                self._unit_vectors[
+                    (int(cluster), int(self.link_author_ids[index]))
+                ]
+                for cluster, index in zip(pair_clusters, left, strict=True)
+            ]
+        )
+        second = np.vstack(
+            [
+                self._unit_vectors[
+                    (int(cluster), int(self.link_author_ids[index]))
+                ]
+                for cluster, index in zip(pair_clusters, right, strict=True)
+            ]
+        )
+        similarity = np.einsum("ij,ij->i", first, second)
+        return np.asarray(np.clip(1.0 - similarity, 0.0, 2.0), dtype=np.float32)
+
+    def _prepare_vectors(
+        self,
+        requested: set[tuple[int, int]],
+    ) -> None:
+        missing = sorted(requested - self._unit_vectors.keys())
+        if not missing:
+            return
+        self._load_global_profiles(
+            np.asarray(
+                sorted({author for _, author in missing}),
+                dtype=np.int64,
+            )
+        )
+        papers_by_key: dict[tuple[int, int], list[int]] = {}
+        needed_papers: set[int] = set()
+        for cluster, author in missing:
+            paper_positions = [
+                int(paper_index)
+                for paper_index in self.author_papers.get(
+                    author, np.empty(0, dtype=np.int64)
+                )
+                if cluster
+                in self.event_clusters[
+                    self.event_offsets[paper_index] :
+                    self.event_offsets[paper_index + 1]
+                ]
+            ]
+            papers_by_key[(cluster, author)] = paper_positions
+            needed_papers.update(paper_positions)
+        article_vectors = self.articles.get_embeddings_batch(
+            self.event_ids[
+                np.asarray(sorted(needed_papers), dtype=np.int64)
+            ]
+        )
+        for key in missing:
+            cluster, author = key
+            global_vector, total_weight = self._global_profiles[author]
+            remaining = (
+                np.asarray(global_vector, dtype=np.float64) * total_weight
+            )
+            for paper_index in papers_by_key[key]:
+                article_id = int(self.event_ids[paper_index])
+                vector = article_vectors.get(article_id)
+                if vector is None:
                     raise RuntimeError(
-                        "Sampled semantic pair references missing author "
-                        f"embedding {missing}"
+                        f"Missing indexed article embedding {article_id}"
                     )
-                first = np.vstack(
-                    [vectors[int(author_id)] for author_id in left_ids]
+                author_count = self.event_authors[paper_index].size
+                remaining -= (
+                    np.asarray(vector, dtype=np.float64) / author_count
                 )
-                second = np.vstack(
-                    [vectors[int(author_id)] for author_id in right_ids]
+            norm = float(np.linalg.norm(remaining))
+            if norm <= 1e-12:
+                raise ValueError(
+                    "Cluster-excluded author embedding is zero for "
+                    f"author {author} in cluster {cluster}"
                 )
-                first_norm = np.linalg.norm(first, axis=1)
-                second_norm = np.linalg.norm(second, axis=1)
-                if np.any(first_norm == 0) or np.any(second_norm == 0):
-                    raise ValueError(
-                        "Author embeddings used for cosine distance must be nonzero"
+            self._unit_vectors[key] = np.asarray(
+                remaining / norm,
+                dtype=np.float32,
+            )
+
+    def _load_global_profiles(self, author_ids: np.ndarray) -> None:
+        requested = [
+            int(author)
+            for author in author_ids
+            if int(author) not in self._global_profiles
+        ]
+        if not requested:
+            return
+        with _connect_readonly(self.base.database_path) as connection:
+            for chunk in _chunks(requested, _SQLITE_IN_LIMIT):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"""
+                    SELECT author_id, embedding, total_weight
+                    FROM author_embeddings
+                    WHERE author_id IN ({placeholders})
+                    """,
+                    [int(author) for author in chunk],
+                )
+                for author, payload, weight in rows:
+                    vector = np.frombuffer(payload, dtype="<f4")
+                    if vector.shape != (self.base.dimension,):
+                        raise ValueError(
+                            f"Author {author} embedding has dimension "
+                            f"{vector.size}, expected {self.base.dimension}"
+                        )
+                    self._global_profiles[int(author)] = (
+                        vector.copy(),
+                        float(weight),
                     )
-                similarity = np.einsum("ij,ij->i", first, second) / (
-                    first_norm * second_norm
-                )
-                result[start:stop] = np.clip(
-                    1.0 - similarity, 0.0, 2.0
-                )
-        return result
+        missing = [
+            author
+            for author in requested
+            if author not in self._global_profiles
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Missing sampled author embedding {missing[0]}"
+            )
 
 
 def build_new_links(
@@ -146,6 +356,7 @@ def build_new_links(
     clusters_dir: str | Path,
     output_dir: str | Path,
     *,
+    embeddings_dir: str | Path,
     author_embeddings_dir: str | Path,
     to_year: int | None = None,
     max_authors: int = DEFAULT_MAX_AUTHORS,
@@ -183,9 +394,9 @@ def build_new_links(
     manifest_path = output / "manifest.json"
 
     existing = _load_manifest(manifest_path) if resume and manifest_path.exists() else None
-    if existing is not None and int(existing.get("artifact_version", 0)) != 9:
+    if existing is not None and int(existing.get("artifact_version", 0)) != 10:
         raise ValueError(
-            "Existing output predates semantic null samples. "
+            "Existing output predates cluster-excluded semantic distances. "
             "Use a new --output-dir."
         )
     if existing is not None and existing.get("distance_mode") != "exact":
@@ -212,8 +423,16 @@ def build_new_links(
         author_embeddings_dir,
         database,
     )
+    article_embeddings = _load_article_embedding_store(
+        embeddings_dir,
+        database,
+        author_embeddings,
+    )
     config = {
         "author_embeddings_manifest_sha256": author_embeddings.manifest_sha256,
+        "embeddings_manifest_sha256": _sha256(
+            article_embeddings.manifest_path
+        ),
         "clusters_manifest_sha256": _sha256(clusters / "manifest.json"),
         "events_manifest_sha256": _sha256(events / "manifest.json"),
         "distance_mode": "exact",
@@ -273,6 +492,16 @@ def build_new_links(
         _atomic_json(manifest_path, manifest)
     elif int(manifest["cluster_level"]) != cluster_level:
         raise ValueError("Cluster level changed since this output was created")
+    semantic_embeddings = ClusterExcludedEmbeddingStore(
+        author_embeddings,
+        article_embeddings,
+        database,
+        event_ids,
+        event_offsets,
+        event_clusters,
+        author_ids,
+        int(cluster_labels.size),
+    )
 
     completed = {int(year) for year in manifest.get("completed_years", [])}
     _check_completed_prefix(years, completed)
@@ -348,7 +577,7 @@ def build_new_links(
             semantic_observation_population,
             semantic_excluded_population,
             seen_keys,
-            author_embeddings,
+            semantic_embeddings,
         )
         _save_year(_year_path(output, year), arrays)
         _save_cluster_year(
@@ -430,7 +659,12 @@ def _new_link_inputs(manifest: dict) -> list[dict[str, str]]:
             "role": role,
             "manifest_sha256": str(manifest[f"{role}_manifest_sha256"]),
         }
-        for role in ("events", "clusters", "author_embeddings")
+        for role in (
+            "events",
+            "clusters",
+            "embeddings",
+            "author_embeddings",
+        )
         if manifest.get(f"{role}_manifest_sha256")
     ]
 
@@ -462,6 +696,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", default="articles.db", help="Read-only source corpus.")
     parser.add_argument("--events-dir", required=True)
     parser.add_argument("--clusters-dir", required=True)
+    parser.add_argument(
+        "--embeddings-dir",
+        required=True,
+        help="Completed article-embeddings artifact used for cluster exclusion.",
+    )
     parser.add_argument(
         "--author-embeddings-dir",
         required=True,
@@ -516,6 +755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.events_dir,
         args.clusters_dir,
         args.output_dir,
+        embeddings_dir=args.embeddings_dir,
         author_embeddings_dir=args.author_embeddings_dir,
         to_year=args.to_year,
         max_authors=args.max_authors,
@@ -615,13 +855,21 @@ def _load_author_embedding_store(
             raise ValueError("Author-embedding database dimension does not match")
         if metadata.get("embedding_encoding") != AUTHOR_EMBEDDING_ENCODING:
             raise ValueError("Author-embedding database encoding does not match")
-        author_ids = np.fromiter(
-            (
-                int(row[0])
-                for row in connection.execute(
-                    "SELECT author_id FROM author_embeddings ORDER BY author_id"
-                )
-            ),
+        rows = list(
+            connection.execute(
+                """
+                SELECT author_id, paper_count
+                FROM author_embeddings
+                ORDER BY author_id
+                """
+            )
+        )
+        author_ids = np.asarray(
+            [int(row[0]) for row in rows],
+            dtype=np.int64,
+        )
+        paper_counts = np.asarray(
+            [int(row[1]) for row in rows],
             dtype=np.int64,
         )
     if author_ids.size and np.any(author_ids[1:] <= author_ids[:-1]):
@@ -631,8 +879,48 @@ def _load_author_embedding_store(
         database_path=database_path,
         dimension=dimension,
         author_ids=author_ids,
+        paper_counts=paper_counts,
+        embedding_manifest_sha256=str(
+            manifest.get("embedding_manifest_sha256") or ""
+        ),
         manifest_sha256=_sha256(manifest_path),
     )
+
+
+def _load_article_embedding_store(
+    root: str | Path,
+    source_database: Path,
+    author_embeddings: AuthorEmbeddingStore,
+) -> EmbeddingStore:
+    store = EmbeddingStore(root)
+    if not store.manifest:
+        raise ValueError("Article embeddings require a manifest-backed artifact")
+    if not bool(store.manifest.get("complete")):
+        raise ValueError("The article-embedding artifact is incomplete")
+    if store.dimension != author_embeddings.dimension:
+        raise ValueError(
+            "Article- and author-embedding dimensions do not match"
+        )
+    source = source_database.expanduser().resolve()
+    expected_source = store.manifest.get("source_database")
+    if expected_source is not None and (
+        Path(str(expected_source)).expanduser().resolve() != source
+    ):
+        raise ValueError("Article embeddings were built from a different corpus")
+    expected_size = store.manifest.get("source_size")
+    if expected_size is not None and int(expected_size) != source.stat().st_size:
+        raise ValueError(
+            "Article embeddings were built from a different corpus size"
+        )
+    expected_digest = store.manifest.get("source_sha256")
+    if expected_digest is not None and str(expected_digest) != file_sha256(source):
+        raise ValueError("Article embeddings were built from a different corpus")
+    digest = _sha256(store.manifest_path)
+    if author_embeddings.embedding_manifest_sha256 != digest:
+        raise ValueError(
+            "Author embeddings were built from a different article-embedding artifact"
+        )
+    return store
 
 
 @contextmanager
@@ -827,6 +1115,39 @@ def _load_event_paper_clusters(
     return load_event_paper_clusters(events_dir, clusters_dir)
 
 
+def _load_event_authors(
+    database: Path,
+    event_ids: np.ndarray,
+) -> list[np.ndarray]:
+    authors: list[list[int]] = [[] for _ in event_ids]
+    with _connect_readonly(database) as connection:
+        for chunk in _chunks(event_ids, _SQLITE_IN_LIMIT):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""
+                SELECT article_id, author_id
+                FROM articles_authors
+                WHERE article_id IN ({placeholders})
+                ORDER BY article_id, author_id
+                """,
+                [int(article_id) for article_id in chunk],
+            )
+            for article_id, author_id in rows:
+                position = int(np.searchsorted(event_ids, int(article_id)))
+                if (
+                    position >= event_ids.size
+                    or int(event_ids[position]) != int(article_id)
+                ):
+                    raise RuntimeError(
+                        f"Unexpected event article id {article_id}"
+                    )
+                authors[position].append(int(author_id))
+    return [
+        np.asarray(list(dict.fromkeys(values)), dtype=np.int64)
+        for values in authors
+    ]
+
+
 def _require_event_article_ids(events_dir: Path) -> None:
     manifest = _read_json(events_dir / "manifest.json")
     incidence_dir = events_dir / manifest["incidence_dir"]
@@ -865,7 +1186,7 @@ def _process_year(
     semantic_observation_population: np.ndarray,
     semantic_excluded_population: np.ndarray,
     seen_keys: np.ndarray,
-    author_embeddings: AuthorEmbeddingStore,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
 ) -> tuple[
     dict[str, np.ndarray],
     dict[str, int | float],
@@ -896,18 +1217,19 @@ def _process_year(
     pair_occurrences = _make_pair_keys(columns, counts)
     (
         semantic_reference_keys,
+        semantic_reference_clusters,
         semantic_reference_population,
     ) = _sample_semantic_reference(
         pair_occurrences,
-        author_ids,
-        author_embeddings.author_ids,
+        semantic_embeddings,
+        cluster_count,
         baseline_sample,
         sampling_seed,
         year,
     )
-    semantic_reference_distances = author_embeddings.distances(
+    semantic_reference_distances = semantic_embeddings.distances(
         semantic_reference_keys,
-        author_ids,
+        semantic_reference_clusters,
     )
     pair_keys, paper_counts = np.unique(pair_occurrences, return_counts=True)
     del pair_occurrences
@@ -941,6 +1263,41 @@ def _process_year(
 
     cluster_id = _attribute_clusters(
         new_keys, new_paper_counts, event_pair_keys, event_pair_clusters
+    )
+    (
+        first_semantic_observations,
+        sampled_first_semantic_keys,
+        sampled_first_semantic_clusters,
+        first_semantic_sampling_weight,
+    ) = _sample_first_semantic_observations(
+        new_keys,
+        cluster_id,
+        semantic_embeddings,
+        cluster_count,
+        cluster_sample,
+        sampling_seed,
+        year,
+    )
+    (
+        first_semantic_reference_keys,
+        first_semantic_reference_clusters,
+        first_semantic_reference_population,
+    ) = _sample_first_semantic_reference(
+        new_keys,
+        cluster_id,
+        semantic_embeddings,
+        cluster_count,
+        baseline_sample,
+        sampling_seed,
+        year,
+    )
+    first_semantic_distances = semantic_embeddings.distances(
+        sampled_first_semantic_keys,
+        sampled_first_semantic_clusters,
+    )
+    first_semantic_reference_distances = semantic_embeddings.distances(
+        first_semantic_reference_keys,
+        first_semantic_reference_clusters,
     )
     all_left, all_right = _decode_pairs(new_keys)
     new_connected = _connected_pairs(parent, all_left, all_right)
@@ -985,8 +1342,7 @@ def _process_year(
     ) = _sample_semantic_observations(
         event_pair_keys,
         event_pair_clusters,
-        author_ids,
-        author_embeddings.author_ids,
+        semantic_embeddings,
         cluster_count,
         cluster_sample,
         sampling_seed,
@@ -996,9 +1352,9 @@ def _process_year(
         semantic_observation_population,
         semantic_excluded_population,
     )
-    semantic_distances = author_embeddings.distances(
+    semantic_distances = semantic_embeddings.distances(
         sampled_semantic_keys,
-        author_ids,
+        sampled_semantic_clusters,
     )
     semantic_reservoirs, semantic_reservoir_years = (
         _finish_semantic_reservoir(
@@ -1016,10 +1372,32 @@ def _process_year(
     semantic_observations["semantic_reference_distance"] = (
         semantic_reference_distances
     )
-    semantic_observations["semantic_reference_population"] = np.asarray(
-        [semantic_reference_population], dtype=np.int64
+    semantic_observations["semantic_reference_cluster_id"] = (
+        semantic_reference_clusters
+    )
+    semantic_observations["semantic_reference_population"] = (
+        semantic_reference_population
     )
     cluster_observations.update(semantic_observations)
+    first_semantic_observations.update(
+        {
+            "first_semantic_distance": first_semantic_distances,
+            "first_semantic_cluster_id": sampled_first_semantic_clusters,
+            "first_semantic_sampling_weight": (
+                first_semantic_sampling_weight
+            ),
+            "first_semantic_reference_distance": (
+                first_semantic_reference_distances
+            ),
+            "first_semantic_reference_cluster_id": (
+                first_semantic_reference_clusters
+            ),
+            "first_semantic_reference_population": (
+                first_semantic_reference_population
+            ),
+        }
+    )
+    cluster_observations.update(first_semantic_observations)
     (
         reference_keys,
         reference_clusters,
@@ -1513,52 +1891,198 @@ def _embedding_covered_pairs(
     left, right = _decode_pairs(pair_keys)
     left_ids = link_author_ids[left]
     right_ids = link_author_ids[right]
-    left_positions = np.searchsorted(embedding_author_ids, left_ids)
-    right_positions = np.searchsorted(embedding_author_ids, right_ids)
-    left_present = left_positions < embedding_author_ids.size
-    right_present = right_positions < embedding_author_ids.size
-    left_present[left_present] &= (
-        embedding_author_ids[left_positions[left_present]]
-        == left_ids[left_present]
+    return _authors_present(
+        embedding_author_ids, left_ids
+    ) & _authors_present(embedding_author_ids, right_ids)
+
+
+def _authors_present(
+    sorted_author_ids: np.ndarray,
+    requested_author_ids: np.ndarray,
+) -> np.ndarray:
+    positions = np.searchsorted(sorted_author_ids, requested_author_ids)
+    present = positions < sorted_author_ids.size
+    present_indices = np.flatnonzero(present)
+    present[present_indices] &= (
+        sorted_author_ids[positions[present_indices]]
+        == requested_author_ids[present_indices]
     )
-    right_present[right_present] &= (
-        embedding_author_ids[right_positions[right_present]]
-        == right_ids[right_present]
+    return present
+
+
+def _sorted_contains(
+    sorted_values: np.ndarray,
+    requested_values: np.ndarray,
+) -> np.ndarray:
+    positions = np.searchsorted(sorted_values, requested_values)
+    present = positions < sorted_values.size
+    present_indices = np.flatnonzero(present)
+    present[present_indices] &= (
+        sorted_values[positions[present_indices]]
+        == requested_values[present_indices]
     )
-    return left_present & right_present
+    return present
 
 
 def _sample_semantic_reference(
     pair_occurrences: np.ndarray,
-    link_author_ids: np.ndarray,
-    embedding_author_ids: np.ndarray,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
+    cluster_count: int,
     sample_size: int,
     sampling_seed: int,
     year: int,
-) -> tuple[np.ndarray, int]:
-    """Sample embedding-covered pair occurrences from all analyzed papers."""
-    eligible = np.flatnonzero(
-        _embedding_covered_pairs(
-            pair_occurrences,
-            link_author_ids,
-            embedding_author_ids,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample leave-cluster-out covered occurrences for each cluster null."""
+    sampled_keys: list[np.ndarray] = []
+    sampled_clusters: list[np.ndarray] = []
+    populations = np.zeros(cluster_count, dtype=np.int64)
+    for cluster in range(cluster_count):
+        eligible = np.flatnonzero(
+            semantic_embeddings.covered_pairs_for_cluster(
+                pair_occurrences,
+                cluster,
+            )
         )
+        population = int(eligible.size)
+        populations[cluster] = population
+        retained = _uniform_sample(
+            eligible,
+            min(sample_size, population),
+            [sampling_seed, int(year), 5, cluster],
+        )
+        sampled_keys.append(pair_occurrences[retained])
+        sampled_clusters.append(
+            np.full(retained.size, cluster, dtype=np.int32)
+        )
+    return (
+        np.concatenate(sampled_keys)
+        if sampled_keys
+        else np.empty(0, dtype=np.uint64),
+        np.concatenate(sampled_clusters)
+        if sampled_clusters
+        else np.empty(0, dtype=np.int32),
+        populations,
     )
-    population = int(eligible.size)
-    retained_size = min(sample_size, population)
-    retained = _uniform_sample(
-        eligible,
-        retained_size,
-        [sampling_seed, int(year), 5],
+
+
+def _sample_first_semantic_observations(
+    new_keys: np.ndarray,
+    attributed_clusters: np.ndarray,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
+    cluster_count: int,
+    sample_size: int,
+    sampling_seed: int,
+    year: int,
+) -> tuple[
+    dict[str, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Sample unique first links with leave-cluster-out author profiles."""
+    attributed = attributed_clusters >= 0
+    candidate_keys = new_keys[attributed]
+    candidate_clusters = attributed_clusters[attributed]
+    covered = semantic_embeddings.covered_pairs(
+        candidate_keys,
+        candidate_clusters,
     )
-    return pair_occurrences[retained], population
+    population = np.bincount(
+        candidate_clusters[covered],
+        minlength=cluster_count,
+    ).astype(np.int64)
+    excluded = np.bincount(
+        candidate_clusters[~covered],
+        minlength=cluster_count,
+    ).astype(np.int64)
+    sampled_indices: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+    for cluster in range(cluster_count):
+        candidates = np.flatnonzero(
+            covered & (candidate_clusters == cluster)
+        )
+        retained = _uniform_sample(
+            candidates,
+            min(sample_size, candidates.size),
+            [sampling_seed, int(year), 6, cluster],
+        )
+        sampled_indices.append(retained)
+        inclusion_probability = (
+            retained.size / candidates.size if candidates.size else 0.0
+        )
+        weights.append(
+            np.full(
+                retained.size,
+                1.0 / inclusion_probability
+                if inclusion_probability
+                else 0.0,
+                dtype=np.float64,
+            )
+        )
+    selected = (
+        np.concatenate(sampled_indices)
+        if sampled_indices
+        else np.empty(0, dtype=np.int64)
+    )
+    return (
+        {
+            "first_semantic_pair_observations": population,
+            "first_semantic_missing_embedding_observations": excluded,
+        },
+        candidate_keys[selected],
+        candidate_clusters[selected],
+        np.concatenate(weights)
+        if weights
+        else np.empty(0, dtype=np.float64),
+    )
+
+
+def _sample_first_semantic_reference(
+    new_keys: np.ndarray,
+    attributed_clusters: np.ndarray,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
+    cluster_count: int,
+    sample_size: int,
+    sampling_seed: int,
+    year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample first links outside clusters for each cluster-specific null."""
+    candidates = new_keys[attributed_clusters < 0]
+    sampled_keys: list[np.ndarray] = []
+    sampled_clusters: list[np.ndarray] = []
+    populations = np.zeros(cluster_count, dtype=np.int64)
+    for cluster in range(cluster_count):
+        eligible = np.flatnonzero(
+            semantic_embeddings.covered_pairs_for_cluster(
+                candidates,
+                cluster,
+            )
+        )
+        populations[cluster] = eligible.size
+        retained = _uniform_sample(
+            eligible,
+            min(sample_size, eligible.size),
+            [sampling_seed, int(year), 7, cluster],
+        )
+        sampled_keys.append(candidates[retained])
+        sampled_clusters.append(
+            np.full(retained.size, cluster, dtype=np.int32)
+        )
+    return (
+        np.concatenate(sampled_keys)
+        if sampled_keys
+        else np.empty(0, dtype=np.uint64),
+        np.concatenate(sampled_clusters)
+        if sampled_clusters
+        else np.empty(0, dtype=np.int32),
+        populations,
+    )
 
 
 def _sample_semantic_observations(
     event_keys: np.ndarray,
     event_clusters: np.ndarray,
-    link_author_ids: np.ndarray,
-    embedding_author_ids: np.ndarray,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
     cluster_count: int,
     cluster_sample: int,
     sampling_seed: int,
@@ -1581,10 +2105,9 @@ def _sample_semantic_observations(
     ``event_keys`` deliberately retains duplicate pair occurrences. A pair
     observed on f qualifying papers therefore has f equal-probability entries.
     """
-    eligible = _embedding_covered_pairs(
+    eligible = semantic_embeddings.covered_pairs(
         event_keys,
-        link_author_ids,
-        embedding_author_ids,
+        event_clusters,
     )
     current_population = np.bincount(
         event_clusters[eligible], minlength=cluster_count
@@ -2350,7 +2873,7 @@ def _fresh_manifest(
 ) -> dict:
     return {
         **config,
-        "artifact_version": 9,
+        "artifact_version": 10,
         "author_count": int(author_ids.size),
         "cluster_level": None,
         "cluster_metadata": "cluster_metadata.npz",
@@ -2377,12 +2900,16 @@ def _fresh_manifest(
             "year-stratified simple random samples without replacement for no-cluster "
             "links, each attributed cluster, and all-paper-link references; one global "
             "year-labelled reservoir per cluster for all connected paper-pair observations; "
-            "one independent global reservoir per cluster for embedding-covered paper-pair "
-            "occurrences, retaining repeated pairs as repeated observations; one uniform "
-            "embedding-covered paper-pair-occurrence null sample per year from all papers"
+            "independent yearly simple random samples of leave-cluster-out covered first "
+            "links per cluster and covered first-link references outside clusters; "
+            "one independent global reservoir per cluster for leave-cluster-out "
+            "embedding-covered paper-pair occurrences, retaining repeated pairs as repeated "
+            "observations; one uniform leave-cluster-out embedding-covered "
+            "paper-pair-occurrence null sample per cluster and year from all papers"
         ),
         "semantic_distance_definition": (
-            "cosine distance between fractional-authorship author embeddings"
+            "cosine distance between fractional-authorship author embeddings "
+            "after removing all embedding-covered papers in the evaluated cluster"
         ),
         "semantic_distance_dtype": "float32",
         "sampling_stats": {},
