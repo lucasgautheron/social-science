@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -171,3 +172,23 @@ def test_publish_website_uses_existing_site_directory(tmp_path):
     assert command[0] == "bash"
     assert command[-2:] == [str(site), "origin"]
     assert run.call_args.kwargs["check"] is True
+
+
+def test_download_replaces_existing_site_atomically(tmp_path):
+    output = tmp_path / "output"
+    existing = output / "website"
+    existing.mkdir(parents=True)
+    (existing / "stale.html").write_text("stale", encoding="utf-8")
+    args = _args("--output-dir", str(output))
+
+    def download(values):
+        destination = Path(values[values.index("--output-dir") + 1]) / "website"
+        destination.mkdir(parents=True)
+        (destination / "index.html").write_text("fresh", encoding="utf-8")
+
+    with mock.patch.object(website.runner, "main", side_effect=download):
+        result = website._download_website(args, "run-1")
+
+    assert result == existing
+    assert (result / "index.html").read_text(encoding="utf-8") == "fresh"
+    assert not (result / "stale.html").exists()

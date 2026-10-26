@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -222,28 +224,38 @@ def _download_website(
     args: argparse.Namespace,
     run_id: str,
 ) -> Path:
-    values = [
-        "download",
-        "--worker",
-        "cpu",
-        "--run-id",
-        run_id,
-        "--state-path",
-        args.state_path,
-        "--last-run-path",
-        args.last_run_path,
-        "--output-dir",
-        args.output_dir,
-        "--yes",
-    ]
-    if args.profile:
-        values.extend(("--profile", args.profile))
-    if args.region:
-        values.extend(("--region", args.region))
-    runner.main(values)
-    website = Path(args.output_dir) / "website"
-    if not (website / "index.html").is_file():
-        raise SystemExit(f"Downloaded website is incomplete: {website}")
+    destination = Path(args.output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    website = destination / "website"
+    with tempfile.TemporaryDirectory(
+        prefix=".website-download-",
+        dir=destination,
+    ) as temporary:
+        values = [
+            "download",
+            "--worker",
+            "cpu",
+            "--run-id",
+            run_id,
+            "--state-path",
+            args.state_path,
+            "--last-run-path",
+            args.last_run_path,
+            "--output-dir",
+            temporary,
+            "--yes",
+        ]
+        if args.profile:
+            values.extend(("--profile", args.profile))
+        if args.region:
+            values.extend(("--region", args.region))
+        runner.main(values)
+        downloaded = Path(temporary) / "website"
+        if not (downloaded / "index.html").is_file():
+            raise SystemExit(f"Downloaded website is incomplete: {downloaded}")
+        if website.exists():
+            shutil.rmtree(website)
+        shutil.move(str(downloaded), website)
     return website
 
 
