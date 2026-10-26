@@ -6,7 +6,8 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
   exit 2
 fi
 
-ROOT="${OPENALEX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${OPENALEX_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 EVENTS_INPUT="$1"
 REMOTE="${2:-origin}"
 if [[ "$EVENTS_INPUT" = /* ]]; then
@@ -77,4 +78,4 @@ fi
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   "${PYTHON:-python}" -m openalex.website.build \
   "${BUILD_ARGS[@]}"
-bash "$ROOT/scripts/publish-gh-pages.sh" "$SITE" "$REMOTE"
+bash "$SCRIPT_DIR/publish-gh-pages.sh" "$SITE" "$REMOTE"
