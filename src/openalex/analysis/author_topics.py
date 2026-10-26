@@ -516,6 +516,11 @@ def _validate_corpus_provenance(
     source: Path,
     source_info: dict[str, int | str],
 ) -> None:
+    if topic_manifest.get("adopted_without_corpus_provenance"):
+        logger.warning(
+            "Using an adopted legacy topic payload without corpus provenance"
+        )
+        return
     upstream_sha256 = topic_manifest.get("source_sha256")
     if upstream_sha256 is not None:
         if upstream_sha256 != source_info["source_sha256"]:

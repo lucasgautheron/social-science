@@ -8,10 +8,11 @@ from collections.abc import Sequence
 
 from openalex.artifacts import cli as artifact_cli
 
-from . import configure, runner
+from . import configure, runner, website
 
 LIFECYCLE_COMMANDS = {"setup", "start", "pause", "workers", "notifications", "destroy"}
 RUN_COMMANDS = {"submit", "status", "logs", "artifacts", "download", "cancel"}
+PIPELINE_COMMANDS = {"website"}
 ARTIFACT_COMMANDS = {"hydrate", "inspect", "pin", "publish"}
 
 
@@ -25,7 +26,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument(
             "command",
             nargs="?",
-            choices=sorted(LIFECYCLE_COMMANDS | RUN_COMMANDS | ARTIFACT_COMMANDS),
+            choices=sorted(
+                LIFECYCLE_COMMANDS
+                | RUN_COMMANDS
+                | ARTIFACT_COMMANDS
+                | PIPELINE_COMMANDS
+            ),
         )
         parser.print_help()
         return 0
@@ -33,6 +39,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return configure.main(values)
     if values[0] in RUN_COMMANDS:
         return runner.main(values)
+    if values[0] in PIPELINE_COMMANDS:
+        return website.main(values[1:])
     if values[0] in ARTIFACT_COMMANDS:
         return artifact_cli.main(values)
     raise SystemExit(f"Unknown AWS command: {values[0]}")

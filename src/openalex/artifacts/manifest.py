@@ -106,6 +106,9 @@ def complete_manifest(
     artifact.mkdir(parents=True, exist_ok=True)
     inventory_path, inventory = write_inventory(artifact)
     payload = dict(manifest)
+    recipe_sha256 = os.environ.get("OPENALEX_ARTIFACT_RECIPE_SHA256")
+    if recipe_sha256:
+        payload.setdefault("recipe_sha256", recipe_sha256)
     payload.update(
         {
             "artifact_schema": ARTIFACT_SCHEMA,

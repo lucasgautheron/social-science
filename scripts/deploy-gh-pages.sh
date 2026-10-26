@@ -21,7 +21,6 @@ fi
 
 TEMP_ROOT="$(mktemp -d)"
 SITE="$TEMP_ROOT/site"
-PUBLISH="$TEMP_ROOT/gh-pages"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 
 BUILD_ARGS=(
@@ -78,38 +77,4 @@ fi
 PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   "${PYTHON:-python}" -m openalex.website.build \
   "${BUILD_ARGS[@]}"
-
-git init --initial-branch=gh-pages "$PUBLISH" >/dev/null
-if name="$(git -C "$ROOT" config user.name 2>/dev/null)" && [[ -n "$name" ]]; then
-  git -C "$PUBLISH" config user.name "$name"
-fi
-if email="$(git -C "$ROOT" config user.email 2>/dev/null)" && [[ -n "$email" ]]; then
-  git -C "$PUBLISH" config user.email "$email"
-fi
-cp -R "$SITE"/. "$PUBLISH"/
-
-python - "$PUBLISH" <<'PY'
-import os
-from pathlib import Path
-import sys
-
-limit = int(os.environ.get("GITHUB_FILE_LIMIT", 100 * 1024 * 1024))
-root = Path(sys.argv[1])
-too_large = [
-    path for path in root.rglob("*")
-    if path.is_file() and ".git" not in path.parts and path.stat().st_size >= limit
-]
-if too_large:
-    print("Refusing to publish files at or over GitHub's 100MB limit:", file=sys.stderr)
-    for path in too_large:
-        print(f"  {path.relative_to(root)}", file=sys.stderr)
-    raise SystemExit(1)
-PY
-
-git -C "$PUBLISH" add --all
-git -C "$PUBLISH" commit --quiet -m "Update event website"
-REMOTE_URL="$(git -C "$ROOT" remote get-url "$REMOTE")"
-git -C "$PUBLISH" remote add origin "$REMOTE_URL"
-git -C "$PUBLISH" push --force --set-upstream origin HEAD:gh-pages
-git -C "$ROOT" fetch --force "$REMOTE" "gh-pages:gh-pages"
-echo "Published event website from $EVENTS_DIR to $REMOTE/gh-pages."
+bash "$ROOT/scripts/publish-gh-pages.sh" "$SITE" "$REMOTE"

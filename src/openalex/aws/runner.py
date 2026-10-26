@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import subprocess
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
 from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
+from openalex.artifacts.lockfile import ArtifactPin
 from openalex.artifacts.manifest import manifest_sha256
 from openalex.artifacts.resolver import ArtifactResolver
 from openalex.artifacts.s3_store import S3ArtifactStore
@@ -174,7 +176,7 @@ def publish_input_artifacts(
         source = root.joinpath(*relative.parts)
         manifest = source / "manifest.json"
         pin = None if artifact_lock is None else artifact_lock.get(destination)
-        if not manifest.is_file() and pin is not None:
+        if pin is not None:
             store = S3ArtifactStore(s3, bucket, state["prefix"])
             manifest_key = (
                 f"{store.artifact_prefix(pin.manifest_sha256)}/manifest.json"
@@ -230,6 +232,48 @@ def publish_input_artifacts(
             }
         )
     return artifacts
+
+
+def pin_run_artifact(
+    s3,
+    state: Dict[str, Any],
+    run_id: str,
+    logical_path: str,
+    artifact_lock: ArtifactLock,
+) -> ArtifactPin:
+    """Pin a promoted run artifact without materializing its payload locally."""
+    logical = _safe_input_path(logical_path).as_posix()
+    relative = PurePosixPath(logical)
+    if not relative.parts or relative.parts[0] != "output":
+        raise ValueError("Run artifact paths must be beneath output/")
+    run_relative = PurePosixPath(*relative.parts[1:]).as_posix()
+    key = f"{run_prefix(state, run_id)}/output/{run_relative}/manifest.json"
+    try:
+        response = s3.get_object(Bucket=state["bucket"], Key=key)
+    except Exception as exc:
+        if client_error_code(exc) in {"404", "NoSuchKey", "NotFound"}:
+            raise ValueError(
+                f"Run {run_id} has no manifest for {logical_path}"
+            ) from exc
+        raise
+    payload = response["Body"].read()
+    digest = hashlib.sha256(payload).hexdigest()
+    manifest = json.loads(payload.decode("utf-8"))
+    store = S3ArtifactStore(s3, state["bucket"], state["prefix"])
+    promoted_key = f"{store.artifact_prefix(digest)}/manifest.json"
+    if not _s3_object_exists(s3, state["bucket"], promoted_key):
+        raise ValueError(
+            f"Run {run_id} completed but {logical_path} was not promoted"
+        )
+    pin = ArtifactPin(
+        logical,
+        digest,
+        str(manifest.get("stage") or "") or None,
+        store.artifact_uri(digest),
+    )
+    artifact_lock.pin(pin)
+    artifact_lock.write()
+    return pin
 
 
 def input_output_exclude_options(inputs: List[Dict[str, str]]) -> str:
@@ -1492,13 +1536,16 @@ def command_submit(args: argparse.Namespace) -> int:
         )
         for path in input_paths:
             local_manifest = Path(path) / "manifest.json"
-            digest = (
-                manifest_sha256(local_manifest)
-                if local_manifest.is_file()
-                else None
-            )
             pin = artifact_lock.get(path)
-            digest = digest or (None if pin is None else pin.manifest_sha256)
+            digest = (
+                pin.manifest_sha256
+                if pin is not None
+                else (
+                    manifest_sha256(local_manifest)
+                    if local_manifest.is_file()
+                    else None
+                )
+            )
             if digest is not None and _s3_object_exists(
                 s3,
                 bucket,

@@ -209,6 +209,7 @@ openalex new-links \
   --db-path /path/to/articles.db \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
+  --embeddings-dir output/embeddings \
   --author-embeddings-dir output/author_embeddings \
   --output-dir output/new_links
 ```
@@ -220,10 +221,12 @@ sampled for output. The sampling strategies are:
 | --- | --- | --- | --- |
 | First-link, no unique cluster | New author pair whose first-year papers do not identify exactly one common cluster | Independent yearly simple random sample of up to `--no-cluster-sample` | First-link reference; stored with inverse-inclusion `sampling_weight` |
 | First-link, attributed cluster | New author pair uniquely attributed to a cluster | Independent simple random sample of up to `--cluster-sample` per cluster and year | Cluster first-link distance; stored with inverse-inclusion `sampling_weight` |
+| First-link semantic, attributed cluster | Uniquely attributed new author pair whose authors both retain a leave-cluster-out embedding | Independent simple random sample of up to `--cluster-sample` per cluster and year | Cluster first-link cosine-distance distribution; covered and excluded populations are counted exactly |
+| First-link semantic reference | New author pair without a unique cluster whose authors both retain the evaluated cluster's leave-cluster-out embedding | Independent simple random sample of up to `--baseline-sample` per cluster and year | Cluster-specific first-link semantic null |
 | All-link network reservoir | Connected cluster-paper-pair occurrence; repeated pair occurrences are retained and an existing link has distance one | Uniform global reservoir of up to `--cluster-sample` per cluster across all years | Cluster all-link distance distribution; disconnected occurrences and population totals are counted exactly |
 | All-link network reference | Cluster-paper-pair occurrence in one year | Independent yearly simple random sample of up to `--baseline-sample` | Leave-one-cluster-out, year-matched network reference |
-| Semantic cluster reservoir | Embedding-covered cluster-paper-pair occurrence; repeated pair occurrences are retained | Uniform global reservoir of up to `--cluster-sample` per cluster across all years | Cluster cosine-distance distribution; covered and missing-embedding populations are counted exactly |
-| Semantic reference | Embedding-covered author-pair occurrence from any analyzed paper in one year | Independent yearly simple random sample of up to `--baseline-sample` | Corpus-wide semantic null, post-stratified to each cluster reservoir's year distribution |
+| Semantic cluster reservoir | Cluster-paper-pair occurrence whose authors both retain a leave-cluster-out embedding; repeated pair occurrences are retained | Uniform global reservoir of up to `--cluster-sample` per cluster across all years | Cluster cosine-distance distribution; covered and excluded populations are counted exactly |
+| Semantic reference | Author-pair occurrence from any analyzed paper whose authors both retain the evaluated cluster's leave-cluster-out embedding | Independent simple random sample of up to `--baseline-sample` per cluster and year | Cluster-specific semantic null, post-stratified to that cluster reservoir's year distribution |
 
 All draws are reproducible with `--sampling-seed`; separate deterministic seed
 streams keep the designs independent. First-link samples are partitioned as
@@ -234,22 +237,26 @@ into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 first-year link. Use `sampling_weight` when estimating totals. Exact
 population/sample counts and inclusion probabilities are in `manifest.json`.
 Event artifacts produced before article-id incidence sidecars were added must
-be regenerated. New-link artifacts before version 9 lack the current
-year-matched network references, semantic distances, or semantic null samples
-and must also be rebuilt.
+be regenerated. New-link artifacts before version 10 lack the current
+cluster-excluded semantic distances and null samples and must also be rebuilt.
 
 For semantic distance, every occurrence of an author pair on a qualifying
 cluster paper is a separate population record. A pair appearing on `f` such
 papers therefore has `f` chances to enter an independent global reservoir of
-up to `--cluster-sample` records per cluster. The stored float32 value is the
-cosine distance between the two fractional-authorship author embeddings.
-Occurrences missing either author embedding are excluded rather than imputed,
-with exact covered and excluded populations recorded for every cluster.
-The null draws up to `--baseline-sample` embedding-covered author-pair
-occurrences uniformly from all analyzed papers in each year. Visualization
-post-stratifies those yearly samples to each cluster reservoir's observed year
-distribution, so the selected and null semantic samples have identical year
-weights.
+up to `--cluster-sample` records per cluster. The first-link semantic measure
+instead includes each uniquely attributed new author pair once in its first
+year. Before either distance is calculated,
+every embedding-covered paper in that cluster is subtracted from each author's
+fractional-authorship profile, including papers outside `--to-year` or skipped
+by `--max-authors`. The stored float32 value is the cosine distance between
+those leave-cluster-out author embeddings. Occurrences for which either author
+has no remaining embedding are excluded rather than imputed, with exact
+covered and excluded populations recorded for every cluster. The null draws up
+to `--baseline-sample` eligible author-pair occurrences uniformly from all
+analyzed papers for each cluster and year, using the same cluster exclusion.
+Visualization post-stratifies those yearly samples to each cluster reservoir's
+observed year distribution, so the selected and null semantic samples have
+identical year weights.
 
 Both `network` and `new-links` skip papers with more than 16 authors by
 default; change this with `--max-authors`. Exact distances use bidirectional
@@ -271,9 +278,9 @@ openalex visualize-new-links \
   --permutation-replicates 1000
 ```
 
-This writes separate scatter plots for first links, all coauthor-pair
-observations on cluster papers, and semantic link distance. In the all-link
-network measure, pairs already linked before the
+This writes separate scatter plots for first-link graph distance, first-link
+semantic distance, all coauthor-pair graph distance, and all-link semantic
+distance. In the all-link network measure, pairs already linked before the
 paper contribute distance one. All connected observations use one uniform
 reservoir of up to `--cluster-sample` observations per cluster across all
 years. Exact connected denominators and reservoir-weighted distance sums keep
@@ -317,16 +324,23 @@ openalex visualize-cluster-topics \
 This joins hard full-corpus paper-topic assignments to event-cluster incidence,
 counts each paper once per cluster, and writes frequency-ranked categorical
 topic histograms. Rao--Stirling diversity uses cosine dissimilarity between
-the saved BERTopic model's c-TF-IDF vectors. Classifier confidence is not used;
+the exported sparse c-TF-IDF vectors. Classifier confidence is not used;
 papers with missing assignments and topic outliers are reported as coverage
-counts but excluded from the diversity distribution. The saved BERTopic model
-is required, so topic artifacts built with `--no-save-model` cannot be used.
+counts but excluded from the diversity distribution. Legacy exports fall back
+to a saved BERTopic model and can be upgraded with
+`openalex topics --output-dir output/topics --export-topic-vectors`.
 The same artifact also groups involved authors by their primary topic. For each
 cluster, an author's primary topic is inferred after subtracting that cluster's
 papers from the author's full topic profile. Each cluster-paper authorship
 contributes `1/n` for a paper with `n` authors, including weight one for
 single-author papers. Author Rao--Stirling diversity applies the same c-TF-IDF
-topic dissimilarities to this fractional primary-topic distribution.
+topic dissimilarities to this fractional primary-topic distribution. For each
+multi-author cluster paper, within-collaboration diversity is calculated from
+the covered coauthors' leave-cluster-out primary topics when at least two are
+available. Each eligible paper receives equal weight in the cluster mean,
+regardless of team size; eligible and insufficient-coverage paper counts are
+reported separately. Cluster-topic visualization artifacts use schema version
+3.
 
 On Slurm, submit the same analysis without occupying a login node:
 
@@ -340,10 +354,6 @@ Or run it on the configured AWS CPU worker:
 
 ```bash
 openalex-aws submit --worker cpu \
-  --input output/events \
-  --input output/event_clusters \
-  --input output/topics \
-  --input output/author_topics \
   -- openalex visualize-cluster-topics \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
@@ -374,21 +384,31 @@ that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year plus paper-topic and weighted
 author-primary-topic histograms, ordered from most to least frequent topic.
 `link-distances.html` interactively plots
-cluster paper count on a logarithmic x-axis against three mean-distance
-measures from `visualize-new-links` and two Rao--Stirling diversity measures:
-first-link network distance, all-paper-link network distance,
-author-embedding cosine distance, paper-topic diversity, and author
-primary-topic diversity. Its
+cluster paper count on a logarithmic x-axis against four mean-distance
+measures from `visualize-new-links` and two cluster-size-based Rao--Stirling
+diversity measures:
+first-link graph distance, first-link semantic distance, all-link graph
+distance, all-link semantic distance, paper-topic diversity, and author
+primary-topic diversity. A separate within-versus-overall tab plots pooled
+author diversity on the x-axis against mean within-collaboration diversity on
+the y-axis, with a diagonal reference. Points near the diagonal concentrate
+diversity within collaborations; points below it indicate a larger
+between-collaboration component. Missing primary topics can prevent an exact
+decomposition, so collaboration coverage is shown on hover. Its
 points use one neutral style rather
 than the static plots' residual highlights; hovering a point shows the cluster,
 its share-of-papers curve by year, the mean connected distance by year for the
 selected measure, and its distance distribution. Network-distance
 distributions (1, 2, ...) are overlaid with that cluster's year-matched
 reference; semantic distance uses a continuous histogram and reports embedding
-coverage, overlaid with year-matched random paper links. The details also report network disconnection and distribution effect
+coverage. First-link semantic distances are overlaid with year-matched first
+links outside clusters, while all-link semantic distances use random paper-link
+occurrences. The details also report network disconnection and distribution effect
 sizes with FDR-adjusted q-values. The
 cluster search matches labels, member keywords, and cluster ids, and filters
-the scatter points immediately.
+the scatter points immediately. Every tab ends with a formula-and-methodology
+section defining its axes, displayed statistics, weighting, coverage,
+reference population, and uncertainty calculations.
 
 When genuine classifications are available, the cluster list uses those
 keywords. Artefact-labelled members are left out of a cluster.
@@ -405,12 +425,15 @@ by the number of articles published that year. The count is one read-only
 `GROUP BY publication_year` over `idx_publication_year`, so the article rows
 are not read. Without `--db-path`, the curves use the processed-paper totals
 stored in the event manifest. Omitting `--new-link-visualizations-dir` leaves
-the three link-distance measures empty; omitting
+the four link-distance measures empty; omitting
 `--cluster-topic-visualizations-dir` omits topic histograms and diversity.
 `--trends` is the cluster-trends
 CSV that classifies those points. Without it, the builder uses
 `cluster_trends.csv` inside `--clusters-dir` when that file exists.
 `scripts/deploy-website.slurm` passes the file only in that case.
+The generated payload is stored as `data.json.gz`; the browser streams and
+decompresses it client-side so large sites remain below GitHub's 100 MB
+per-file limit.
 
 Publish a fresh orphan `gh-pages` commit with:
 
@@ -497,6 +520,7 @@ openalex-aws submit \
   -- openalex new-links \
   --events-dir output/events \
   --clusters-dir output/event_clusters \
+  --embeddings-dir output/embeddings \
   --author-embeddings-dir output/author_embeddings
 ```
 
