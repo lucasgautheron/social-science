@@ -7,6 +7,7 @@ import hashlib
 import json
 import pickle
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -339,7 +340,23 @@ def local_payload_is_adoptable(stage: StageSpec, root: str | Path) -> bool:
         return False
     if not stage.required_payloads:
         return False
-    return all((path / relative).exists() for relative in stage.required_payloads)
+    if not all((path / relative).exists() for relative in stage.required_payloads):
+        return False
+    if stage.name == "events":
+        parts = list((path / "incidence").glob("part_*.npz"))
+        return bool(parts) and all(
+            part.with_name(f"{part.stem}_years.npy").is_file()
+            and part.with_name(f"{part.stem}_article_ids.npy").is_file()
+            for part in parts
+        )
+    if stage.name == "topics":
+        has_vectors = (path / "topic_vector_ids.npy").is_file() and (
+            path / "topic_vectors.npz"
+        ).is_file()
+        return has_vectors or (path / "bertopic_model").exists()
+    if stage.name == "new-links":
+        return bool(list((path / "cluster_years").glob("*.npz")))
+    return True
 
 
 def adopt_local_artifact(
@@ -380,16 +397,27 @@ def adopt_local_artifact(
 
 def _adopted_manifest(stage: StageSpec, root: Path) -> dict[str, Any]:
     if stage.name == "events":
+        incidence_parts = sorted(
+            path.name for path in (root / "incidence").glob("part_*.npz")
+        )
+        paper_years: Counter[int] = Counter()
+        for part in incidence_parts:
+            years = np.load(
+                root / "incidence" / part.replace(".npz", "_years.npy"),
+                allow_pickle=False,
+            )
+            paper_years.update(int(year) for year in years)
         return {
             "vocabulary": "event_vocabulary.npy",
             "cooccurrence": "event_cooccurrence.npz",
             "document_frequency": "event_document_frequency.npy",
             "incidence_dir": "incidence",
-            "incidence_parts": sorted(
-                path.name for path in (root / "incidence").glob("part_*.npz")
-            ),
+            "incidence_parts": incidence_parts,
             "incidence_article_ids": True,
-            "papers_by_year": {},
+            "processed_papers": int(sum(paper_years.values())),
+            "papers_by_year": {
+                str(year): count for year, count in sorted(paper_years.items())
+            },
         }
     if stage.name == "embeddings":
         database = root / "embeddings.db"

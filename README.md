@@ -435,6 +435,44 @@ The generated payload is stored as `data.json.gz`; the browser streams and
 decompresses it client-side so large sites remain below GitHub's 100 MB
 per-file limit.
 
+### Automatic website update
+
+The AWS website pipeline resolves the complete dependency graph, reuses
+compatible local or pinned artifacts, builds only missing or stale stages on
+the appropriate CPU/GPU worker, downloads the finished static site, pauses the
+workers it used, and publishes `gh-pages`:
+
+```bash
+openalex-aws website --deploy
+```
+
+`--deploy` is the default; use `--no-deploy` to stop after downloading
+`output/website`. The command uses the current Git commit unless `--commit` or
+`--branch` is supplied, so commit and push code changes before launching it.
+Embeddings are routed to the configured GPU worker; all other stages use the
+CPU worker. Use `--force STAGE` to rebuild one stage and
+`--keep-workers-running` to leave used instances running.
+
+Existing files under `output/` are not discarded merely because an immutable
+manifest or provenance fields are absent. When the required stage-specific
+payload files are recognizable, the pipeline adopts them, writes their
+checksum inventory and manifest, publishes them once, and continues without
+recomputing the analysis.
+
+On a Slurm cluster, the entire update survives SSH disconnection as one
+command:
+
+```bash
+sbatch \
+  --job-name=openalex-website \
+  --output=openalex-website-%j.log \
+  --wrap='openalex-aws website --deploy'
+```
+
+The batch node needs outbound AWS/Git access and noninteractive credentials.
+Monitor it with `squeue`, `sacct`, or
+`tail -f openalex-website-JOB_ID.log`.
+
 Publish a fresh orphan `gh-pages` commit with:
 
 ```bash
@@ -444,6 +482,13 @@ OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR=output/cluster_topic_visualizations \
 OPENALEX_DB_PATH=/path/to/articles.db \
 OPENALEX_CLUSTER_TRENDS=output/event_clusters/cluster_trends.csv \
   scripts/deploy-gh-pages.sh output/events
+```
+
+If `output/website` has already been built, publish it directly without
+rebuilding:
+
+```bash
+scripts/publish-gh-pages.sh output/website
 ```
 
 ## AWS

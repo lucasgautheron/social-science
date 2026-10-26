@@ -240,10 +240,16 @@ def test_missing_manifest_payload_is_adopted_without_recomputation(tmp_path):
     from scipy import sparse
 
     sparse.save_npz(events / "event_cooccurrence.npz", sparse.csr_matrix([[0]]))
+    incidence = events / "incidence"
+    incidence.mkdir()
+    sparse.save_npz(incidence / "part_00000.npz", sparse.csr_matrix([[1]]))
+    np.save(incidence / "part_00000_years.npy", np.asarray([2020]))
+    np.save(incidence / "part_00000_article_ids.npy", np.asarray([1]))
 
     validation = adopt_local_artifact(STAGES["events"], events, {})
 
     assert validation.manifest["adopted_local_payload"] is True
     assert validation.manifest["stage"] == "events"
     assert validation.manifest["artifact_version"] == 1
-    assert validation.file_count == 3
+    assert validation.manifest["papers_by_year"] == {"2020": 1}
+    assert validation.file_count == 6

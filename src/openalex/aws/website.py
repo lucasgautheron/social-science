@@ -27,7 +27,6 @@ from openalex.artifacts.s3_store import S3ArtifactStore
 
 from . import configure, runner
 
-
 TERMINAL_STATUSES = {"success", "failed", "cancelled"}
 
 
@@ -129,7 +128,7 @@ def _submit_stage(
         "--artifact-cache",
         args.artifact_cache,
         "--branch",
-        args.branch,
+        args.branch or runner.DEFAULT_BRANCH,
     ]
     if args.profile:
         values.extend(("--profile", args.profile))
@@ -257,7 +256,8 @@ def _publish_website(args: argparse.Namespace, website: Path) -> None:
 
 
 def run_website_pipeline(args: argparse.Namespace) -> int:
-    args.commit = args.commit or _current_commit()
+    if args.commit is None and args.branch is None:
+        args.commit = _current_commit()
     forced = forced_stage_names(args.force)
     project_state = runner.load_state(args.state_path)
     session = runner.boto3_session(args, project_state)
@@ -340,7 +340,7 @@ def run_website_pipeline(args: argparse.Namespace) -> int:
             for worker in sorted(workers_used):
                 try:
                     _pause_worker(args, worker)
-                except Exception as exc:
+                except (Exception, SystemExit) as exc:
                     print(f"Could not pause {worker} worker: {exc}")
 
 
@@ -356,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--last-run-path", default=runner.DEFAULT_LAST_RUN_PATH)
     parser.add_argument("--profile", default=None)
     parser.add_argument("--region", default=None)
-    parser.add_argument("--branch", default=runner.DEFAULT_BRANCH)
+    parser.add_argument("--branch", default=None)
     parser.add_argument("--commit", default=None)
     parser.add_argument("--artifact-lock", default=str(DEFAULT_LOCK_PATH))
     parser.add_argument("--artifact-cache", default=str(DEFAULT_CACHE_DIR))
