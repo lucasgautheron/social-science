@@ -94,6 +94,7 @@ class ClusterExcludedEmbeddingStore:
     ) -> None:
         self.base = base
         self.articles = articles
+        self.source_database = source_database
         self.event_ids = np.asarray(event_ids, dtype=np.int64)
         self.event_offsets = np.asarray(event_offsets, dtype=np.int64)
         self.event_clusters = np.asarray(event_clusters, dtype=np.int32)
@@ -300,14 +301,63 @@ class ClusterExcludedEmbeddingStore:
                 )
             norm = float(np.linalg.norm(remaining))
             if norm <= 1e-12:
-                raise ValueError(
-                    "Cluster-excluded author embedding is zero for "
-                    f"author {author} in cluster {cluster}"
+                logger.warning(
+                    "Recomputing cluster-excluded embedding directly for "
+                    "author %s in cluster %s after float32 cancellation",
+                    author,
+                    cluster,
                 )
+                remaining = self._direct_remaining_vector(
+                    author,
+                    papers_by_key[key],
+                )
+                norm = float(np.linalg.norm(remaining))
+                if norm <= 1e-12:
+                    raise ValueError(
+                        "Cluster-excluded author embedding is zero after direct "
+                        f"recomputation for author {author} in cluster {cluster}"
+                    )
             self._unit_vectors[key] = np.asarray(
                 remaining / norm,
                 dtype=np.float32,
             )
+
+    def _direct_remaining_vector(
+        self,
+        author: int,
+        excluded_paper_positions: Sequence[int],
+    ) -> np.ndarray:
+        excluded_article_ids = {
+            int(self.event_ids[paper_index])
+            for paper_index in excluded_paper_positions
+        }
+        with _connect_readonly(self.source_database) as connection:
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT target.article_id, COUNT(coauthor.author_id)
+                    FROM articles_authors target
+                    JOIN articles_authors coauthor
+                      ON coauthor.article_id = target.article_id
+                    WHERE target.author_id = ?
+                    GROUP BY target.article_id
+                    ORDER BY target.article_id
+                    """,
+                    (author,),
+                )
+            )
+        author_counts = {
+            int(article_id): int(author_count)
+            for article_id, author_count in rows
+            if int(article_id) not in excluded_article_ids
+        }
+        vectors = self.articles.get_embeddings_batch(author_counts)
+        remaining = np.zeros(self.base.dimension, dtype=np.float64)
+        for article_id, author_count in author_counts.items():
+            vector = vectors.get(article_id)
+            if vector is not None:
+                remaining += np.asarray(vector, dtype=np.float64) / author_count
+        return remaining
 
     def _load_global_profiles(self, author_ids: np.ndarray) -> None:
         requested = [

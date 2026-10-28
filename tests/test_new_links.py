@@ -8,7 +8,7 @@ import pytest
 from scipy import sparse
 
 from openalex.analysis import new_links
-from openalex.analysis.embeddings import encode_embedding
+from openalex.analysis.embeddings import EmbeddingStore, encode_embedding
 from openalex.analysis.network import build_parser as build_network_parser
 from openalex.analysis.new_links import (
     _bidirectional_exact_bfs,
@@ -511,6 +511,49 @@ def test_semantic_profiles_exclude_cluster_only_author_histories(tmp_path):
             "first_semantic_missing_embedding_observations"
         ].tolist() == [3, 0]
         assert 0 not in stats["first_semantic_cluster_id"]
+
+
+def test_zero_subtractive_profile_is_recomputed_from_remaining_papers(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    articles = EmbeddingStore(tmp_path / "embeddings")
+    excluded_vector = articles.get_embedding(1)
+    assert excluded_vector is not None
+    with sqlite3.connect(author_embeddings / "author_embeddings.db") as connection:
+        connection.execute(
+            """
+            UPDATE author_embeddings
+            SET embedding = ?, total_weight = 1.0
+            WHERE author_id = 1
+            """,
+            (np.asarray(excluded_vector / 2, dtype="<f4").tobytes(),),
+        )
+
+    base = new_links._load_author_embedding_store(
+        author_embeddings,
+        database,
+    )
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        base,
+        articles,
+        database,
+        np.asarray([1], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1, 2], dtype=np.int64),
+        1,
+    )
+    pair = np.asarray([np.uint64(1)], dtype=np.uint64)
+    clusters = np.asarray([0], dtype=np.int32)
+
+    assert profiles.covered_pairs(pair, clusters).tolist() == [True]
+    distances = profiles.distances(pair, clusters)
+
+    assert distances.shape == (1,)
+    assert np.isfinite(distances[0])
+    assert np.linalg.norm(profiles._unit_vectors[(0, 1)]) == pytest.approx(1.0)
 
 
 def test_old_event_artifacts_explain_required_regeneration(tmp_path):
