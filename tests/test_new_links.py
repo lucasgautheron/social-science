@@ -357,7 +357,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
     assert 20 not in author_ids
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_version"] == 10
+    assert manifest["artifact_version"] == 11
     assert manifest["baseline_sample"] == 2_000
     assert manifest["completed_years"] == [2019, 2020, 2021]
     assert manifest["clustered_link_counts"]["2020"] == 1
@@ -554,6 +554,138 @@ def test_zero_subtractive_profile_is_recomputed_from_remaining_papers(tmp_path):
     assert distances.shape == (1,)
     assert np.isfinite(distances[0])
     assert np.linalg.norm(profiles._unit_vectors[(0, 1)]) == pytest.approx(1.0)
+
+
+def test_genuinely_zero_cluster_excluded_profile_becomes_uncovered(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    event_ids = np.asarray([1, 3, 4, 8, 9, 15], dtype=np.int64)
+    with sqlite3.connect(tmp_path / "embeddings" / "embeddings.db") as connection:
+        connection.executemany(
+            "UPDATE embeddings SET embedding = ? WHERE article_id = ?",
+            [
+                (encode_embedding(np.zeros(2, dtype=np.float32)), int(article_id))
+                for article_id in event_ids
+            ],
+        )
+    with sqlite3.connect(author_embeddings / "author_embeddings.db") as connection:
+        connection.execute(
+            """
+            UPDATE author_embeddings
+            SET embedding = ?, paper_count = paper_count + 1, total_weight = 10.0
+            WHERE author_id = 1
+            """,
+            (np.zeros(2, dtype="<f4").tobytes(),),
+        )
+
+    articles = EmbeddingStore(tmp_path / "embeddings")
+    base = new_links._load_author_embedding_store(
+        author_embeddings,
+        database,
+    )
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        base,
+        articles,
+        database,
+        event_ids,
+        np.arange(event_ids.size + 1, dtype=np.int64),
+        np.zeros(event_ids.size, dtype=np.int32),
+        np.asarray([1, 2], dtype=np.int64),
+        1,
+    )
+    pair = np.asarray([np.uint64(1)], dtype=np.uint64)
+    clusters = np.asarray([0], dtype=np.int32)
+
+    assert profiles.covered_pairs(pair, clusters).tolist() == [True]
+    distances = profiles.distances(pair, clusters)
+
+    assert np.isnan(distances[0])
+    assert profiles.covered_pairs(pair, clusters).tolist() == [False]
+
+
+def test_exhausted_fractional_weight_is_uncovered_before_sampling(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    with sqlite3.connect(author_embeddings / "author_embeddings.db") as connection:
+        connection.execute(
+            """
+            UPDATE author_embeddings
+            SET paper_count = 100, total_weight = 3.0
+            WHERE author_id = 1
+            """
+        )
+
+    event_ids = np.asarray([1, 3, 4, 8, 9, 15], dtype=np.int64)
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        new_links._load_author_embedding_store(author_embeddings, database),
+        EmbeddingStore(tmp_path / "embeddings"),
+        database,
+        event_ids,
+        np.arange(event_ids.size + 1, dtype=np.int64),
+        np.zeros(event_ids.size, dtype=np.int32),
+        np.asarray([1, 2], dtype=np.int64),
+        1,
+    )
+    pair = np.asarray([np.uint64(1)], dtype=np.uint64)
+    clusters = np.asarray([0], dtype=np.int32)
+
+    assert profiles.invalid_link_indices[0].tolist() == [0]
+    assert profiles.covered_pairs(pair, clusters).tolist() == [False]
+
+
+def test_new_links_resamples_after_discovering_zero_semantic_profile(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    events = tmp_path / "events"
+    clusters = tmp_path / "clusters"
+    output = tmp_path / "new_links"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    create_event_artifacts(events, clusters)
+    with sqlite3.connect(tmp_path / "embeddings" / "embeddings.db") as connection:
+        connection.executemany(
+            "UPDATE embeddings SET embedding = ? WHERE article_id = ?",
+            [
+                (encode_embedding(np.zeros(2, dtype=np.float32)), article_id)
+                for article_id in (1, 3, 4, 8, 9, 15)
+            ],
+        )
+    with sqlite3.connect(author_embeddings / "author_embeddings.db") as connection:
+        connection.execute(
+            """
+            UPDATE author_embeddings
+            SET embedding = ?, total_weight = 10.0
+            WHERE author_id = 1
+            """,
+            (np.zeros(2, dtype="<f4").tobytes(),),
+        )
+
+    build_new_links(
+        database,
+        events,
+        clusters,
+        output,
+        embeddings_dir=tmp_path / "embeddings",
+        author_embeddings_dir=author_embeddings,
+        max_authors=0,
+    )
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is True
+    with np.load(output / "cluster_years" / "2021.npz") as observations:
+        assert np.all(
+            np.isfinite(observations["semantic_reference_distance"])
+        )
+        assert np.all(
+            np.isfinite(observations["first_semantic_distance"])
+        )
+        assert int(
+            observations["semantic_missing_embedding_observations"].sum()
+        ) > 0
 
 
 def test_old_event_artifacts_explain_required_regeneration(tmp_path):

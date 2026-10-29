@@ -75,6 +75,7 @@ class AuthorEmbeddingStore:
     dimension: int
     author_ids: np.ndarray
     paper_counts: np.ndarray
+    total_weights: np.ndarray
     embedding_manifest_sha256: str
     manifest_sha256: str
 
@@ -121,10 +122,14 @@ class ClusterExcludedEmbeddingStore:
         excluded_counts: list[dict[int, int]] = [
             defaultdict(int) for _ in range(cluster_count)
         ]
+        excluded_weights: list[dict[int, float]] = [
+            defaultdict(float) for _ in range(cluster_count)
+        ]
         for paper_index in np.flatnonzero(covered):
             authors = self.event_authors[int(paper_index)]
             if authors.size == 0:
                 continue
+            paper_weight = 1.0 / authors.size
             clusters = self.event_clusters[
                 self.event_offsets[paper_index] :
                 self.event_offsets[paper_index + 1]
@@ -134,20 +139,33 @@ class ClusterExcludedEmbeddingStore:
                 author_papers[author].append(int(paper_index))
                 for cluster_value in clusters:
                     excluded_counts[int(cluster_value)][author] += 1
+                    excluded_weights[int(cluster_value)][author] += paper_weight
         self.author_papers = {
             author: np.asarray(papers, dtype=np.int64)
             for author, papers in author_papers.items()
         }
-        self.invalid_link_indices = self._invalid_indices(excluded_counts)
+        self.invalid_link_indices = self._invalid_indices(
+            excluded_counts,
+            excluded_weights,
+        )
         self._global_profiles: dict[int, tuple[np.ndarray, float]] = {}
         self._unit_vectors: dict[tuple[int, int], np.ndarray] = {}
+        self._unavailable_vectors: set[tuple[int, int]] = set()
+        self._direct_author_papers: dict[
+            int, list[tuple[int, int, np.ndarray]]
+        ] = {}
 
     def _invalid_indices(
         self,
         excluded_counts: Sequence[dict[int, int]],
+        excluded_weights: Sequence[dict[int, float]],
     ) -> list[np.ndarray]:
         result: list[np.ndarray] = []
-        for by_author in excluded_counts:
+        for by_author, weights_by_author in zip(
+            excluded_counts,
+            excluded_weights,
+            strict=True,
+        ):
             invalid: list[int] = []
             for author, excluded_count in by_author.items():
                 profile_position = int(
@@ -156,9 +174,21 @@ class ClusterExcludedEmbeddingStore:
                 if (
                     profile_position >= self.base.author_ids.size
                     or int(self.base.author_ids[profile_position]) != author
-                    or excluded_count
-                    < int(self.base.paper_counts[profile_position])
                 ):
+                    continue
+                paper_count_exhausted = excluded_count >= int(
+                    self.base.paper_counts[profile_position]
+                )
+                total_weight = float(
+                    self.base.total_weights[profile_position]
+                )
+                remaining_weight = total_weight - float(
+                    weights_by_author[author]
+                )
+                weight_exhausted = remaining_weight <= (
+                    1e-12 * max(1.0, total_weight)
+                )
+                if not paper_count_exhausted and not weight_exhausted:
                     continue
                 link_position = int(
                     np.searchsorted(self.link_author_ids, author)
@@ -197,6 +227,10 @@ class ClusterExcludedEmbeddingStore:
                 covered[members] &= ~_sorted_contains(
                     invalid, right[members]
                 )
+        for cluster, author in self._unavailable_vectors:
+            members = pair_clusters == cluster
+            covered[members] &= left_ids[members] != author
+            covered[members] &= right_ids[members] != author
         return covered
 
     def covered_pairs_for_cluster(
@@ -229,30 +263,69 @@ class ClusterExcludedEmbeddingStore:
             )
         }
         self._prepare_vectors(requested)
-        first = np.vstack(
+        available = np.asarray(
             [
-                self._unit_vectors[
-                    (int(cluster), int(self.link_author_ids[index]))
-                ]
-                for cluster, index in zip(pair_clusters, left, strict=True)
-            ]
+                (
+                    int(cluster),
+                    int(self.link_author_ids[left_index]),
+                )
+                not in self._unavailable_vectors
+                and (
+                    int(cluster),
+                    int(self.link_author_ids[right_index]),
+                )
+                not in self._unavailable_vectors
+                for cluster, left_index, right_index in zip(
+                    pair_clusters,
+                    left,
+                    right,
+                    strict=True,
+                )
+            ],
+            dtype=bool,
         )
-        second = np.vstack(
-            [
-                self._unit_vectors[
-                    (int(cluster), int(self.link_author_ids[index]))
+        result = np.full(pair_keys.size, np.nan, dtype=np.float32)
+        if np.any(available):
+            first = np.vstack(
+                [
+                    self._unit_vectors[
+                        (int(cluster), int(self.link_author_ids[index]))
+                    ]
+                    for cluster, index in zip(
+                        pair_clusters[available],
+                        left[available],
+                        strict=True,
+                    )
                 ]
-                for cluster, index in zip(pair_clusters, right, strict=True)
-            ]
-        )
-        similarity = np.einsum("ij,ij->i", first, second)
-        return np.asarray(np.clip(1.0 - similarity, 0.0, 2.0), dtype=np.float32)
+            )
+            second = np.vstack(
+                [
+                    self._unit_vectors[
+                        (int(cluster), int(self.link_author_ids[index]))
+                    ]
+                    for cluster, index in zip(
+                        pair_clusters[available],
+                        right[available],
+                        strict=True,
+                    )
+                ]
+            )
+            similarity = np.einsum("ij,ij->i", first, second)
+            result[available] = np.asarray(
+                np.clip(1.0 - similarity, 0.0, 2.0),
+                dtype=np.float32,
+            )
+        return result
 
     def _prepare_vectors(
         self,
         requested: set[tuple[int, int]],
     ) -> None:
-        missing = sorted(requested - self._unit_vectors.keys())
+        missing = sorted(
+            requested
+            - self._unit_vectors.keys()
+            - self._unavailable_vectors
+        )
         if not missing:
             return
         self._load_global_profiles(
@@ -288,6 +361,7 @@ class ClusterExcludedEmbeddingStore:
             remaining = (
                 np.asarray(global_vector, dtype=np.float64) * total_weight
             )
+            cancellation_scale = float(np.linalg.norm(remaining))
             for paper_index in papers_by_key[key]:
                 article_id = int(self.event_ids[paper_index])
                 vector = article_vectors.get(article_id)
@@ -296,27 +370,37 @@ class ClusterExcludedEmbeddingStore:
                         f"Missing indexed article embedding {article_id}"
                     )
                 author_count = self.event_authors[paper_index].size
-                remaining -= (
+                contribution = (
                     np.asarray(vector, dtype=np.float64) / author_count
                 )
+                if np.any(~np.isfinite(contribution)):
+                    raise ValueError(
+                        f"Article embedding {article_id} contains non-finite values"
+                    )
+                cancellation_scale += float(np.linalg.norm(contribution))
+                remaining -= contribution
             norm = float(np.linalg.norm(remaining))
-            if norm <= 1e-12:
+            if norm <= max(1e-12, 1e-6 * cancellation_scale):
                 logger.warning(
                     "Recomputing cluster-excluded embedding directly for "
                     "author %s in cluster %s after float32 cancellation",
                     author,
                     cluster,
                 )
-                remaining = self._direct_remaining_vector(
+                remaining, direct_scale = self._direct_remaining_vector(
                     author,
                     papers_by_key[key],
                 )
                 norm = float(np.linalg.norm(remaining))
-                if norm <= 1e-12:
-                    raise ValueError(
-                        "Cluster-excluded author embedding is zero after direct "
-                        f"recomputation for author {author} in cluster {cluster}"
+                if norm <= max(1e-12, 1e-6 * direct_scale):
+                    logger.warning(
+                        "Excluding undefined cluster-excluded embedding for "
+                        "author %s in cluster %s",
+                        author,
+                        cluster,
                     )
+                    self._unavailable_vectors.add(key)
+                    continue
             self._unit_vectors[key] = np.asarray(
                 remaining / norm,
                 dtype=np.float32,
@@ -326,38 +410,58 @@ class ClusterExcludedEmbeddingStore:
         self,
         author: int,
         excluded_paper_positions: Sequence[int],
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, float]:
         excluded_article_ids = {
             int(self.event_ids[paper_index])
             for paper_index in excluded_paper_positions
         }
-        with _connect_readonly(self.source_database) as connection:
-            rows = list(
-                connection.execute(
-                    """
-                    SELECT target.article_id, COUNT(coauthor.author_id)
-                    FROM articles_authors target
-                    JOIN articles_authors coauthor
-                      ON coauthor.article_id = target.article_id
-                    WHERE target.author_id = ?
-                    GROUP BY target.article_id
-                    ORDER BY target.article_id
-                    """,
-                    (author,),
+        papers = self._direct_author_papers.get(author)
+        if papers is None:
+            with _connect_readonly(self.source_database) as connection:
+                rows = list(
+                    connection.execute(
+                        """
+                        SELECT target.article_id, COUNT(coauthor.author_id)
+                        FROM articles_authors target
+                        JOIN articles_authors coauthor
+                          ON coauthor.article_id = target.article_id
+                        WHERE target.author_id = ?
+                        GROUP BY target.article_id
+                        ORDER BY target.article_id
+                        """,
+                        (author,),
+                    )
                 )
-            )
-        author_counts = {
-            int(article_id): int(author_count)
-            for article_id, author_count in rows
-            if int(article_id) not in excluded_article_ids
-        }
-        vectors = self.articles.get_embeddings_batch(author_counts)
+            author_counts = {
+                int(article_id): int(author_count)
+                for article_id, author_count in rows
+            }
+            vectors = self.articles.get_embeddings_batch(author_counts)
+            papers = []
+            for article_id, author_count in author_counts.items():
+                vector = vectors.get(article_id)
+                if vector is None:
+                    continue
+                if np.any(~np.isfinite(vector)):
+                    raise ValueError(
+                        f"Article embedding {article_id} contains non-finite values"
+                    )
+                papers.append(
+                    (
+                        article_id,
+                        author_count,
+                        np.asarray(vector, dtype=np.float64),
+                    )
+                )
+            self._direct_author_papers[author] = papers
         remaining = np.zeros(self.base.dimension, dtype=np.float64)
-        for article_id, author_count in author_counts.items():
-            vector = vectors.get(article_id)
-            if vector is not None:
-                remaining += np.asarray(vector, dtype=np.float64) / author_count
-        return remaining
+        scale = 0.0
+        for article_id, author_count, vector in papers:
+            if article_id not in excluded_article_ids:
+                contribution = vector / author_count
+                remaining += contribution
+                scale += float(np.linalg.norm(contribution))
+        return remaining, scale
 
     def _load_global_profiles(self, author_ids: np.ndarray) -> None:
         requested = [
@@ -384,6 +488,10 @@ class ClusterExcludedEmbeddingStore:
                         raise ValueError(
                             f"Author {author} embedding has dimension "
                             f"{vector.size}, expected {self.base.dimension}"
+                        )
+                    if np.any(~np.isfinite(vector)):
+                        raise ValueError(
+                            f"Author {author} embedding contains non-finite values"
                         )
                     self._global_profiles[int(author)] = (
                         vector.copy(),
@@ -444,7 +552,7 @@ def build_new_links(
     manifest_path = output / "manifest.json"
 
     existing = _load_manifest(manifest_path) if resume and manifest_path.exists() else None
-    if existing is not None and int(existing.get("artifact_version", 0)) != 10:
+    if existing is not None and int(existing.get("artifact_version", 0)) != 11:
         raise ValueError(
             "Existing output predates cluster-excluded semantic distances. "
             "Use a new --output-dir."
@@ -908,7 +1016,7 @@ def _load_author_embedding_store(
         rows = list(
             connection.execute(
                 """
-                SELECT author_id, paper_count
+                SELECT author_id, paper_count, total_weight
                 FROM author_embeddings
                 ORDER BY author_id
                 """
@@ -922,6 +1030,14 @@ def _load_author_embedding_store(
             [int(row[1]) for row in rows],
             dtype=np.int64,
         )
+        total_weights = np.asarray(
+            [float(row[2]) for row in rows],
+            dtype=np.float64,
+        )
+        if np.any(~np.isfinite(total_weights)) or np.any(total_weights <= 0):
+            raise ValueError(
+                "Author-embedding total weights must be finite and positive"
+            )
     if author_ids.size and np.any(author_ids[1:] <= author_ids[:-1]):
         raise ValueError("Author-embedding ids must be strictly increasing")
     return AuthorEmbeddingStore(
@@ -930,6 +1046,7 @@ def _load_author_embedding_store(
         dimension=dimension,
         author_ids=author_ids,
         paper_counts=paper_counts,
+        total_weights=total_weights,
         embedding_manifest_sha256=str(
             manifest.get("embedding_manifest_sha256") or ""
         ),
@@ -1265,22 +1382,28 @@ def _process_year(
         )
     columns = _author_columns(author_ids, authors, year)
     pair_occurrences = _make_pair_keys(columns, counts)
-    (
-        semantic_reference_keys,
-        semantic_reference_clusters,
-        semantic_reference_population,
-    ) = _sample_semantic_reference(
-        pair_occurrences,
-        semantic_embeddings,
-        cluster_count,
-        baseline_sample,
-        sampling_seed,
-        year,
-    )
-    semantic_reference_distances = semantic_embeddings.distances(
-        semantic_reference_keys,
-        semantic_reference_clusters,
-    )
+    while True:
+        unavailable_before = len(semantic_embeddings._unavailable_vectors)
+        (
+            semantic_reference_keys,
+            semantic_reference_clusters,
+            semantic_reference_population,
+        ) = _sample_semantic_reference(
+            pair_occurrences,
+            semantic_embeddings,
+            cluster_count,
+            baseline_sample,
+            sampling_seed,
+            year,
+        )
+        semantic_reference_distances = semantic_embeddings.distances(
+            semantic_reference_keys,
+            semantic_reference_clusters,
+        )
+        if np.all(np.isfinite(semantic_reference_distances)):
+            break
+        if len(semantic_embeddings._unavailable_vectors) == unavailable_before:
+            raise RuntimeError("Semantic reference resampling made no progress")
     pair_keys, paper_counts = np.unique(pair_occurrences, return_counts=True)
     del pair_occurrences
 
@@ -1314,41 +1437,55 @@ def _process_year(
     cluster_id = _attribute_clusters(
         new_keys, new_paper_counts, event_pair_keys, event_pair_clusters
     )
-    (
-        first_semantic_observations,
-        sampled_first_semantic_keys,
-        sampled_first_semantic_clusters,
-        first_semantic_sampling_weight,
-    ) = _sample_first_semantic_observations(
-        new_keys,
-        cluster_id,
-        semantic_embeddings,
-        cluster_count,
-        cluster_sample,
-        sampling_seed,
-        year,
-    )
-    (
-        first_semantic_reference_keys,
-        first_semantic_reference_clusters,
-        first_semantic_reference_population,
-    ) = _sample_first_semantic_reference(
-        new_keys,
-        cluster_id,
-        semantic_embeddings,
-        cluster_count,
-        baseline_sample,
-        sampling_seed,
-        year,
-    )
-    first_semantic_distances = semantic_embeddings.distances(
-        sampled_first_semantic_keys,
-        sampled_first_semantic_clusters,
-    )
-    first_semantic_reference_distances = semantic_embeddings.distances(
-        first_semantic_reference_keys,
-        first_semantic_reference_clusters,
-    )
+    while True:
+        unavailable_before = len(semantic_embeddings._unavailable_vectors)
+        (
+            first_semantic_observations,
+            sampled_first_semantic_keys,
+            sampled_first_semantic_clusters,
+            first_semantic_sampling_weight,
+        ) = _sample_first_semantic_observations(
+            new_keys,
+            cluster_id,
+            semantic_embeddings,
+            cluster_count,
+            cluster_sample,
+            sampling_seed,
+            year,
+        )
+        first_semantic_distances = semantic_embeddings.distances(
+            sampled_first_semantic_keys,
+            sampled_first_semantic_clusters,
+        )
+        if np.all(np.isfinite(first_semantic_distances)):
+            break
+        if len(semantic_embeddings._unavailable_vectors) == unavailable_before:
+            raise RuntimeError("First-link semantic resampling made no progress")
+    while True:
+        unavailable_before = len(semantic_embeddings._unavailable_vectors)
+        (
+            first_semantic_reference_keys,
+            first_semantic_reference_clusters,
+            first_semantic_reference_population,
+        ) = _sample_first_semantic_reference(
+            new_keys,
+            cluster_id,
+            semantic_embeddings,
+            cluster_count,
+            baseline_sample,
+            sampling_seed,
+            year,
+        )
+        first_semantic_reference_distances = semantic_embeddings.distances(
+            first_semantic_reference_keys,
+            first_semantic_reference_clusters,
+        )
+        if np.all(np.isfinite(first_semantic_reference_distances)):
+            break
+        if len(semantic_embeddings._unavailable_vectors) == unavailable_before:
+            raise RuntimeError(
+                "First-link semantic reference resampling made no progress"
+            )
     all_left, all_right = _decode_pairs(new_keys)
     new_connected = _connected_pairs(parent, all_left, all_right)
     retained, sampling_weight, sampling_stats = _sample_links(
@@ -1381,31 +1518,39 @@ def _process_year(
         cluster_reservoir_years,
         cluster_observation_population,
     )
-    (
-        semantic_observations,
-        sampled_semantic_keys,
-        sampled_semantic_clusters,
-        kept_semantic_reservoirs,
-        kept_semantic_reservoir_years,
-        semantic_observation_population,
-        semantic_excluded_population,
-    ) = _sample_semantic_observations(
-        event_pair_keys,
-        event_pair_clusters,
-        semantic_embeddings,
-        cluster_count,
-        cluster_sample,
-        sampling_seed,
-        year,
-        semantic_reservoirs,
-        semantic_reservoir_years,
-        semantic_observation_population,
-        semantic_excluded_population,
-    )
-    semantic_distances = semantic_embeddings.distances(
-        sampled_semantic_keys,
-        sampled_semantic_clusters,
-    )
+    while True:
+        unavailable_before = len(semantic_embeddings._unavailable_vectors)
+        (
+            semantic_observations,
+            sampled_semantic_keys,
+            sampled_semantic_clusters,
+            kept_semantic_reservoirs,
+            kept_semantic_reservoir_years,
+            updated_semantic_population,
+            updated_semantic_excluded,
+        ) = _sample_semantic_observations(
+            event_pair_keys,
+            event_pair_clusters,
+            semantic_embeddings,
+            cluster_count,
+            cluster_sample,
+            sampling_seed,
+            year,
+            semantic_reservoirs,
+            semantic_reservoir_years,
+            semantic_observation_population,
+            semantic_excluded_population,
+        )
+        semantic_distances = semantic_embeddings.distances(
+            sampled_semantic_keys,
+            sampled_semantic_clusters,
+        )
+        if np.all(np.isfinite(semantic_distances)):
+            semantic_observation_population = updated_semantic_population
+            semantic_excluded_population = updated_semantic_excluded
+            break
+        if len(semantic_embeddings._unavailable_vectors) == unavailable_before:
+            raise RuntimeError("All-link semantic resampling made no progress")
     semantic_reservoirs, semantic_reservoir_years = (
         _finish_semantic_reservoir(
             kept_semantic_reservoirs,
@@ -2923,7 +3068,7 @@ def _fresh_manifest(
 ) -> dict:
     return {
         **config,
-        "artifact_version": 10,
+        "artifact_version": 11,
         "author_count": int(author_ids.size),
         "cluster_level": None,
         "cluster_metadata": "cluster_metadata.npz",

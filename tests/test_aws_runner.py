@@ -8,6 +8,7 @@ from unittest import mock
 
 from openalex.artifacts.lockfile import ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import complete_manifest
+from openalex.artifacts.s3_store import S3ArtifactStore
 from openalex.aws import configure as aws_configure
 from openalex.aws import runner as aws_run
 
@@ -19,8 +20,11 @@ class FakePaginator:
     def paginate(self, Bucket, Prefix):
         del Bucket
         contents = [
-            {"Key": key, "Size": size}
-            for key, size in self.objects.items()
+            {
+                "Key": key,
+                "Size": len(payload) if isinstance(payload, bytes) else payload,
+            }
+            for key, payload in self.objects.items()
             if key.startswith(Prefix)
         ]
         return [{"Contents": contents}] if contents else [{}]
@@ -40,7 +44,10 @@ class FakeS3:
 
     def download_file(self, bucket, key, filename):
         self.downloads.append((bucket, key, filename))
-        Path(filename).write_text(key, encoding="utf-8")
+        payload = self.objects.get(key, key.encode("utf-8"))
+        if not isinstance(payload, bytes):
+            payload = b"x" * payload
+        Path(filename).write_bytes(payload)
 
     def head_object(self, Bucket, Key):
         del Bucket
@@ -70,7 +77,7 @@ class FakeS3:
 
     def upload_file(self, filename, bucket, key, ExtraArgs=None):
         self.uploads.append((filename, bucket, key))
-        self.objects[key] = Path(filename).stat().st_size
+        self.objects[key] = Path(filename).read_bytes()
         self.metadata[key] = (ExtraArgs or {}).get("Metadata", {})
 
 
@@ -216,11 +223,19 @@ class ArtifactTests(unittest.TestCase):
                 {"artifact_version": 1},
                 stage="events",
             )
+            s3 = FakeS3({})
+            published = S3ArtifactStore(
+                s3, self.state["bucket"], self.state["prefix"]
+            ).publish(artifact)
             lock = ArtifactLock(root / "lock.json")
-            lock.pin(ArtifactPin("output/events", "pinned", "events"))
-            s3 = FakeS3(
-                {"project/artifacts/pinned/manifest.json": b'{"stage":"events"}'}
+            lock.pin(
+                ArtifactPin(
+                    "output/events",
+                    published["manifest_sha256"],
+                    "events",
+                )
             )
+            upload_count = len(s3.uploads)
 
             prepared = aws_run.publish_input_artifacts(
                 s3,
@@ -230,18 +245,30 @@ class ArtifactTests(unittest.TestCase):
                 artifact_lock=lock,
             )
 
-            self.assertEqual(prepared[0]["manifest_sha256"], "pinned")
-            self.assertEqual(s3.uploads, [])
+            self.assertEqual(
+                prepared[0]["manifest_sha256"], published["manifest_sha256"]
+            )
+            self.assertEqual(len(s3.uploads), upload_count)
 
     def test_pin_run_artifact_records_promoted_digest_without_download(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = b'{"artifact_version": 1, "stage": "events"}'
+            artifact = Path(temp_dir) / "events"
+            artifact.mkdir()
+            (artifact / "payload.bin").write_bytes(b"events")
+            complete_manifest(
+                artifact,
+                {"artifact_version": 1},
+                stage="events",
+            )
+            manifest = (artifact / "manifest.json").read_bytes()
             digest = hashlib.sha256(manifest).hexdigest()
-            objects = {
-                "project/runs/run-1/output/events/manifest.json": manifest,
-                f"project/artifacts/{digest}/manifest.json": manifest,
-            }
-            s3 = FakeS3(objects)
+            s3 = FakeS3({})
+            S3ArtifactStore(
+                s3, self.state["bucket"], self.state["prefix"]
+            ).publish(artifact)
+            s3.objects[
+                "project/runs/run-1/output/events/manifest.json"
+            ] = manifest
             lock = ArtifactLock(Path(temp_dir) / "lock.json")
 
             pin = aws_run.pin_run_artifact(
@@ -254,6 +281,27 @@ class ArtifactTests(unittest.TestCase):
 
             self.assertEqual(pin.manifest_sha256, digest)
             self.assertEqual(lock.get("output/events"), pin)
+
+    def test_pin_run_artifact_rejects_partial_promotion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = b'{"artifact_version": 1, "stage": "events"}'
+            digest = hashlib.sha256(manifest).hexdigest()
+            s3 = FakeS3(
+                {
+                    "project/runs/run-1/output/events/manifest.json": manifest,
+                    f"project/artifacts/{digest}/manifest.json": manifest,
+                }
+            )
+            lock = ArtifactLock(Path(temp_dir) / "lock.json")
+
+            with self.assertRaisesRegex(ValueError, "not completely promoted"):
+                aws_run.pin_run_artifact(
+                    s3,
+                    self.state,
+                    "run-1",
+                    "output/events",
+                    lock,
+                )
 
     def test_refresh_script_collects_current_and_legacy_outputs(self):
         script = aws_run.build_artifact_refresh_script(
@@ -537,7 +585,7 @@ class ArtifactTests(unittest.TestCase):
                         selected["instance_id"]
                     ),
                 ),
-                mock.patch.object(aws_run, "put_s3_json"),
+                mock.patch.object(aws_run, "put_s3_json") as put_status,
                 mock.patch.object(aws_run, "put_s3_text"),
                 mock.patch.object(
                     aws_run,
@@ -551,6 +599,7 @@ class ArtifactTests(unittest.TestCase):
 
             self.assertEqual(started, ["i-gpu"])
             self.assertEqual(sent, ["i-gpu"])
+            put_status.assert_called_once()
             history = json.loads(last_run.read_text(encoding="utf-8"))
             self.assertEqual(history["last_worker"], "gpu")
             self.assertEqual(history["by_worker"]["gpu"]["run_id"], "gpu-run")

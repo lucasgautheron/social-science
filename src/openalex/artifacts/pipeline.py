@@ -170,7 +170,7 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
         "new-links",
         "output/new_links",
         "cpu",
-        10,
+        11,
         (
             ("events", "events"),
             ("clusters", "cluster-events"),
@@ -192,6 +192,7 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
             "output/author_embeddings",
             "--output-dir",
             "output/new_links",
+            "--resume",
         ),
         (
             "cluster_metadata.npz",
@@ -355,7 +356,7 @@ def local_payload_is_adoptable(stage: StageSpec, root: str | Path) -> bool:
         ).is_file()
         return has_vectors or (path / "bertopic_model").exists()
     if stage.name == "new-links":
-        return bool(list((path / "cluster_years").glob("*.npz")))
+        return False
     return True
 
 

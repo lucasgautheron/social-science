@@ -85,7 +85,7 @@ def build_cluster_link_plots(
     root = Path(new_links_dir).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
     manifest = _read_json(root / "manifest.json")
-    if int(manifest.get("artifact_version", 0)) < 10:
+    if int(manifest.get("artifact_version", 0)) < 11:
         raise ValueError(
             "New-link artifacts lack cluster-excluded semantic distances; "
             "rebuild them."

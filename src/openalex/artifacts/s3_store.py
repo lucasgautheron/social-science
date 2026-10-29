@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .manifest import (
@@ -108,6 +108,81 @@ class S3ArtifactStore:
                 str(record["sha256"]),
             )
             for record in inventory.get("files", [])
+        )
+
+    def remote_is_complete(self, digest: str) -> bool:
+        """Return whether every checksummed object for an artifact is present."""
+        try:
+            manifest_response = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=self._key(digest, MANIFEST_FILENAME),
+            )
+            manifest_payload = manifest_response["Body"].read()
+            if hashlib.sha256(manifest_payload).hexdigest() != digest:
+                return False
+            manifest = json.loads(manifest_payload.decode("utf-8"))
+
+            inventory_response = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=self._key(digest, INVENTORY_FILENAME),
+            )
+            inventory_payload = inventory_response["Body"].read()
+            inventory = json.loads(inventory_payload.decode("utf-8"))
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            if isinstance(exc, (KeyError, TypeError, ValueError, json.JSONDecodeError)):
+                return False
+            raise
+
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("complete") is False
+            or not isinstance(inventory, dict)
+        ):
+            return False
+        records = inventory.get("files")
+        if not isinstance(records, list):
+            return False
+        seen: set[str] = set()
+        try:
+            for record in records:
+                if not isinstance(record, dict):
+                    return False
+                relative = PurePosixPath(str(record["path"]))
+                if (
+                    relative.is_absolute()
+                    or not relative.parts
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or relative.as_posix() in seen
+                ):
+                    return False
+                seen.add(relative.as_posix())
+                int(record["size"])
+                str(record["sha256"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        inventory_meta = manifest.get("inventory")
+        if isinstance(inventory_meta, dict):
+            try:
+                metadata_matches = (
+                    inventory_meta.get("path") == INVENTORY_FILENAME
+                    and str(inventory_meta.get("sha256", ""))
+                    == hashlib.sha256(inventory_payload).hexdigest()
+                    and int(inventory_meta.get("file_count", -1)) == len(records)
+                    and int(inventory_meta.get("total_size", -1))
+                    == sum(int(record["size"]) for record in records)
+                )
+            except (TypeError, ValueError):
+                return False
+            if not metadata_matches:
+                return False
+        return self.is_complete(
+            digest,
+            inventory,
+            manifest_size=len(manifest_payload),
         )
 
     def publish(self, root: str | Path) -> dict[str, str]:

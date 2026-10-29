@@ -30,14 +30,42 @@ from openalex.artifacts.s3_store import S3ArtifactStore
 from . import configure, runner
 
 TERMINAL_STATUSES = {"success", "failed", "cancelled"}
+REQUIRED_WEBSITE_FILES = (
+    "index.html",
+    "clusters.html",
+    "clusters.js",
+    "link-distances.html",
+    "link-distances.js",
+    "style.css",
+    "data.json.gz",
+)
 
 
 def _current_commit() -> str:
     try:
-        return subprocess.check_output(
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            text=True,
+        ).strip()
+        if dirty:
+            raise SystemExit(
+                "Tracked files have uncommitted changes. Commit and push them "
+                "before launching the AWS website pipeline."
+            )
+        commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             text=True,
         ).strip()
+        remote_refs = subprocess.check_output(
+            ["git", "branch", "-r", "--contains", commit],
+            text=True,
+        ).strip()
+        if not remote_refs:
+            raise SystemExit(
+                f"Commit {commit[:12]} is not present on a tracked remote. "
+                "Push it before launching the AWS website pipeline."
+            )
+        return commit
     except (OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit("Could not determine the current Git commit") from exc
 
@@ -100,6 +128,12 @@ def _select_or_publish(
 
     pin = lock.get(stage.output)
     if pin is None:
+        return None
+    if not store.remote_is_complete(pin.manifest_sha256):
+        print(
+            f"Ignoring incomplete pinned {stage.name} artifact "
+            f"{pin.manifest_sha256[:12]}."
+        )
         return None
     manifest = _remote_manifest(s3, store, pin.manifest_sha256)
     if manifest is None or not manifest_is_compatible(
@@ -164,8 +198,10 @@ def _wait_for_run(
     client_error,
     run_id: str,
     poll_seconds: float,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     key = f"{runner.run_prefix(state, run_id)}/status.json"
+    deadline = time.monotonic() + timeout_seconds
     while True:
         status = runner.get_s3_json(
             s3,
@@ -179,6 +215,11 @@ def _wait_for_run(
         if value in TERMINAL_STATUSES:
             assert status is not None
             return status
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"Run {run_id} exceeded the stage timeout of "
+                f"{timeout_seconds / 3600:g} hours"
+            )
         time.sleep(poll_seconds)
 
 
@@ -251,8 +292,16 @@ def _download_website(
             values.extend(("--region", args.region))
         runner.main(values)
         downloaded = Path(temporary) / "website"
-        if not (downloaded / "index.html").is_file():
-            raise SystemExit(f"Downloaded website is incomplete: {downloaded}")
+        missing = [
+            relative
+            for relative in REQUIRED_WEBSITE_FILES
+            if not (downloaded / relative).is_file()
+        ]
+        if missing:
+            raise SystemExit(
+                f"Downloaded website is incomplete: {downloaded}; missing "
+                f"{', '.join(missing)}"
+            )
         if website.exists():
             shutil.rmtree(website)
         shutil.move(str(downloaded), website)
@@ -318,6 +367,7 @@ def run_website_pipeline(args: argparse.Namespace) -> int:
                 client_error,
                 run_id,
                 args.poll_seconds,
+                args.stage_timeout_hours * 3600,
             )
             if status.get("status") != "success":
                 _show_failure_logs(args, stage, run_id)
@@ -382,6 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=runner.DEFAULT_DOWNLOAD_ROOT)
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
+    parser.add_argument("--stage-timeout-hours", type=float, default=48.0)
     parser.add_argument("--keep-workers-running", action="store_true")
     deployment = parser.add_mutually_exclusive_group()
     deployment.add_argument("--deploy", dest="deploy", action="store_true")
@@ -394,6 +445,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.poll_seconds <= 0:
         raise SystemExit("--poll-seconds must be greater than zero")
+    if args.stage_timeout_hours <= 0:
+        raise SystemExit("--stage-timeout-hours must be greater than zero")
     try:
         return run_website_pipeline(args)
     except ArtifactValidationError as exc:

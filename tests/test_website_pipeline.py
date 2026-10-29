@@ -56,6 +56,24 @@ def test_parser_defaults_to_deploy_and_accepts_no_deploy():
     assert _args("--no-deploy").deploy is False
 
 
+def test_default_commit_rejects_dirty_or_unpushed_code():
+    with mock.patch.object(
+        website.subprocess,
+        "check_output",
+        return_value=" M src/openalex/example.py\n",
+    ):
+        with pytest.raises(SystemExit, match="uncommitted changes"):
+            website._current_commit()
+
+    with mock.patch.object(
+        website.subprocess,
+        "check_output",
+        side_effect=["", "abc123\n", ""],
+    ):
+        with pytest.raises(SystemExit, match="not present on a tracked remote"):
+            website._current_commit()
+
+
 def test_website_pipeline_is_registered_in_aws_cli():
     with mock.patch.object(website, "main", return_value=0) as main:
         assert aws_cli.main(["website", "--no-deploy"]) == 0
@@ -162,6 +180,30 @@ def test_submit_stage_routes_explicit_inputs_and_recipe():
     )
 
 
+def test_wait_for_run_has_a_deadline():
+    with (
+        mock.patch.object(
+            website.runner,
+            "get_s3_json",
+            return_value={"status": "running"},
+        ),
+        mock.patch.object(
+            website.time,
+            "monotonic",
+            side_effect=[0.0, 2.0],
+        ),
+    ):
+        with pytest.raises(SystemExit, match="exceeded the stage timeout"):
+            website._wait_for_run(
+                object(),
+                {"bucket": "bucket", "prefix": "project"},
+                RuntimeError,
+                "run-1",
+                1.0,
+                1.0,
+            )
+
+
 def test_publish_website_uses_existing_site_directory(tmp_path):
     site = tmp_path / "website"
     args = _args()
@@ -184,7 +226,8 @@ def test_download_replaces_existing_site_atomically(tmp_path):
     def download(values):
         destination = Path(values[values.index("--output-dir") + 1]) / "website"
         destination.mkdir(parents=True)
-        (destination / "index.html").write_text("fresh", encoding="utf-8")
+        for relative in website.REQUIRED_WEBSITE_FILES:
+            (destination / relative).write_text("fresh", encoding="utf-8")
 
     with mock.patch.object(website.runner, "main", side_effect=download):
         result = website._download_website(args, "run-1")
@@ -192,3 +235,22 @@ def test_download_replaces_existing_site_atomically(tmp_path):
     assert result == existing
     assert (result / "index.html").read_text(encoding="utf-8") == "fresh"
     assert not (result / "stale.html").exists()
+
+
+def test_download_keeps_previous_site_when_remote_site_is_incomplete(tmp_path):
+    output = tmp_path / "output"
+    existing = output / "website"
+    existing.mkdir(parents=True)
+    (existing / "index.html").write_text("previous", encoding="utf-8")
+    args = _args("--output-dir", str(output))
+
+    def download(values):
+        destination = Path(values[values.index("--output-dir") + 1]) / "website"
+        destination.mkdir(parents=True)
+        (destination / "index.html").write_text("incomplete", encoding="utf-8")
+
+    with mock.patch.object(website.runner, "main", side_effect=download):
+        with pytest.raises(SystemExit, match="missing clusters.html"):
+            website._download_website(args, "run-1")
+
+    assert (existing / "index.html").read_text(encoding="utf-8") == "previous"

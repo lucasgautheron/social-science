@@ -177,10 +177,7 @@ def publish_input_artifacts(
         pin = None if artifact_lock is None else artifact_lock.get(destination)
         if pin is not None:
             store = S3ArtifactStore(s3, bucket, state["prefix"])
-            manifest_key = (
-                f"{store.artifact_prefix(pin.manifest_sha256)}/manifest.json"
-            )
-            if _s3_object_exists(s3, bucket, manifest_key):
+            if store.remote_is_complete(pin.manifest_sha256):
                 artifacts.append(
                     {
                         "path": destination,
@@ -202,8 +199,7 @@ def publish_input_artifacts(
         artifact_prefix = prefixed_key(
             state["prefix"], f"{INPUT_ARTIFACTS_DIR}/{digest}"
         )
-        manifest_key = f"{artifact_prefix}/manifest.json"
-        if _s3_object_exists(s3, bucket, manifest_key):
+        if store.remote_is_complete(digest):
             published = {
                 "manifest_sha256": digest,
                 "s3_uri": f"{s3_uri(bucket, artifact_prefix)}/",
@@ -259,10 +255,9 @@ def pin_run_artifact(
     digest = hashlib.sha256(payload).hexdigest()
     manifest = json.loads(payload.decode("utf-8"))
     store = S3ArtifactStore(s3, state["bucket"], state["prefix"])
-    promoted_key = f"{store.artifact_prefix(digest)}/manifest.json"
-    if not _s3_object_exists(s3, state["bucket"], promoted_key):
+    if not store.remote_is_complete(digest):
         raise ValueError(
-            f"Run {run_id} completed but {logical_path} was not promoted"
+            f"Run {run_id} completed but {logical_path} was not completely promoted"
         )
     pin = ArtifactPin(
         logical,
@@ -917,9 +912,10 @@ promote_output_artifacts() {{
     python -m openalex.artifacts.remote_publish \
       "${{RUN_DIR}}/output" \
       --bucket "$BUCKET" \
-      --prefix "$ARTIFACT_PREFIX" >>"$LAUNCHER_LOG" 2>&1 || \
-      echo "Artifact promotion failed; run outputs remain available under the run prefix." >>"$LAUNCHER_LOG"
+      --prefix "$ARTIFACT_PREFIX" >>"$LAUNCHER_LOG" 2>&1
+    return $?
   fi
+  return 0
 }}
 
 PYTHON_BIN=""
@@ -1332,9 +1328,14 @@ on_error() {{
   set -e
   sync_output
   if [ "$exit_code" -eq 0 ]; then
-    promote_output_artifacts
-    terminal_status="success"
-    terminal_message="Pipeline completed successfully"
+    if promote_output_artifacts; then
+      terminal_status="success"
+      terminal_message="Pipeline completed successfully"
+    else
+      exit_code=1
+      terminal_status="failed"
+      terminal_message="Pipeline completed but artifact promotion failed"
+    fi
   else
     terminal_status="failed"
     terminal_message="Pipeline failed with exit code $exit_code"
@@ -1585,10 +1586,6 @@ def command_submit(args: argparse.Namespace) -> int:
         command_id = send_ssm_command(session, state["instance_id"], launcher_script, run_id)
     else:
         command_id = send_ssh_command(session, state, args, launcher_script)
-    status["command_id"] = command_id
-    status["message"] = "SSM command accepted; remote runner is starting"
-    status["updated_at"] = utc_now()
-    put_s3_json(s3, bucket, f"{prefix}/status.json", status)
     record_last_run(Path(args.last_run_path), run_id, args.worker)
 
     print(f"Submitted command as run_id={run_id}")
