@@ -114,7 +114,7 @@ def test_global_trends_increase_after_a_flat_pre_2022_line(tmp_path):
     assert "Observed" in script
     assert "Expected" in script
     assert "break_year" in script
-    for name in ("clusters.html", "link-distances.html", "global-trends.html"):
+    for name in ("clusters.html", "link-distances.html", "shapes.html", "global-trends.html"):
         assert 'href="global-trends.html"' in (site / name).read_text(encoding="utf-8")
 
 

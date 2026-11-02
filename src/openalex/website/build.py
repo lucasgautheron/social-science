@@ -22,6 +22,8 @@ from scipy import sparse
 from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import squareform
 
+from openalex.analysis.cluster_trends import classify_cluster_list, link_distance_class
+
 DEFAULT_CLUSTER_SIMILARITY = 0.5
 DEFAULT_MIN_DOCUMENT_FREQUENCY = 10
 DEFAULT_MAX_DENDROGRAM_KEYWORDS = 500
@@ -29,9 +31,11 @@ SITE_ASSETS = (
     "index.html",
     "clusters.html",
     "link-distances.html",
+    "shapes.html",
     "global-trends.html",
     "clusters.js",
     "link-distances.js",
+    "shapes.js",
     "global-trends.js",
     "style.css",
 )
@@ -644,40 +648,6 @@ def build_cluster_list(
     return _cluster_rows(prepared, yearly_counts, papers_by_year, total_documents)
 
 
-def load_cluster_types(
-    clusters_dir: str | Path,
-    level: int,
-    trends: str | Path | None = None,
-) -> dict[int, str]:
-    """Read the six-way class of each cluster at one hierarchy level.
-
-    ``trends`` is the cluster-trends CSV. When omitted, ``cluster_trends.csv``
-    inside ``clusters_dir`` is used, and a missing file means no classes are
-    available. The class is the ``compatible`` column.
-    """
-    if trends is None:
-        path = Path(clusters_dir).expanduser().resolve() / "cluster_trends.csv"
-        if not path.is_file():
-            return {}
-    else:
-        path = Path(trends).expanduser().resolve()
-        if not path.is_file():
-            raise ValueError(f"Cluster trends not found: {path}")
-    types: dict[int, str] = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        required = {"level", "group", "compatible"}
-        if reader.fieldnames is None or not required <= set(reader.fieldnames):
-            raise ValueError(
-                f"{path} must contain columns level, group, and compatible"
-            )
-        for row in reader:
-            if int(row["level"]) != level:
-                continue
-            types[int(row["group"])] = row["compatible"]
-    return types
-
-
 def load_link_distance_summary(
     visualizations_dir: str | Path,
     clusters: Sequence[Mapping[str, Any]] | None,
@@ -1023,7 +993,6 @@ def build_website(
     new_link_visualizations_dir: str | Path | None = None,
     cluster_topic_visualizations_dir: str | Path | None = None,
     global_trends_dir: str | Path | None = None,
-    trends: str | Path | None = None,
     incidence_workers: int = 1,
 ) -> dict[str, Any]:
     artifacts = load_event_artifacts(events_dir)
@@ -1105,30 +1074,17 @@ def build_website(
             papers_by_year,
             total_documents,
         )
-    cluster_types = None
-    if (
-        (new_link_visualizations_dir is not None or cluster_topic_visualizations_dir is not None)
-        and clusters_dir is not None
-        and prepared_clusters is not None
-    ):
-        cluster_types = load_cluster_types(
-            clusters_dir,
-            int(prepared_clusters["level"]),
-            trends,
-        )
     link_distances = None
     if new_link_visualizations_dir is not None:
         link_distances = load_link_distance_summary(
             new_link_visualizations_dir,
             cluster_list,
-            cluster_types,
         )
     cluster_topics = None
     if cluster_topic_visualizations_dir is not None:
         cluster_topics = load_cluster_topic_summary(
             cluster_topic_visualizations_dir,
             cluster_list,
-            cluster_types,
         )
         topics_by_group = {
             int(row["cluster_id"]): row
@@ -1159,6 +1115,23 @@ def build_website(
             ):
                 if field in topic_row:
                     cluster[field] = topic_row[field]
+    shapes = (
+        classify_cluster_list(cluster_list, papers_by_year=papers_by_year)
+        if cluster_list
+        else None
+    )
+    collapsed_types = (
+        {}
+        if shapes is None
+        else {
+            int(row["group"]): link_distance_class(str(row["sub"]))
+            for row in shapes["series"]
+        }
+    )
+    for row in link_distances or []:
+        row["cluster_type"] = collapsed_types.get(int(row["cluster_id"]))
+    for row in cluster_topics or []:
+        row["cluster_type"] = collapsed_types.get(int(row["cluster_id"]))
     payload = {
         "meta": {
             "processed_papers": processed,
@@ -1175,6 +1148,7 @@ def build_website(
         "cluster_list": cluster_list,
         "link_distances": link_distances,
         "cluster_topics": cluster_topics,
+        "shapes": shapes,
         "global_trends": (
             load_global_trends(global_trends_dir)
             if global_trends_dir is not None
@@ -1187,6 +1161,7 @@ def build_website(
         "index.html",
         "clusters.html",
         "link-distances.html",
+        "shapes.html",
         "global-trends.html",
     }
     for stale_html in output.glob("*.html"):
@@ -1284,15 +1259,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional global-trends output used by global-trends.html.",
     )
     parser.add_argument(
-        "--trends",
-        type=Path,
-        default=None,
-        help=(
-            "cluster-trends CSV used to classify link-distance points. "
-            "Defaults to cluster_trends.csv inside --clusters-dir when that file exists."
-        ),
-    )
-    parser.add_argument(
         "--min-document-frequency",
         type=int,
         default=DEFAULT_MIN_DOCUMENT_FREQUENCY,
@@ -1339,7 +1305,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         new_link_visualizations_dir=args.new_link_visualizations_dir,
         cluster_topic_visualizations_dir=args.cluster_topic_visualizations_dir,
         global_trends_dir=args.global_trends_dir,
-        trends=args.trends,
         incidence_workers=args.incidence_workers,
     )
     print(json.dumps(summary, indent=2))

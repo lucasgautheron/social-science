@@ -36,6 +36,8 @@ REQUIRED_WEBSITE_FILES = (
     "clusters.js",
     "link-distances.html",
     "link-distances.js",
+    "shapes.html",
+    "shapes.js",
     "global-trends.html",
     "global-trends.js",
     "style.css",

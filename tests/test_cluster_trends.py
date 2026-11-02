@@ -5,383 +5,216 @@ import numpy as np
 import pytest
 
 from openalex.analysis.cluster_trends import (
-    BUMP_DECREASING,
-    BUMP_INCREASING,
-    BUMP_UNKNOWN,
-    DECREASING,
+    DECLINE_CLASSES,
     FIELDNAMES,
-    INCREASING,
-    SHOCK_LABEL,
-    STEP_LABEL,
-    TREND_DECREASING,
-    TREND_INCREASING,
-    BreakFit,
-    ClusterSeries,
-    assign_chunks,
-    break_design,
-    break_indices,
-    build_parser,
-    bump_multiplier,
-    bump_phase_labels,
-    bump_tau_prior,
-    default_events_dir,
-    laplace_log_evidence,
-    load_cluster_series,
-    posterior_model_probabilities,
-    shock_multiplier,
-    signed_labels,
-    standardize_time,
-    trend_record,
-    write_trend_csv,
+    RISE_CLASSES,
+    classify,
+    classify_cluster_list,
+    fit_cluster_trends,
+    link_distance_class,
+    log_activity,
+    topic_adjust,
 )
 from openalex.cli import COMMANDS
 
-
-def write_yearly(path, rows, manifest=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["level", "group", "year", "papers", "share"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-    if manifest is not None:
-        events = path.parent.parent / "events"
-        events.mkdir(parents=True, exist_ok=True)
-        (events / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-
-
-def fit(parameters, *, log_evidence, break_year, u_max):
-    return BreakFit(
-        log_evidence=log_evidence,
-        break_year=break_year,
-        u_max=u_max,
-        parameters={name: np.asarray(values, dtype=float) for name, values in parameters.items()},
-        divergences=0,
-        rhat_max=1.0,
-    )
+YEARS = np.arange(2010, 2026)
 
 
 def test_command_is_registered():
     assert COMMANDS["cluster-trends"] == "openalex.analysis.cluster_trends"
 
 
-def test_load_recovers_trials_and_fills_missing_years(tmp_path):
-    clusters = tmp_path / "event_clusters"
-    write_yearly(
-        clusters / "cluster_by_year.csv",
-        [
-            {"level": 0, "group": 0, "year": 2020, "papers": 20, "share": 0.2},
-            {"level": 0, "group": 0, "year": 2021, "papers": 30, "share": 0.3},
-            {"level": 0, "group": 1, "year": 2020, "papers": 10, "share": 0.1},
-            {"level": 0, "group": 1, "year": 2022, "papers": 40, "share": 0.4},
-            {"level": 1, "group": 0, "year": 2020, "papers": 5, "share": 0.05},
-        ],
-    )
-    series = load_cluster_series(clusters, level=0)
-    assert [item.group for item in series] == [0, 1]
-    assert series[0].years.tolist() == [2020, 2021, 2022]
-    assert series[0].trials.tolist() == [100, 100, 100]
-    assert series[0].successes.tolist() == [20, 30, 0]
-    assert series[1].successes.tolist() == [10, 0, 40]
+def test_constant_series_is_stable():
+    row = classify(np.zeros(YEARS.size), YEARS)
+    assert row["sub"] == "stable"
+    assert row["family"] == "smooth"
+    assert row["trend"] == pytest.approx(0.0, abs=1e-8)
+    assert row["burstiness"] == pytest.approx(0.0, abs=1e-8)
 
 
-def test_manifest_fills_a_year_with_no_cluster_hits(tmp_path):
-    clusters = tmp_path / "event_clusters"
-    write_yearly(
-        clusters / "cluster_by_year.csv",
-        [
-            {"level": 0, "group": 3, "year": 2020, "papers": 10, "share": 0.1},
-            {"level": 0, "group": 3, "year": 2021, "papers": 10, "share": 0.1},
-        ],
-        manifest={"papers_by_year": {"2019": 80, "2020": 100, "2021": 100}},
-    )
-    assert default_events_dir(clusters) == tmp_path / "events"
-    series = load_cluster_series(clusters, level=0, events_dir=tmp_path / "events")
-    assert series[0].years.tolist() == [2019, 2020, 2021]
-    assert series[0].successes.tolist() == [0, 10, 10]
-    assert series[0].trials.tolist() == [80, 100, 100]
+def test_linear_ramp_is_a_steady_rise():
+    row = classify(np.linspace(0.0, 1.5, YEARS.size), YEARS)
+    assert row["sub"] == "steady rise"
+    assert row["cls"] == "linear"
+    assert row["trend"] > 0
+    assert row["burstiness"] < 0.15
 
 
-def test_load_rejects_a_short_span_and_inconsistent_denominators(tmp_path):
-    clusters = tmp_path / "event_clusters"
-    write_yearly(
-        clusters / "cluster_by_year.csv",
-        [
-            {"level": 0, "group": 0, "year": 2020, "papers": 10, "share": 0.1},
-            {"level": 0, "group": 0, "year": 2021, "papers": 10, "share": 0.1},
-        ],
-    )
-    with pytest.raises(ValueError, match="three years"):
-        load_cluster_series(clusters, level=0)
-
-    write_yearly(
-        clusters / "cluster_by_year.csv",
-        [
-            {"level": 0, "group": 0, "year": 2020, "papers": 10, "share": 0.1},
-            {"level": 0, "group": 1, "year": 2020, "papers": 40, "share": 0.2},
-            {"level": 0, "group": 0, "year": 2021, "papers": 10, "share": 0.1},
-            {"level": 0, "group": 0, "year": 2022, "papers": 10, "share": 0.1},
-        ],
-    )
-    with pytest.raises(ValueError, match="inconsistent corpus sizes"):
-        load_cluster_series(clusters, level=0)
+def test_short_pulse_is_a_transient_shock():
+    index = np.arange(YEARS.size, dtype=float)
+    onset = 6
+    pulse = np.where(index >= onset, np.exp(-1.5 * (index - onset)), 0.0)
+    row = classify(1.4 * pulse, YEARS)
+    assert row["sub"] == "shock: transient"
+    assert row["family"] == "abrupt"
+    assert row["onset"] == 2016
+    assert row["half_life"] == pytest.approx(np.log(2) / 1.5, rel=0.05)
+    assert row["burstiness"] >= 0.15
 
 
-def test_standardized_time_has_mean_zero_and_unit_scale():
-    standardized, center, scale = standardize_time(np.array([2010, 2012, 2014]))
-    assert center == pytest.approx(2012)
-    assert standardized.mean() == pytest.approx(0)
-    assert standardized.std() == pytest.approx(1)
-    assert scale == pytest.approx(np.std([2010, 2012, 2014]))
+def test_topic_reference_removes_a_shared_trajectory():
+    length = YEARS.size
+    drift = np.linspace(-0.8, 0.8, length)
+    activity = np.vstack([drift + offset for offset in np.linspace(-0.2, 0.2, 15)])
+    distributions = [[{"topic_id": 7, "share": 1.0, "papers": 10}] for _ in range(15)]
+    adjusted = topic_adjust(activity, distributions)
+    assert np.std(adjusted, axis=1).max() == pytest.approx(0.0, abs=1e-8)
+
+    other = np.vstack([activity, np.zeros(length)])
+    other_distributions = [*distributions, []]
+    adjusted_other = topic_adjust(other, other_distributions)
+    assert np.std(adjusted_other[-1]) > 0.2
 
 
-def curves(**evidences):
-    return {
-        "trend": fit(
-            {"intercept": [1.0, 3.0], "beta": [1.0, 1.0]},
-            log_evidence=evidences["trend"],
-            break_year=2011,
-            u_max=1.5,
-        ),
-        "step": fit(
-            {"intercept": [0.0], "c": [-1.0]},
-            log_evidence=evidences["step"],
-            break_year=2012,
-            u_max=1.0,
-        ),
-        "shock": fit(
-            {"intercept": [0.0, 0.0], "c": [2.0, 2.0], "half_life": [4.0, 4.0]},
-            log_evidence=evidences["shock"],
-            break_year=2012,
-            u_max=1.0,
-        ),
-        "bump": fit(
-            {"intercept": [0.0], "amplitude": [-0.5], "width": [3.0]},
-            log_evidence=evidences["bump"],
-            break_year=2011,
-            u_max=1.0,
-        ),
-    }
+def test_log_activity_uses_the_peak_pseudocount_and_median_corpus_size():
+    count = np.array([[0.0, 10.0, 40.0]])
+    share = np.array([[0.0, 0.1, 0.2]])
+    logged = log_activity(count, share)
+    total = np.array([100.0, 100.0, 200.0])
+    total[0] = np.median([100.0, 200.0])
+    expected = np.log((count + 0.05 * 40.0) / total)
+    assert logged == pytest.approx(expected)
 
 
-def test_break_design_is_flat_through_the_shift_year():
-    time = np.array([-1.5, -0.5, 0.5, 1.5])
-    years = np.array([2010, 2011, 2012, 2013])
-    design = break_design(time, years, 1)
-    assert design.after.tolist() == [0.0, 1.0, 1.0, 1.0]
-    assert design.since[0] == 0
-    assert design.since[1] == 0
-    assert design.since[2] == pytest.approx(1.0)
-    assert design.u_max == pytest.approx(design.since[-1])
-    assert design.elapsed_years.tolist() == [0.0, 0.0, 1.0, 2.0]
-    assert design.centered_years.tolist() == [-1.0, 0.0, 1.0, 2.0]
-    assert break_indices(4).tolist() == [1, 2]
-    with pytest.raises(ValueError, match="four years"):
-        break_indices(3)
+def test_link_distance_class_collapses_rise_and_decline():
+    assert link_distance_class("steady rise") == "rise"
+    assert link_distance_class("accelerating rise") == "rise"
+    assert link_distance_class("saturating rise") == "rise"
+    assert link_distance_class("steady decline") == "decline"
+    assert link_distance_class("accelerating decline") == "decline"
+    assert link_distance_class("flattening decline") == "decline"
+    assert link_distance_class("rise then fall") == "rise then fall"
+    assert link_distance_class("shock: transient") == "shock: transient"
+    assert RISE_CLASSES.isdisjoint(DECLINE_CLASSES)
 
 
-def test_bump_center_prior_covers_years_outside_the_window():
-    years = np.arange(2010, 2026)
-    mean, scale = bump_tau_prior(years)
-    assert mean == pytest.approx(0.5 * (2010 + 2025))
-    assert scale == pytest.approx(2025 - 2010)
-    future = 2025 + (2025 - 2010)
-    assert abs(future - mean) / scale == pytest.approx(1.5)
-    with pytest.raises(ValueError, match="span"):
-        bump_tau_prior(np.array([2020.0, 2020.0]))
-
-
-def test_shock_halves_each_half_life_and_the_bump_returns_to_the_baseline():
-    assert shock_multiplier(0.0, 4.0) == pytest.approx(1.0)
-    assert shock_multiplier(4.0, 4.0) == pytest.approx(0.5)
-    assert shock_multiplier(8.0, 4.0) == pytest.approx(0.25)
-    assert bump_multiplier(0.0, 3.0) == pytest.approx(1.0)
-    assert bump_multiplier(3.0, 3.0) == pytest.approx(np.exp(-0.5))
-    assert signed_labels(np.array([0.2, -0.1, 0.0]), INCREASING, DECREASING).tolist() == [
-        INCREASING,
-        DECREASING,
-        INCREASING,
+def test_short_cluster_list_stays_unclassified():
+    clusters = [
+        {
+            "group": 0,
+            "keywords": ["alpha"],
+            "yearly": [
+                {"year": 2020, "papers": 10, "share": 0.1},
+                {"year": 2021, "papers": 12, "share": 0.1},
+            ],
+        }
     ]
-    labels = bump_phase_labels(
-        np.array([1.0, 1.0, -1.0, -1.0, 1.0]),
-        np.array([2020.0, 2010.0, 2020.0, 2010.0, 2015.0]),
-        2015.0,
-    )
-    assert labels.tolist() == [
-        BUMP_INCREASING,
-        BUMP_DECREASING,
-        BUMP_DECREASING,
-        BUMP_INCREASING,
-        BUMP_INCREASING,
-    ]
+    assert classify_cluster_list(clusters) is None
 
 
-def test_laplace_evidence_and_equal_prior_model_probabilities():
-    evidence = laplace_log_evidence(-1.0, np.array([[4.0]]))
-    assert evidence == pytest.approx(-1.0 + 0.5 * np.log(2.0 * np.pi) - np.log(2.0))
-    first, second = posterior_model_probabilities([0.0, np.log(1.0 / 3.0)])
-    assert first == pytest.approx(0.75)
-    assert second == pytest.approx(0.25)
-    tied = posterior_model_probabilities([-5.0, -5.0, -5.0, -5.0])
-    assert tied.tolist() == pytest.approx([0.25, 0.25, 0.25, 0.25])
+def test_cluster_list_payload_uses_the_leading_keyword():
+    years = list(range(2010, 2026))
+    clusters = []
+    for group in range(2):
+        yearly = []
+        for offset, year in enumerate(years):
+            papers = 1000 if group == 0 else 1000 + 80 * offset
+            yearly.append({"year": year, "papers": papers, "share": papers / 100000})
+        clusters.append(
+            {
+                "group": group,
+                "keywords": ["beta", "alpha"] if group == 0 else ["gamma"],
+                "yearly": yearly,
+            }
+        )
+    payload = classify_cluster_list(clusters)
+    assert payload is not None
+    assert payload["years"] == years
+    assert payload["series"][0]["label"] == "beta"
+    assert payload["series"][0]["keywords"] == ["beta", "alpha"]
+    assert payload["series"][0]["sub"] in DECLINE_CLASSES
+    assert payload["series"][1]["sub"] in RISE_CLASSES
+    assert len(payload["series"][1]["activity"]) == 16
 
 
-def test_trend_record_keeps_the_trend_on_a_tie_and_saves_every_family():
-    years = np.array([2010, 2011, 2012, 2013])
-    _standardized, time_mean, time_scale = standardize_time(years)
-    series = ClusterSeries(
+def test_fit_writes_the_shape_table(tmp_path):
+    clusters = tmp_path / "event_clusters"
+    clusters.mkdir()
+    years = list(range(2010, 2026))
+    with (clusters / "cluster_by_year.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["level", "group", "year", "papers", "share"],
+        )
+        writer.writeheader()
+        for year in years:
+            papers = 500
+            writer.writerow(
+                {
+                    "level": 0,
+                    "group": 3,
+                    "year": year,
+                    "papers": papers,
+                    "share": papers / 100000,
+                }
+            )
+    with (clusters / "clusters.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["level", "group", "n_keywords", "keywords"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "level": 0,
+                "group": 3,
+                "n_keywords": 2,
+                "keywords": "delta | epsilon",
+            }
+        )
+    topics = tmp_path / "topics"
+    topics.mkdir()
+    with (topics / "cluster_topic_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["cluster_id", "topic_distribution"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "cluster_id": 3,
+                "topic_distribution": json.dumps(
+                    [{"topic_id": 1, "share": 1.0, "papers": 4}]
+                ),
+            }
+        )
+
+    summary = fit_cluster_trends(
+        clusters,
         level=0,
-        group=4,
-        years=years,
-        successes=np.array([1, 2, 3, 4]),
-        trials=np.array([10, 10, 10, 10]),
+        topics_dir=topics,
     )
-    row = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        **curves(trend=0.0, step=-10.0, shock=-10.0, bump=-10.0),
-    )
-    assert row["preferred_model"] == "trend"
-    assert row["compatible"] == TREND_INCREASING
-    assert row["trend_posterior"] == pytest.approx(1.0 / (1.0 + 3.0 * np.exp(-10.0)))
-    assert row["log_bayes_factor"] == pytest.approx(10.0)
-    assert row["trend_intercept_mean"] == pytest.approx(2)
-    assert row["trend_beta_mean"] == pytest.approx(1)
-    assert row["trend_break_year"] == 2011
-    assert row["p_upward_shock"] == pytest.approx(1)
-    assert row["p_u"] == pytest.approx(1)
-    assert set(row) == set(FIELDNAMES)
-
-    tied = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        trend=fit(
-            {"intercept": [0.0], "beta": [-0.2]},
-            log_evidence=-5.0,
-            break_year=2011,
-            u_max=1.0,
-        ),
-        step=fit({"intercept": [0.0], "c": [1.0]}, log_evidence=-5.0, break_year=2012, u_max=1.0),
-        shock=fit(
-            {"intercept": [0.0], "c": [1.0], "half_life": [4.0]},
-            log_evidence=-5.0,
-            break_year=2012,
-            u_max=1.0,
-        ),
-        bump=fit(
-            {"intercept": [0.0], "amplitude": [1.0], "width": [2.0]},
-            log_evidence=-5.0,
-            break_year=2011,
-            u_max=1.0,
-        ),
-    )
-    assert tied["preferred_model"] == "trend"
-    assert tied["compatible"] == TREND_DECREASING
-    step = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        **curves(trend=-4.0, step=0.0, shock=-4.0, bump=-4.0),
-    )
-    assert step["compatible"] == STEP_LABEL
-    bump = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        **curves(trend=-4.0, step=-4.0, shock=-4.0, bump=0.0),
-    )
-    assert bump["compatible"] == BUMP_INCREASING
-    rising = fit(
-        {"intercept": [0.0], "amplitude": [1.0], "width": [3.0]},
-        log_evidence=0.0,
-        break_year=2011,
-        u_max=1.0,
-    )
-    rising_row = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        trend=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
-        step=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
-        shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
-        bump=rising,
-    )
-    assert rising_row["compatible"] == BUMP_DECREASING
-    outside = fit(
-        {"intercept": [0.0], "amplitude": [1.0], "width": [8.0]},
-        log_evidence=0.0,
-        break_year=2031.25,
-        u_max=0.0,
-    )
-    outside_row = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        trend=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
-        step=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
-        shock=curves(trend=-4.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
-        bump=outside,
-    )
-    assert outside_row["bump_break_year"] == pytest.approx(2031.25)
-    assert outside_row["compatible"] == BUMP_INCREASING
-    assert tied["log_bayes_factor"] == pytest.approx(0.0)
-    unknown = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        trend=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["trend"],
-        step=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["step"],
-        shock=curves(trend=0.0, step=-4.0, shock=-4.0, bump=-4.0)["shock"],
-        bump=None,
-    )
-    assert unknown["preferred_model"] == "bump"
-    assert unknown["compatible"] == BUMP_UNKNOWN
-    assert unknown["trend_log_evidence"] == pytest.approx(0.0)
-    assert np.isnan(unknown["bump_log_evidence"])
-    assert np.isnan(unknown["log_bayes_factor"])
-    assert np.isnan(unknown["bump_posterior"])
-    assert np.isnan(unknown["bump_break_year"])
-    assert np.isnan(unknown["p_inverted_u"])
-    assert set(unknown) == set(FIELDNAMES)
-
-
-def test_write_trend_csv_round_trips_the_header(tmp_path):
-    years = np.array([2010, 2011, 2012, 2013])
-    _standardized, time_mean, time_scale = standardize_time(years)
-    series = ClusterSeries(
-        level=0,
-        group=1,
-        years=years,
-        successes=np.array([1, 2, 3, 4]),
-        trials=np.array([10, 10, 10, 10]),
-    )
-    row = trend_record(
-        series,
-        time_mean=time_mean,
-        time_scale=time_scale,
-        **curves(trend=-8.0, step=-6.0, shock=-1.0, bump=-4.0),
-    )
-    assert row["preferred_model"] == "shock"
-    assert row["compatible"] == SHOCK_LABEL
-    destination = tmp_path / "cluster_trends.csv"
-    write_trend_csv(destination, [row])
+    destination = clusters / "cluster_trends.csv"
+    assert summary["output"] == str(destination.resolve())
+    assert summary["clusters"] == 1
     with destination.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        assert reader.fieldnames == list(FIELDNAMES)
-        stored = next(reader)
-    assert stored["preferred_model"] == "shock"
-    assert stored["compatible"] == SHOCK_LABEL
-    assert float(stored["shock_c_mean"]) == pytest.approx(2)
-    assert float(stored["shock_half_life_mean"]) == pytest.approx(4)
-    assert int(stored["shock_break_year"]) == 2012
-    assert not (tmp_path / ".cluster_trends.csv.tmp").exists()
+        rows = list(csv.DictReader(handle))
+    assert list(rows[0]) == list(FIELDNAMES)
+    assert rows[0]["group"] == "3"
+    assert rows[0]["keywords"] == "delta; epsilon"
+    assert rows[0]["sub"] == "stable"
+    assert json.loads(rows[0]["activity"])
+    assert not destination.with_name(".cluster_trends.csv.tmp").exists()
 
 
-def test_chunks_cover_every_cluster_once():
-    chunks = assign_chunks([0, 1, 2, 3, 4], 2)
-    assert chunks == [[0, 2, 4], [1, 3]]
-    assert build_parser().parse_args(["--groups", "1, 2"]).groups == (1, 2)
+def test_fit_rejects_a_short_year_grid(tmp_path):
+    clusters = tmp_path / "event_clusters"
+    clusters.mkdir()
+    with (clusters / "cluster_by_year.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["level", "group", "year", "papers", "share"],
+        )
+        writer.writeheader()
+        for year in (2020, 2021):
+            writer.writerow(
+                {
+                    "level": 0,
+                    "group": 0,
+                    "year": year,
+                    "papers": 10,
+                    "share": 0.1,
+                }
+            )
+    with pytest.raises(ValueError, match="8 years"):
+        fit_cluster_trends(clusters, level=0)

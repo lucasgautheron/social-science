@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
+from openalex.analysis.cluster_trends import SHAPE_CLASSES, link_distance_class
 from openalex.website.build import (
     aggregate_node_years,
     build_cluster_list,
@@ -135,6 +136,7 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     assert not (site_dir / "dendrogram.js").exists()
     assert (site_dir / "clusters.html").is_file()
     assert (site_dir / "link-distances.html").is_file()
+    assert (site_dir / "shapes.html").is_file()
     link_page = (site_dir / "link-distances.html").read_text(
         encoding="utf-8"
     )
@@ -152,7 +154,7 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     assert not (site_dir / "progress.html").exists()
     assert (site_dir / "data.json.gz").is_file()
     assert not (site_dir / "data.json").exists()
-    for script in ("clusters.js", "link-distances.js", "global-trends.js"):
+    for script in ("clusters.js", "link-distances.js", "shapes.js", "global-trends.js"):
         content = (site_dir / script).read_text(encoding="utf-8")
         assert 'fetchCompressedJson("data.json.gz")' in content
         assert 'new DecompressionStream("gzip")' in content
@@ -217,10 +219,6 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[],[],[],[]\n',
         encoding="utf-8",
     )
-    (clusters_dir / "cluster_trends.csv").write_text(
-        "level,group,compatible\n0,0,shock\n1,1,step\n",
-        encoding="utf-8",
-    )
 
     summary = build_website(
         event_dir,
@@ -280,34 +278,9 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         [2, 6.0],
     ]
     assert second["average_new_link_distance"] is None
-    assert first["cluster_type"] == "shock"
+    assert first["cluster_type"] is None
     assert second["cluster_type"] is None
-    external = tmp_path / "cluster_trends.csv"
-    external.write_text(
-        "level,group,compatible\n0,0,step\n",
-        encoding="utf-8",
-    )
-    build_website(
-        event_dir,
-        clusters_dir=clusters_dir,
-        new_link_visualizations_dir=plots_dir,
-        output_dir=site_dir,
-        trends=external,
-        min_document_frequency=2,
-        max_dendrogram_keywords=10,
-    )
-    labeled = read_site_payload(site_dir)
-    assert labeled["link_distances"][0]["cluster_type"] == "step"
-    with pytest.raises(ValueError, match="Cluster trends not found"):
-        build_website(
-            event_dir,
-            clusters_dir=clusters_dir,
-            new_link_visualizations_dir=plots_dir,
-            output_dir=site_dir,
-            trends=tmp_path / "missing-trends.csv",
-            min_document_frequency=2,
-            max_dendrogram_keywords=10,
-        )
+    assert payload["shapes"] is None
     script = (site_dir / "link-distances.js").read_text(encoding="utf-8")
     assert "scatter-point" in script
     assert "Connected-distance distribution" in script
@@ -324,13 +297,14 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert 'id="cluster-search"' in page
     assert 'data-measure="semantic"' in page
     for cluster_type in (
-        "trend increasing",
-        "trend decreasing",
-        "step",
-        "shock",
-        "bump increasing",
-        "bump decreasing",
-        "bump unknown",
+        "stable",
+        "rise",
+        "decline",
+        "rise then fall",
+        "fall then rise",
+        "shock: transient",
+        "shock: lasting",
+        "abrupt drop",
     ):
         assert f'data-cluster-type="{cluster_type}"' in page
     assert "matchesType" in script
@@ -378,10 +352,6 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
         '""papers"":1,""share"":1.0}]",1,0,1,1.0,0.0,1.0,nan,1,0,1,nan,[]\n',
         encoding="utf-8",
     )
-    (clusters_dir / "cluster_trends.csv").write_text(
-        "level,group,compatible\n0,0,shock\n",
-        encoding="utf-8",
-    )
 
     summary = build_website(
         event_dir,
@@ -397,7 +367,7 @@ def test_cluster_topic_summary_joins_histograms_and_diversity(tmp_path):
     first, second = payload["cluster_topics"]
     assert first["cluster_id"] == 0
     assert first["rao_stirling_diversity"] == pytest.approx(0.375)
-    assert first["cluster_type"] == "shock"
+    assert first["cluster_type"] is None
     assert [item["topic_id"] for item in first["topic_distribution"]] == [1, 0, 2]
     assert first["author_rao_stirling_diversity"] == pytest.approx(0.42)
     assert first["author_within_collaboration_diversity"] == pytest.approx(
@@ -665,3 +635,88 @@ def test_sharded_incidence_counts_each_paper_once(tmp_path):
         workers=2,
     )
     assert parallel == counts
+
+
+def test_long_year_grid_adds_shape_classes_and_collapsed_filters(tmp_path):
+    event_dir = tmp_path / "events"
+    clusters_dir = tmp_path / "clusters"
+    plots_dir = tmp_path / "plots"
+    site_dir = tmp_path / "site"
+    write_event_fixture(event_dir)
+    write_cluster_fixture(clusters_dir)
+    manifest_path = event_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["papers_by_year"] = {str(year): 10 for year in range(2010, 2026)}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    plots_dir.mkdir()
+    integer_fields = (
+        "paper_count",
+        "new_link_connected_count",
+        "new_link_disconnected_count",
+        "all_link_connected_count",
+        "all_link_disconnected_count",
+        "all_link_existing_count",
+        "all_link_observation_count",
+        "first_semantic_link_observation_count",
+        "first_semantic_link_missing_embedding_count",
+        "first_semantic_link_distance_sample_count",
+        "semantic_link_observation_count",
+        "semantic_link_missing_embedding_count",
+        "semantic_link_distance_sample_count",
+    )
+    distance_fields = (
+        "average_new_link_distance",
+        "average_all_link_distance",
+        "average_first_semantic_link_distance",
+        "average_semantic_link_distance",
+    )
+    distribution_fields = (
+        "new_link_distance_distribution",
+        "all_link_distance_distribution",
+        "new_link_baseline_distance_distribution",
+        "all_link_baseline_distance_distribution",
+        "first_semantic_link_distance_distribution",
+        "first_semantic_link_baseline_distance_distribution",
+        "semantic_link_distance_distribution",
+        "semantic_link_baseline_distance_distribution",
+    )
+    header = ["cluster_id", "label", *integer_fields, *distance_fields, *distribution_fields]
+    lines = [",".join(header)]
+    for cluster_id, label in ((0, "beta"), (1, "gamma")):
+        row = {name: "0" for name in header}
+        row["cluster_id"] = str(cluster_id)
+        row["label"] = label
+        for name in distance_fields:
+            row[name] = "1.5"
+        for name in distribution_fields:
+            row[name] = "[]"
+        lines.append(",".join(row[name] for name in header))
+    (plots_dir / "cluster_link_distance_summary.csv").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+    build_website(
+        event_dir,
+        clusters_dir=clusters_dir,
+        new_link_visualizations_dir=plots_dir,
+        output_dir=site_dir,
+        min_document_frequency=2,
+        max_dendrogram_keywords=10,
+    )
+    payload = read_site_payload(site_dir)
+    shapes = payload["shapes"]
+    assert shapes["years"] == list(range(2010, 2026))
+    assert {row["label"] for row in shapes["series"]} == {"beta", "gamma"}
+    collapsed = {}
+    for row in shapes["series"]:
+        assert row["sub"] in SHAPE_CLASSES
+        assert len(row["activity"]) == 16
+        collapsed[row["group"]] = link_distance_class(row["sub"])
+    for row in payload["link_distances"]:
+        assert row["cluster_type"] == collapsed[row["cluster_id"]]
+    page = (site_dir / "shapes.html").read_text(encoding="utf-8")
+    script = (site_dir / "shapes.js").read_text(encoding="utf-8")
+    assert "Hover a point or a curve" in page
+    assert "pointermove" in script
+    assert 'href="shapes.html"' in (site_dir / "link-distances.html").read_text(encoding="utf-8")
