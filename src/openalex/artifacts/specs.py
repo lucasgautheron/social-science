@@ -18,6 +18,10 @@ class InputSpec:
 COMMAND_INPUTS: dict[str, tuple[InputSpec, ...]] = {
     "author-embeddings": (InputSpec("--embeddings-dir", "output/embeddings"),),
     "author-topics": (InputSpec("--topics-dir", "output/topics"),),
+    "global-trends": (
+        InputSpec("--topics-dir", "output/topics"),
+        InputSpec("--author-topics-dir", "output/author_topics"),
+    ),
     "cluster-events": (InputSpec("--events-dir", "output/events"),),
     "new-links": (
         InputSpec("--events-dir"),
@@ -64,6 +68,7 @@ def dependency_paths(command: str, argv: Sequence[str]) -> list[str]:
             "--filtered-dir",
             "--new-link-visualizations-dir",
             "--cluster-topic-visualizations-dir",
+            "--global-trends-dir",
         ):
             value = _option_value(argv, flag)
             if value and value not in paths:
@@ -73,7 +78,7 @@ def dependency_paths(command: str, argv: Sequence[str]) -> list[str]:
 
 def validate_dependency(command: str, argv: Sequence[str], path: str | Path) -> None:
     validation = validate_artifact(path)
-    if command != "visualize-cluster-topics":
+    if command not in {"visualize-cluster-topics", "global-trends"}:
         return
     topics_path = _option_value(argv, "--topics-dir") or "output/topics"
     if Path(path) != Path(topics_path):

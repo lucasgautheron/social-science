@@ -250,6 +250,31 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
         ("cluster_topic_summary.csv",),
     ),
     StageSpec(
+        "global-trends",
+        "output/global_trends",
+        "cpu",
+        1,
+        (
+            ("topics", "topics"),
+            ("author_topics", "author-topics"),
+        ),
+        (
+            "openalex",
+            "global-trends",
+            "--db-path",
+            "articles.db",
+            "--topics-dir",
+            "output/topics",
+            "--author-topics-dir",
+            "output/author_topics",
+            "--output-dir",
+            "output/global_trends",
+            "--break-year",
+            "2022",
+        ),
+        ("series.json",),
+    ),
+    StageSpec(
         "build-website",
         "output/website",
         "cpu",
@@ -262,6 +287,7 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
                 "cluster_topic_visualizations",
                 "visualize-cluster-topics",
             ),
+            ("global_trends", "global-trends"),
         ),
         (
             "openalex",
@@ -274,6 +300,8 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
             "output/new_link_visualizations",
             "--cluster-topic-visualizations-dir",
             "output/cluster_topic_visualizations",
+            "--global-trends-dir",
+            "output/global_trends",
             "--db-path",
             "articles.db",
             "--output-dir",
@@ -515,6 +543,15 @@ def _adopted_manifest(stage: StageSpec, root: Path) -> dict[str, Any]:
         return {
             "summary": "cluster_topic_summary.csv",
             "cluster_count": cluster_count,
+        }
+    if stage.name == "global-trends":
+        series = json.loads((root / "series.json").read_text(encoding="utf-8"))
+        return {
+            "series": "series.json",
+            "break_year": int(series.get("break_year", 2022)),
+            "year_count": len(series.get("years", [])),
+            "complete": True,
+            "adopted_without_corpus_provenance": True,
         }
     raise ArtifactValidationError(f"{stage.name} cannot adopt a local payload")
 

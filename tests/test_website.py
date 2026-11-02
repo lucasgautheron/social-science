@@ -152,7 +152,7 @@ def test_website_pages_and_exact_paper_unions(tmp_path):
     assert not (site_dir / "progress.html").exists()
     assert (site_dir / "data.json.gz").is_file()
     assert not (site_dir / "data.json").exists()
-    for script in ("clusters.js", "link-distances.js"):
+    for script in ("clusters.js", "link-distances.js", "global-trends.js"):
         content = (site_dir / script).read_text(encoding="utf-8")
         assert 'fetchCompressedJson("data.json.gz")' in content
         assert 'new DecompressionStream("gzip")' in content

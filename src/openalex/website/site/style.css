@@ -304,8 +304,20 @@ nav a[aria-current="page"] { color: #fff; background: var(--accent); }
 }
 .baseline-series { fill: none; stroke: #b16b3b; stroke-width: 2; }
 .baseline-point { fill: #fff; stroke: #b16b3b; stroke-width: 1.5; }
+.trend-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.trend-panel h2 { margin: 0 0 .35rem; font-size: 1rem; }
+.trend-chart { display: block; width: 100%; height: auto; }
+.trend-axis, .trend-break { stroke: var(--line); stroke-width: 1.5; }
+.trend-observed { fill: none; stroke: var(--accent); stroke-width: 2.5; }
+.trend-expected { fill: none; stroke: #b16b3b; stroke-width: 2; stroke-dasharray: 5 4; }
+.trend-point { fill: var(--accent); }
+.trend-label { font-size: 11px; font-weight: 650; }
+.trend-label.observed { fill: var(--accent); }
+.trend-label.expected { fill: #b16b3b; }
+.trend-label.break { fill: var(--muted); font-size: 10px; font-weight: 700; }
 
 @media (max-width: 800px) {
+  .trend-grid { grid-template-columns: 1fr; }
   .app { height: auto; min-height: 100vh; }
   .toolbar { align-items: start; flex-direction: column; gap: .75rem; }
   .details { border-top: 1px solid var(--line); border-left: 0; }

@@ -189,6 +189,8 @@ def test_website_pipeline_graph_and_workers_are_deterministic():
     assert names.index("embeddings") < names.index("topics")
     assert names.index("author-embeddings") < names.index("new-links")
     assert names.index("new-links") < names.index("visualize-new-links")
+    assert names.index("author-topics") < names.index("global-trends")
+    assert names.index("global-trends") < names.index("build-website")
     assert names[-1] == "build-website"
     assert STAGES["embeddings"].worker == "gpu"
     assert all(

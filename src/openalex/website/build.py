@@ -29,8 +29,10 @@ SITE_ASSETS = (
     "index.html",
     "clusters.html",
     "link-distances.html",
+    "global-trends.html",
     "clusters.js",
     "link-distances.js",
+    "global-trends.js",
     "style.css",
 )
 
@@ -811,6 +813,26 @@ def load_link_distance_summary(
     return rows
 
 
+def load_global_trends(trends_dir: str | Path) -> dict[str, Any]:
+    """Load the yearly collaborator-topic series."""
+    root = Path(trends_dir).expanduser().resolve()
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Global-trends manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not bool(manifest.get("complete")):
+        raise ValueError(f"Global-trends artifact is incomplete: {manifest_path}")
+    if int(manifest.get("artifact_version", 0)) < 1:
+        raise ValueError("Global-trends artifacts must use artifact version 1 or newer")
+    series_path = root / str(manifest.get("series", "series.json"))
+    if not series_path.is_file():
+        raise ValueError(f"Global-trends series not found: {series_path}")
+    series = json.loads(series_path.read_text(encoding="utf-8"))
+    if not isinstance(series.get("years"), list):
+        raise ValueError(f"Global-trends series has no years: {series_path}")
+    return series
+
+
 def load_cluster_topic_summary(
     visualizations_dir: str | Path,
     clusters: Sequence[Mapping[str, Any]] | None,
@@ -1000,6 +1022,7 @@ def build_website(
     db_path: str | Path | None = None,
     new_link_visualizations_dir: str | Path | None = None,
     cluster_topic_visualizations_dir: str | Path | None = None,
+    global_trends_dir: str | Path | None = None,
     trends: str | Path | None = None,
     incidence_workers: int = 1,
 ) -> dict[str, Any]:
@@ -1152,6 +1175,11 @@ def build_website(
         "cluster_list": cluster_list,
         "link_distances": link_distances,
         "cluster_topics": cluster_topics,
+        "global_trends": (
+            load_global_trends(global_trends_dir)
+            if global_trends_dir is not None
+            else None
+        ),
     }
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -1159,6 +1187,7 @@ def build_website(
         "index.html",
         "clusters.html",
         "link-distances.html",
+        "global-trends.html",
     }
     for stale_html in output.glob("*.html"):
         if stale_html.name not in expected_html:
@@ -1191,6 +1220,11 @@ def build_website(
         ),
         "topic_clusters": (
             0 if payload["cluster_topics"] is None else len(payload["cluster_topics"])
+        ),
+        "global_trend_years": (
+            0
+            if payload["global_trends"] is None
+            else len(payload["global_trends"]["years"])
         ),
         "keyword_filter": payload["meta"]["keyword_filter"],
         "genuine_keywords": None if allowed is None else len(allowed),
@@ -1242,6 +1276,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional visualize-cluster-topics output used for topic histograms "
             "and diversity."
         ),
+    )
+    parser.add_argument(
+        "--global-trends-dir",
+        type=Path,
+        default=None,
+        help="Optional global-trends output used by global-trends.html.",
     )
     parser.add_argument(
         "--trends",
@@ -1298,6 +1338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         db_path=args.db_path,
         new_link_visualizations_dir=args.new_link_visualizations_dir,
         cluster_topic_visualizations_dir=args.cluster_topic_visualizations_dir,
+        global_trends_dir=args.global_trends_dir,
         trends=args.trends,
         incidence_workers=args.incidence_workers,
     )
