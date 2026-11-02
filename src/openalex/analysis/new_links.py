@@ -49,6 +49,7 @@ DEFAULT_CLUSTER_SAMPLE = 2_000
 DEFAULT_BASELINE_SAMPLE = 2_000
 DEFAULT_SAMPLING_SEED = 0
 DEFAULT_CACHE_MB = 2048
+SEMANTIC_VECTOR_BATCH_SIZE = 100_000
 AUTHOR_EMBEDDING_ARTIFACT_VERSION = 1
 AUTHOR_EMBEDDING_DATABASE = "author_embeddings.db"
 AUTHOR_EMBEDDING_ENCODING = "little-endian-float32"
@@ -151,9 +152,14 @@ class ClusterExcludedEmbeddingStore:
         self._global_profiles: dict[int, tuple[np.ndarray, float]] = {}
         self._unit_vectors: dict[tuple[int, int], np.ndarray] = {}
         self._unavailable_vectors: set[tuple[int, int]] = set()
+        self._unavailable_link_indices: list[set[int]] = [
+            set() for _ in range(cluster_count)
+        ]
         self._direct_author_papers: dict[
             int, list[tuple[int, int, np.ndarray]]
         ] = {}
+        self._direct_recomputation_count = 0
+        self._undefined_profile_count = 0
 
     def _invalid_indices(
         self,
@@ -198,7 +204,7 @@ class ClusterExcludedEmbeddingStore:
                     and int(self.link_author_ids[link_position]) == author
                 ):
                     invalid.append(link_position)
-            result.append(np.asarray(invalid, dtype=np.int32))
+            result.append(np.sort(np.asarray(invalid, dtype=np.int32)))
         return result
 
     def covered_pairs(
@@ -214,23 +220,17 @@ class ClusterExcludedEmbeddingStore:
         right_ids = self.link_author_ids[right]
         covered = _authors_present(self.base.author_ids, left_ids)
         covered &= _authors_present(self.base.author_ids, right_ids)
-        for cluster_value in np.unique(pair_clusters):
-            cluster = int(cluster_value)
-            if cluster < 0 or cluster >= self.cluster_count:
-                raise ValueError(f"Invalid semantic cluster id {cluster}")
-            members = pair_clusters == cluster
-            invalid = self.invalid_link_indices[cluster]
+        grouped, offsets = _group_indices_by_cluster(
+            pair_clusters,
+            np.ones(pair_clusters.size, dtype=bool),
+            self.cluster_count,
+        )
+        for cluster in np.flatnonzero(np.diff(offsets)):
+            members = grouped[offsets[cluster] : offsets[cluster + 1]]
+            invalid = self.invalid_indices_for_cluster(int(cluster))
             if invalid.size:
-                covered[members] &= ~_sorted_contains(
-                    invalid, left[members]
-                )
-                covered[members] &= ~_sorted_contains(
-                    invalid, right[members]
-                )
-        for cluster, author in self._unavailable_vectors:
-            members = pair_clusters == cluster
-            covered[members] &= left_ids[members] != author
-            covered[members] &= right_ids[members] != author
+                covered[members] &= ~_sorted_contains(invalid, left[members])
+                covered[members] &= ~_sorted_contains(invalid, right[members])
         return covered
 
     def covered_pairs_for_cluster(
@@ -242,6 +242,16 @@ class ClusterExcludedEmbeddingStore:
             pair_keys,
             np.full(pair_keys.size, cluster, dtype=np.int32),
         )
+
+    def invalid_indices_for_cluster(self, cluster: int) -> np.ndarray:
+        invalid = self.invalid_link_indices[cluster]
+        discovered = self._unavailable_link_indices[cluster]
+        if not discovered:
+            return invalid
+        return np.union1d(
+            invalid,
+            np.fromiter(discovered, dtype=np.int32),
+        ).astype(np.int32, copy=False)
 
     def distances(
         self,
@@ -286,35 +296,37 @@ class ClusterExcludedEmbeddingStore:
         )
         result = np.full(pair_keys.size, np.nan, dtype=np.float32)
         if np.any(available):
-            first = np.vstack(
-                [
-                    self._unit_vectors[
-                        (int(cluster), int(self.link_author_ids[index]))
+            for batch in _chunks(
+                np.flatnonzero(available),
+                SEMANTIC_VECTOR_BATCH_SIZE,
+            ):
+                first = np.vstack(
+                    [
+                        self._unit_vectors[
+                            (
+                                int(pair_clusters[position]),
+                                int(self.link_author_ids[left[position]]),
+                            )
+                        ]
+                        for position in batch
                     ]
-                    for cluster, index in zip(
-                        pair_clusters[available],
-                        left[available],
-                        strict=True,
-                    )
-                ]
-            )
-            second = np.vstack(
-                [
-                    self._unit_vectors[
-                        (int(cluster), int(self.link_author_ids[index]))
+                )
+                second = np.vstack(
+                    [
+                        self._unit_vectors[
+                            (
+                                int(pair_clusters[position]),
+                                int(self.link_author_ids[right[position]]),
+                            )
+                        ]
+                        for position in batch
                     ]
-                    for cluster, index in zip(
-                        pair_clusters[available],
-                        right[available],
-                        strict=True,
-                    )
-                ]
-            )
-            similarity = np.einsum("ij,ij->i", first, second)
-            result[available] = np.asarray(
-                np.clip(1.0 - similarity, 0.0, 2.0),
-                dtype=np.float32,
-            )
+                )
+                similarity = np.einsum("ij,ij->i", first, second)
+                result[batch] = np.asarray(
+                    np.clip(1.0 - similarity, 0.0, 2.0),
+                    dtype=np.float32,
+                )
         return result
 
     def _prepare_vectors(
@@ -355,6 +367,7 @@ class ClusterExcludedEmbeddingStore:
                 np.asarray(sorted(needed_papers), dtype=np.int64)
             ]
         )
+        unstable: list[tuple[int, int]] = []
         for key in missing:
             cluster, author = key
             global_vector, total_weight = self._global_profiles[author]
@@ -381,29 +394,55 @@ class ClusterExcludedEmbeddingStore:
                 remaining -= contribution
             norm = float(np.linalg.norm(remaining))
             if norm <= max(1e-12, 1e-6 * cancellation_scale):
-                logger.warning(
+                self._direct_recomputation_count += 1
+                logger.debug(
                     "Recomputing cluster-excluded embedding directly for "
                     "author %s in cluster %s after float32 cancellation",
                     author,
                     cluster,
                 )
-                remaining, direct_scale = self._direct_remaining_vector(
-                    author,
-                    papers_by_key[key],
-                )
-                norm = float(np.linalg.norm(remaining))
-                if norm <= max(1e-12, 1e-6 * direct_scale):
-                    logger.warning(
-                        "Excluding undefined cluster-excluded embedding for "
-                        "author %s in cluster %s",
-                        author,
-                        cluster,
-                    )
-                    self._unavailable_vectors.add(key)
-                    continue
+                unstable.append(key)
+                continue
             self._unit_vectors[key] = np.asarray(
                 remaining / norm,
                 dtype=np.float32,
+            )
+
+        self._load_direct_author_papers(
+            {author for _, author in unstable}
+        )
+        for key in unstable:
+            cluster, author = key
+            remaining, direct_scale = self._direct_remaining_vector(
+                author,
+                papers_by_key[key],
+            )
+            norm = float(np.linalg.norm(remaining))
+            if norm <= max(1e-12, 1e-6 * direct_scale):
+                self._undefined_profile_count += 1
+                logger.debug(
+                    "Excluding undefined cluster-excluded embedding for "
+                    "author %s in cluster %s",
+                    author,
+                    cluster,
+                )
+                self._unavailable_vectors.add(key)
+                self._unavailable_link_indices[cluster].add(
+                    int(np.searchsorted(self.link_author_ids, author))
+                )
+                continue
+            self._unit_vectors[key] = np.asarray(
+                remaining / norm,
+                dtype=np.float32,
+            )
+
+    def log_fallback_summary(self) -> None:
+        if self._direct_recomputation_count:
+            logger.info(
+                "Directly recomputed %s numerically unstable "
+                "cluster-excluded author profiles; excluded %s undefined profiles",
+                self._direct_recomputation_count,
+                self._undefined_profile_count,
             )
 
     def _direct_remaining_vector(
@@ -415,45 +454,9 @@ class ClusterExcludedEmbeddingStore:
             int(self.event_ids[paper_index])
             for paper_index in excluded_paper_positions
         }
-        papers = self._direct_author_papers.get(author)
-        if papers is None:
-            with _connect_readonly(self.source_database) as connection:
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT target.article_id, COUNT(coauthor.author_id)
-                        FROM articles_authors target
-                        JOIN articles_authors coauthor
-                          ON coauthor.article_id = target.article_id
-                        WHERE target.author_id = ?
-                        GROUP BY target.article_id
-                        ORDER BY target.article_id
-                        """,
-                        (author,),
-                    )
-                )
-            author_counts = {
-                int(article_id): int(author_count)
-                for article_id, author_count in rows
-            }
-            vectors = self.articles.get_embeddings_batch(author_counts)
-            papers = []
-            for article_id, author_count in author_counts.items():
-                vector = vectors.get(article_id)
-                if vector is None:
-                    continue
-                if np.any(~np.isfinite(vector)):
-                    raise ValueError(
-                        f"Article embedding {article_id} contains non-finite values"
-                    )
-                papers.append(
-                    (
-                        article_id,
-                        author_count,
-                        np.asarray(vector, dtype=np.float64),
-                    )
-                )
-            self._direct_author_papers[author] = papers
+        if author not in self._direct_author_papers:
+            self._load_direct_author_papers({author})
+        papers = self._direct_author_papers[author]
         remaining = np.zeros(self.base.dimension, dtype=np.float64)
         scale = 0.0
         for article_id, author_count, vector in papers:
@@ -462,6 +465,71 @@ class ClusterExcludedEmbeddingStore:
                 remaining += contribution
                 scale += float(np.linalg.norm(contribution))
         return remaining, scale
+
+    def _load_direct_author_papers(self, authors: set[int]) -> None:
+        missing = sorted(authors - self._direct_author_papers.keys())
+        if not missing:
+            return
+        counts_by_author: dict[int, dict[int, int]] = {
+            author: {} for author in missing
+        }
+        with _connect_readonly(self.source_database) as connection:
+            # The corpus is opened in SQLite read-only mode, so disabling
+            # query_only only permits this connection's temporary table.
+            connection.execute("PRAGMA query_only = OFF")
+            connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute(
+                """
+                CREATE TEMP TABLE requested_authors(
+                    author_id INTEGER PRIMARY KEY
+                ) WITHOUT ROWID
+                """
+            )
+            connection.executemany(
+                "INSERT INTO requested_authors(author_id) VALUES (?)",
+                [(author,) for author in missing],
+            )
+            rows = connection.execute(
+                """
+                SELECT target.author_id, target.article_id,
+                       COUNT(coauthor.author_id)
+                FROM articles_authors target
+                JOIN requested_authors requested
+                  ON requested.author_id = target.author_id
+                JOIN articles_authors coauthor
+                  ON coauthor.article_id = target.article_id
+                GROUP BY target.author_id, target.article_id
+                ORDER BY target.author_id, target.article_id
+                """
+            )
+            for author, article_id, author_count in rows:
+                counts_by_author[int(author)][int(article_id)] = int(
+                    author_count
+                )
+        article_ids = {
+            article_id
+            for author_counts in counts_by_author.values()
+            for article_id in author_counts
+        }
+        vectors = self.articles.get_embeddings_batch(article_ids)
+        for author, author_counts in counts_by_author.items():
+            papers = []
+            for article_id, author_count in author_counts.items():
+                vector = vectors.get(article_id)
+                if vector is not None:
+                    if np.any(~np.isfinite(vector)):
+                        raise ValueError(
+                            f"Article embedding {article_id} contains "
+                            "non-finite values"
+                        )
+                    papers.append(
+                        (
+                            article_id,
+                            author_count,
+                            np.asarray(vector, dtype=np.float64),
+                        )
+                    )
+            self._direct_author_papers[author] = papers
 
     def _load_global_profiles(self, author_ids: np.ndarray) -> None:
         requested = [
@@ -787,6 +855,7 @@ def build_new_links(
             time.perf_counter() - started,
         )
 
+    semantic_embeddings.log_fallback_summary()
     _save_cluster_reservoir(
         output / "cluster_distance_reservoir.npz",
         cluster_reservoirs,
@@ -1727,8 +1796,15 @@ def _sample_links(
 
     cluster_stats: dict[str, dict[str, int | float]] = {}
     clustered_population = 0
-    for cluster in np.unique(cluster_id[cluster_id >= 0]):
-        members = np.flatnonzero(cluster_id == cluster)
+    grouped, offsets = _group_indices_by_cluster(
+        cluster_id,
+        cluster_id >= 0,
+        int(cluster_id[cluster_id >= 0].max()) + 1
+        if np.any(cluster_id >= 0)
+        else 0,
+    )
+    for cluster in np.flatnonzero(np.diff(offsets)):
+        members = grouped[offsets[cluster] : offsets[cluster + 1]]
         cluster_population = int(members.size)
         cluster_sample_size = min(cluster_sample, cluster_population)
         sampled = _uniform_sample(
@@ -1776,6 +1852,30 @@ def _uniform_sample(
         indices.size, size=sample_size, replace=False, shuffle=False
     )
     return indices[positions]
+
+
+def _group_indices_by_cluster(
+    cluster_ids: np.ndarray,
+    selected: np.ndarray,
+    cluster_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Group selected record indices once instead of rescanning per cluster."""
+    indices = np.flatnonzero(selected)
+    if indices.size:
+        labels = cluster_ids[indices]
+        if np.any(labels < 0) or np.any(labels >= cluster_count):
+            raise ValueError("Selected cluster ids are out of range")
+        if labels.size > 1 and np.any(labels[1:] < labels[:-1]):
+            order = np.argsort(labels, kind="stable")
+            indices = indices[order]
+            labels = labels[order]
+        counts = np.bincount(labels, minlength=cluster_count)
+    else:
+        counts = np.zeros(cluster_count, dtype=np.int64)
+    offsets = np.empty(cluster_count + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    return indices, offsets
 
 
 def _author_columns(author_ids: np.ndarray, authors: np.ndarray, year: int) -> np.ndarray:
@@ -2009,10 +2109,15 @@ def _sample_cluster_observations(
         + existing
         + connected_new
     )
+    grouped_candidates, candidate_offsets = _group_indices_by_cluster(
+        event_clusters,
+        connected_records,
+        cluster_count,
+    )
     for cluster in range(cluster_count):
-        candidates = np.flatnonzero(
-            connected_records & (event_clusters == cluster)
-        )
+        candidates = grouped_candidates[
+            candidate_offsets[cluster] : candidate_offsets[cluster + 1]
+        ]
         previous_population = int(cluster_observation_population[cluster])
         current_population = int(candidates.size)
         total_population = previous_population + current_population
@@ -2119,33 +2224,154 @@ def _sorted_contains(
     return present
 
 
-def _sample_semantic_reference(
-    pair_occurrences: np.ndarray,
+def _pair_positions_by_author(
+    left: np.ndarray,
+    right: np.ndarray,
+    author_indices: np.ndarray,
+) -> dict[int, np.ndarray]:
+    positions_by_author: dict[int, list[np.ndarray]] = defaultdict(list)
+    if author_indices.size == 0:
+        return {}
+    for endpoints in (left, right):
+        selected = np.flatnonzero(
+            _sorted_contains(author_indices, endpoints)
+        )
+        if selected.size == 0:
+            continue
+        labels = endpoints[selected]
+        order = np.argsort(labels, kind="stable")
+        selected = selected[order]
+        labels = labels[order]
+        starts = np.flatnonzero(
+            np.concatenate(
+                (
+                    np.asarray([True]),
+                    labels[1:] != labels[:-1],
+                )
+            )
+        )
+        stops = np.append(starts[1:], labels.size)
+        for start, stop in zip(starts, stops, strict=True):
+            positions_by_author[int(labels[start])].append(
+                selected[start:stop]
+            )
+    return {
+        author: (
+            parts[0]
+            if len(parts) == 1
+            else np.concatenate(parts)
+        )
+        for author, parts in positions_by_author.items()
+    }
+
+
+def _uniform_sample_excluding(
+    population_indices: np.ndarray,
+    excluded_indices: np.ndarray,
+    sample_size: int,
+    seed_components: Sequence[int],
+) -> np.ndarray:
+    population = int(population_indices.size - excluded_indices.size)
+    retained_size = min(sample_size, population)
+    if retained_size == 0:
+        return np.empty(0, dtype=np.int64)
+    if excluded_indices.size == 0:
+        return _uniform_sample(
+            population_indices,
+            retained_size,
+            seed_components,
+        )
+    if retained_size == population or population * 4 < population_indices.size:
+        eligible = np.setdiff1d(
+            population_indices,
+            excluded_indices,
+            assume_unique=True,
+        )
+        return _uniform_sample(
+            eligible,
+            retained_size,
+            seed_components,
+        )
+
+    excluded = {int(index) for index in excluded_indices}
+    selected_slots: set[int] = set()
+    retained: list[int] = []
+    rng = np.random.default_rng(
+        np.random.SeedSequence(list(seed_components))
+    )
+    while len(retained) < retained_size:
+        remaining = retained_size - len(retained)
+        slots = rng.integers(
+            0,
+            population_indices.size,
+            size=max(32, remaining * 2),
+        )
+        for slot_value in slots:
+            slot = int(slot_value)
+            if slot in selected_slots:
+                continue
+            occurrence = int(population_indices[slot])
+            if occurrence in excluded:
+                continue
+            selected_slots.add(slot)
+            retained.append(occurrence)
+            if len(retained) == retained_size:
+                break
+    return np.asarray(retained, dtype=np.int64)
+
+
+def _sample_cluster_excluded_reference(
+    pair_keys: np.ndarray,
     semantic_embeddings: ClusterExcludedEmbeddingStore,
     cluster_count: int,
     sample_size: int,
-    sampling_seed: int,
-    year: int,
+    seed_components: Sequence[int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample leave-cluster-out covered occurrences for each cluster null."""
+    left, right = _decode_pairs(pair_keys)
+    base_covered = _embedding_covered_pairs(
+        pair_keys,
+        semantic_embeddings.link_author_ids,
+        semantic_embeddings.base.author_ids,
+    )
+    base_indices = np.flatnonzero(base_covered)
+    invalid_by_cluster = [
+        semantic_embeddings.invalid_indices_for_cluster(cluster)
+        for cluster in range(cluster_count)
+    ]
+    invalid_union = (
+        np.unique(np.concatenate(invalid_by_cluster))
+        if any(values.size for values in invalid_by_cluster)
+        else np.empty(0, dtype=np.int32)
+    )
+    incident_positions = _pair_positions_by_author(
+        left,
+        right,
+        invalid_union,
+    )
+
     sampled_keys: list[np.ndarray] = []
     sampled_clusters: list[np.ndarray] = []
     populations = np.zeros(cluster_count, dtype=np.int64)
-    for cluster in range(cluster_count):
-        eligible = np.flatnonzero(
-            semantic_embeddings.covered_pairs_for_cluster(
-                pair_occurrences,
-                cluster,
-            )
-        )
-        population = int(eligible.size)
+    for cluster, invalid in enumerate(invalid_by_cluster):
+        parts = [
+            incident_positions[int(author)]
+            for author in invalid
+            if int(author) in incident_positions
+        ]
+        if parts:
+            excluded = np.unique(np.concatenate(parts))
+            excluded = excluded[base_covered[excluded]]
+        else:
+            excluded = np.empty(0, dtype=np.int64)
+        population = int(base_indices.size - excluded.size)
         populations[cluster] = population
-        retained = _uniform_sample(
-            eligible,
+        retained = _uniform_sample_excluding(
+            base_indices,
+            excluded,
             min(sample_size, population),
-            [sampling_seed, int(year), 5, cluster],
+            [*seed_components, cluster],
         )
-        sampled_keys.append(pair_occurrences[retained])
+        sampled_keys.append(pair_keys[retained])
         sampled_clusters.append(
             np.full(retained.size, cluster, dtype=np.int32)
         )
@@ -2157,6 +2383,24 @@ def _sample_semantic_reference(
         if sampled_clusters
         else np.empty(0, dtype=np.int32),
         populations,
+    )
+
+
+def _sample_semantic_reference(
+    pair_occurrences: np.ndarray,
+    semantic_embeddings: ClusterExcludedEmbeddingStore,
+    cluster_count: int,
+    sample_size: int,
+    sampling_seed: int,
+    year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample leave-cluster-out covered occurrences for each cluster null."""
+    return _sample_cluster_excluded_reference(
+        pair_occurrences,
+        semantic_embeddings,
+        cluster_count,
+        sample_size,
+        [sampling_seed, int(year), 5],
     )
 
 
@@ -2192,10 +2436,15 @@ def _sample_first_semantic_observations(
     ).astype(np.int64)
     sampled_indices: list[np.ndarray] = []
     weights: list[np.ndarray] = []
+    grouped_candidates, candidate_offsets = _group_indices_by_cluster(
+        candidate_clusters,
+        covered,
+        cluster_count,
+    )
     for cluster in range(cluster_count):
-        candidates = np.flatnonzero(
-            covered & (candidate_clusters == cluster)
-        )
+        candidates = grouped_candidates[
+            candidate_offsets[cluster] : candidate_offsets[cluster + 1]
+        ]
         retained = _uniform_sample(
             candidates,
             min(sample_size, candidates.size),
@@ -2243,34 +2492,12 @@ def _sample_first_semantic_reference(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sample first links outside clusters for each cluster-specific null."""
     candidates = new_keys[attributed_clusters < 0]
-    sampled_keys: list[np.ndarray] = []
-    sampled_clusters: list[np.ndarray] = []
-    populations = np.zeros(cluster_count, dtype=np.int64)
-    for cluster in range(cluster_count):
-        eligible = np.flatnonzero(
-            semantic_embeddings.covered_pairs_for_cluster(
-                candidates,
-                cluster,
-            )
-        )
-        populations[cluster] = eligible.size
-        retained = _uniform_sample(
-            eligible,
-            min(sample_size, eligible.size),
-            [sampling_seed, int(year), 7, cluster],
-        )
-        sampled_keys.append(candidates[retained])
-        sampled_clusters.append(
-            np.full(retained.size, cluster, dtype=np.int32)
-        )
-    return (
-        np.concatenate(sampled_keys)
-        if sampled_keys
-        else np.empty(0, dtype=np.uint64),
-        np.concatenate(sampled_clusters)
-        if sampled_clusters
-        else np.empty(0, dtype=np.int32),
-        populations,
+    return _sample_cluster_excluded_reference(
+        candidates,
+        semantic_embeddings,
+        cluster_count,
+        sample_size,
+        [sampling_seed, int(year), 7],
     )
 
 
@@ -2320,10 +2547,15 @@ def _sample_semantic_observations(
     updated_excluded = (
         excluded_population.astype(np.int64, copy=True) + current_excluded
     )
+    grouped_candidates, candidate_offsets = _group_indices_by_cluster(
+        event_clusters,
+        eligible,
+        cluster_count,
+    )
     for cluster in range(cluster_count):
-        candidates = np.flatnonzero(
-            eligible & (event_clusters == cluster)
-        )
+        candidates = grouped_candidates[
+            candidate_offsets[cluster] : candidate_offsets[cluster + 1]
+        ]
         previous_count = int(population[cluster])
         current_count = int(candidates.size)
         total_count = previous_count + current_count
@@ -2392,11 +2624,18 @@ def _finish_semantic_reservoir(
     cluster_count: int,
     year: int,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    grouped, offsets = _group_indices_by_cluster(
+        sampled_clusters,
+        np.ones(sampled_clusters.size, dtype=bool),
+        cluster_count,
+    )
     reservoirs = [
         np.concatenate(
             (
                 kept_reservoirs[cluster],
-                sampled_distances[sampled_clusters == cluster],
+                sampled_distances[
+                    grouped[offsets[cluster] : offsets[cluster + 1]]
+                ],
             )
         ).astype(np.float32, copy=False)
         for cluster in range(cluster_count)
@@ -2406,7 +2645,7 @@ def _finish_semantic_reservoir(
             (
                 kept_reservoir_years[cluster],
                 np.full(
-                    np.count_nonzero(sampled_clusters == cluster),
+                    offsets[cluster + 1] - offsets[cluster],
                     year,
                     dtype=np.int32,
                 ),
@@ -2464,11 +2703,18 @@ def _finish_cluster_reservoir(
             raise RuntimeError("Connected cluster observation has no finite distance")
     else:
         sampled_distances = np.empty(0, dtype=np.int32)
+    grouped, offsets = _group_indices_by_cluster(
+        sampled_clusters,
+        np.ones(sampled_clusters.size, dtype=bool),
+        cluster_count,
+    )
     reservoirs = [
         np.concatenate(
             (
                 kept_reservoirs[cluster],
-                sampled_distances[sampled_clusters == cluster],
+                sampled_distances[
+                    grouped[offsets[cluster] : offsets[cluster + 1]]
+                ],
             )
         ).astype(np.int32, copy=False)
         for cluster in range(cluster_count)
@@ -2478,7 +2724,7 @@ def _finish_cluster_reservoir(
             (
                 kept_reservoir_years[cluster],
                 np.full(
-                    np.count_nonzero(sampled_clusters == cluster),
+                    offsets[cluster + 1] - offsets[cluster],
                     year,
                     dtype=np.int32,
                 ),

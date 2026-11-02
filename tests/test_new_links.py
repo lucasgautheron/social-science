@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 
 import numpy as np
 import pytest
@@ -635,6 +636,150 @@ def test_exhausted_fractional_weight_is_uncovered_before_sampling(tmp_path):
 
     assert profiles.invalid_link_indices[0].tolist() == [0]
     assert profiles.covered_pairs(pair, clusters).tolist() == [False]
+
+
+def test_exhausted_profile_index_is_sorted_for_binary_search(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    with sqlite3.connect(author_embeddings / "author_embeddings.db") as connection:
+        connection.executemany(
+            """
+            UPDATE author_embeddings
+            SET paper_count = 100, total_weight = ?
+            WHERE author_id = ?
+            """,
+            [(0.5, 1), (0.5, 2), (1.0, 3)],
+        )
+
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        new_links._load_author_embedding_store(author_embeddings, database),
+        EmbeddingStore(tmp_path / "embeddings"),
+        database,
+        np.asarray([2, 3], dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 0], dtype=np.int32),
+        np.asarray([1, 2, 3], dtype=np.int64),
+        1,
+    )
+    pair_keys = np.asarray(
+        [
+            np.uint64(1),
+            (np.uint64(1) << np.uint64(32)) | np.uint64(2),
+        ],
+        dtype=np.uint64,
+    )
+
+    assert profiles.invalid_link_indices[0].tolist() == [0, 1, 2]
+    assert profiles.covered_pairs_for_cluster(pair_keys, 0).tolist() == [
+        False,
+        False,
+    ]
+    assert profiles._direct_recomputation_count == 0
+
+
+def test_direct_fallback_batches_authors_into_one_corpus_scan(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        new_links._load_author_embedding_store(author_embeddings, database),
+        EmbeddingStore(tmp_path / "embeddings"),
+        database,
+        np.asarray([2, 3], dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 0], dtype=np.int32),
+        np.asarray([1, 2, 3], dtype=np.int64),
+        1,
+    )
+    statements = []
+    connect_readonly = new_links._connect_readonly
+
+    @contextmanager
+    def tracked_connection(path):
+        with connect_readonly(path) as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(new_links, "_connect_readonly", tracked_connection)
+    profiles._load_direct_author_papers({1, 2, 3})
+
+    corpus_scans = [
+        statement
+        for statement in statements
+        if "FROM articles_authors target" in statement
+    ]
+    assert len(corpus_scans) == 1
+    assert set(profiles._direct_author_papers) == {1, 2, 3}
+
+
+def test_cluster_reference_index_matches_naive_coverage(tmp_path):
+    database = tmp_path / "articles.db"
+    author_embeddings = tmp_path / "author_embeddings"
+    create_corpus(database)
+    create_author_embedding_artifacts(author_embeddings, database)
+    profiles = new_links.ClusterExcludedEmbeddingStore(
+        new_links._load_author_embedding_store(author_embeddings, database),
+        EmbeddingStore(tmp_path / "embeddings"),
+        database,
+        np.asarray([2, 3], dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int32),
+        np.asarray([1, 2, 3], dtype=np.int64),
+        2,
+    )
+    profiles.invalid_link_indices = [
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1], dtype=np.int32),
+    ]
+    pair_keys = np.asarray(
+        [
+            np.uint64(1),
+            np.uint64(2),
+            (np.uint64(1) << np.uint64(32)) | np.uint64(2),
+            np.uint64(2),
+        ],
+        dtype=np.uint64,
+    )
+
+    sampled, sampled_clusters, populations = (
+        new_links._sample_cluster_excluded_reference(
+            pair_keys,
+            profiles,
+            cluster_count=2,
+            sample_size=100,
+            seed_components=[11, 2020],
+        )
+    )
+
+    expected = [
+        pair_keys[profiles.covered_pairs_for_cluster(pair_keys, cluster)]
+        for cluster in range(2)
+    ]
+    assert populations.tolist() == [values.size for values in expected]
+    for cluster, values in enumerate(expected):
+        assert np.array_equal(
+            sampled[sampled_clusters == cluster],
+            values,
+        )
+    capped = [
+        new_links._sample_cluster_excluded_reference(
+            pair_keys,
+            profiles,
+            cluster_count=2,
+            sample_size=1,
+            seed_components=[11, 2020],
+        )
+        for _ in range(2)
+    ]
+    assert np.array_equal(capped[0][0], capped[1][0])
+    assert np.array_equal(capped[0][1], capped[1][1])
+    assert profiles.covered_pairs(capped[0][0], capped[0][1]).all()
 
 
 def test_new_links_resamples_after_discovering_zero_semantic_profile(tmp_path):
