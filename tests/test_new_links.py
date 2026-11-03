@@ -555,6 +555,12 @@ def test_zero_subtractive_profile_is_recomputed_from_remaining_papers(tmp_path):
     assert distances.shape == (1,)
     assert np.isfinite(distances[0])
     assert np.linalg.norm(profiles._unit_vectors[(0, 1)]) == pytest.approx(1.0)
+    assert profiles._global_profiles
+    profiles.release_year_vectors()
+    assert profiles._unit_vectors == {}
+    assert profiles._global_profiles
+    recomputed = profiles.distances(pair, clusters)
+    assert recomputed == pytest.approx(distances)
 
 
 def test_genuinely_zero_cluster_excluded_profile_becomes_uncovered(tmp_path):

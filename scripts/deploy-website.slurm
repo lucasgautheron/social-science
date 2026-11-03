@@ -24,9 +24,4 @@ if [[ -f "${CLUSTER_TOPIC_VISUALIZATIONS}/cluster_topic_summary.csv" ]]; then
   export OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR="$CLUSTER_TOPIC_VISUALIZATIONS"
 fi
 
-CLUSTER_TRENDS="${OPENALEX_CLUSTERS_DIR}/cluster_trends.csv"
-if [[ -f "$CLUSTER_TRENDS" ]]; then
-  export OPENALEX_CLUSTER_TRENDS="$CLUSTER_TRENDS"
-fi
-
 scripts/deploy-gh-pages.sh "${SLURM_SUBMIT_DIR}/output/events"

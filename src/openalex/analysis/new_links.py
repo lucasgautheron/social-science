@@ -50,6 +50,7 @@ DEFAULT_BASELINE_SAMPLE = 2_000
 DEFAULT_SAMPLING_SEED = 0
 DEFAULT_CACHE_MB = 2048
 SEMANTIC_VECTOR_BATCH_SIZE = 100_000
+SEMANTIC_PREPARE_BATCH_SIZE = 20_000
 AUTHOR_EMBEDDING_ARTIFACT_VERSION = 1
 AUTHOR_EMBEDDING_DATABASE = "author_embeddings.db"
 AUTHOR_EMBEDDING_ENCODING = "little-endian-float32"
@@ -340,6 +341,34 @@ class ClusterExcludedEmbeddingStore:
         )
         if not missing:
             return
+        # One year's sample can name millions of author-cluster pairs. Resolve
+        # them in batches so their paper embeddings do not all stay live.
+        for start in range(0, len(missing), SEMANTIC_PREPARE_BATCH_SIZE):
+            self._prepare_vector_batch(
+                missing[start : start + SEMANTIC_PREPARE_BATCH_SIZE]
+            )
+
+    def release_year_vectors(self) -> None:
+        """Drop per-cluster vectors after a year has stored its distances.
+
+        The same author in many clusters would otherwise retain a distinct
+        vector for every completed year. Global author profiles stay cached
+        because rereading them dominates the next year's preparation.
+        """
+        count = len(self._unit_vectors)
+        self._unit_vectors.clear()
+        if count:
+            logger.info(
+                "Released %s cluster-excluded author vectors; "
+                "retaining %s global author profiles",
+                count,
+                len(self._global_profiles),
+            )
+
+    def _prepare_vector_batch(
+        self,
+        missing: Sequence[tuple[int, int]],
+    ) -> None:
         self._load_global_profiles(
             np.asarray(
                 sorted({author for _, author in missing}),
@@ -859,6 +888,7 @@ def build_new_links(
             distance_stats["inspected_edges"],
             time.perf_counter() - started,
         )
+        semantic_embeddings.release_year_vectors()
 
     semantic_embeddings.log_fallback_summary()
     _save_cluster_reservoir(
