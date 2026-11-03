@@ -237,7 +237,7 @@ into `author_ids.npy`, int32 exact `distance`, int32 `cluster_id`, and float64
 first-year link. Use `sampling_weight` when estimating totals. Exact
 population/sample counts and inclusion probabilities are in `manifest.json`.
 Event artifacts produced before article-id incidence sidecars were added must
-be regenerated. New-link artifacts before version 10 lack the current
+be regenerated. New-link artifacts before version 11 lack the current
 cluster-excluded semantic distances and null samples and must also be rebuilt.
 
 For semantic distance, every occurrence of an author pair on a qualifying
@@ -363,6 +363,25 @@ openalex-aws submit --worker cpu \
   --output-dir output/cluster_topic_visualizations
 ```
 
+Global collaborator-topic trends use the same leave-one-context primary-topic
+rule, with the plotted publication year removed instead of the current cluster.
+For each year, an eligible author has at least one unique coauthor and both
+people have a leave-year-out primary topic. Solo papers still contribute to
+profiles. Each eligible author has equal weight. The three yearly means are the
+number of distinct primary topics among classified coauthors, the share of
+those coauthors from a different topic, and Rao--Stirling diversity
+`1 - ||Σ p_i v_i||^2` from equal-person topic shares and the normalized
+c-TF-IDF vectors. A dashed line extrapolates the unweighted OLS fit of each
+mean on years before 2022. Coverage counts are stored with the series.
+
+```bash
+openalex global-trends \
+  --db-path /path/to/articles.db \
+  --topics-dir output/topics \
+  --author-topics-dir output/author_topics \
+  --output-dir output/global_trends
+```
+
 ## Website
 
 Build the site:
@@ -373,6 +392,7 @@ openalex build-website \
   --clusters-dir output/event_clusters \
   --new-link-visualizations-dir output/new_link_visualizations \
   --cluster-topic-visualizations-dir output/cluster_topic_visualizations \
+  --global-trends-dir output/global_trends \
   --db-path /path/to/articles.db \
   --output-dir output/website
 python -m http.server --directory output/website 8000
@@ -383,6 +403,9 @@ The site root opens `clusters.html`, which lists every cluster from
 that contain any of its keywords, divided by the total number of documents,
 and each row plots that share by year plus paper-topic and weighted
 author-primary-topic histograms, ordered from most to least frequent topic.
+`global-trends.html` plots those three yearly collaborator-topic means
+against publication year, with the observed series, the dashed pre-2022
+extrapolation, endpoint labels, and a 2022 marker.
 `link-distances.html` interactively plots
 cluster paper count on a logarithmic x-axis against four mean-distance
 measures from `visualize-new-links` and two cluster-size-based Rao--Stirling
@@ -427,10 +450,21 @@ are not read. Without `--db-path`, the curves use the processed-paper totals
 stored in the event manifest. Omitting `--new-link-visualizations-dir` leaves
 the four link-distance measures empty; omitting
 `--cluster-topic-visualizations-dir` omits topic histograms and diversity.
-`--trends` is the cluster-trends
-CSV that classifies those points. Without it, the builder uses
-`cluster_trends.csv` inside `--clusters-dir` when that file exists.
-`scripts/deploy-website.slurm` passes the file only in that case.
+When the cluster year grid has at least eight years, the builder classifies
+each cluster's topic-adjusted log activity and stores the shape classes in
+the payload. `shapes.html` plots net trend against burstiness and a gallery
+of the twelve shape classes. Link-distance filters use that taxonomy with
+the three rise classes collapsed to `rise` and the three decline classes
+collapsed to `decline`.
+`openalex cluster-trends` writes the same classification to
+`cluster_trends.csv` when a table is needed outside the site.
+
+```bash
+openalex cluster-trends \
+  --clusters-dir output/event_clusters \
+  --cluster-topic-visualizations-dir output/cluster_topic_visualizations
+```
+
 The generated payload is stored as `data.json.gz`; the browser streams and
 decompresses it client-side so large sites remain below GitHub's 100 MB
 per-file limit.
@@ -480,7 +514,6 @@ OPENALEX_CLUSTERS_DIR=output/event_clusters \
 OPENALEX_NEW_LINK_VISUALIZATIONS_DIR=output/new_link_visualizations \
 OPENALEX_CLUSTER_TOPIC_VISUALIZATIONS_DIR=output/cluster_topic_visualizations \
 OPENALEX_DB_PATH=/path/to/articles.db \
-OPENALEX_CLUSTER_TRENDS=output/event_clusters/cluster_trends.csv \
   scripts/deploy-gh-pages.sh output/events
 ```
 

@@ -408,33 +408,38 @@ class ClusterExcludedEmbeddingStore:
                 dtype=np.float32,
             )
 
-        self._load_direct_author_papers(
-            {author for _, author in unstable}
-        )
-        for key in unstable:
-            cluster, author = key
-            remaining, direct_scale = self._direct_remaining_vector(
-                author,
-                papers_by_key[key],
+        # Paper embeddings are only needed while resolving this batch. Keeping
+        # every unstable author's full history retained tens of gigabytes.
+        try:
+            self._load_direct_author_papers(
+                {author for _, author in unstable}
             )
-            norm = float(np.linalg.norm(remaining))
-            if norm <= max(1e-12, 1e-6 * direct_scale):
-                self._undefined_profile_count += 1
-                logger.debug(
-                    "Excluding undefined cluster-excluded embedding for "
-                    "author %s in cluster %s",
+            for key in unstable:
+                cluster, author = key
+                remaining, direct_scale = self._direct_remaining_vector(
                     author,
-                    cluster,
+                    papers_by_key[key],
                 )
-                self._unavailable_vectors.add(key)
-                self._unavailable_link_indices[cluster].add(
-                    int(np.searchsorted(self.link_author_ids, author))
+                norm = float(np.linalg.norm(remaining))
+                if norm <= max(1e-12, 1e-6 * direct_scale):
+                    self._undefined_profile_count += 1
+                    logger.debug(
+                        "Excluding undefined cluster-excluded embedding for "
+                        "author %s in cluster %s",
+                        author,
+                        cluster,
+                    )
+                    self._unavailable_vectors.add(key)
+                    self._unavailable_link_indices[cluster].add(
+                        int(np.searchsorted(self.link_author_ids, author))
+                    )
+                    continue
+                self._unit_vectors[key] = np.asarray(
+                    remaining / norm,
+                    dtype=np.float32,
                 )
-                continue
-            self._unit_vectors[key] = np.asarray(
-                remaining / norm,
-                dtype=np.float32,
-            )
+        finally:
+            self._direct_author_papers.clear()
 
     def log_fallback_summary(self) -> None:
         if self._direct_recomputation_count:
@@ -526,7 +531,7 @@ class ClusterExcludedEmbeddingStore:
                         (
                             article_id,
                             author_count,
-                            np.asarray(vector, dtype=np.float64),
+                            np.asarray(vector, dtype=np.float32),
                         )
                     )
             self._direct_author_papers[author] = papers
@@ -2265,59 +2270,38 @@ def _pair_positions_by_author(
     }
 
 
-def _uniform_sample_excluding(
-    population_indices: np.ndarray,
-    excluded_indices: np.ndarray,
+def _sample_true_indices(
+    mask: np.ndarray,
     sample_size: int,
     seed_components: Sequence[int],
+    *,
+    population: int,
 ) -> np.ndarray:
-    population = int(population_indices.size - excluded_indices.size)
+    """Sample True positions without building a Python set of the population."""
     retained_size = min(sample_size, population)
-    if retained_size == 0:
+    if retained_size <= 0:
         return np.empty(0, dtype=np.int64)
-    if excluded_indices.size == 0:
-        return _uniform_sample(
-            population_indices,
-            retained_size,
-            seed_components,
-        )
-    if retained_size == population or population * 4 < population_indices.size:
-        eligible = np.setdiff1d(
-            population_indices,
-            excluded_indices,
-            assume_unique=True,
-        )
-        return _uniform_sample(
-            eligible,
-            retained_size,
-            seed_components,
-        )
-
-    excluded = {int(index) for index in excluded_indices}
-    selected_slots: set[int] = set()
-    retained: list[int] = []
-    rng = np.random.default_rng(
-        np.random.SeedSequence(list(seed_components))
-    )
-    while len(retained) < retained_size:
-        remaining = retained_size - len(retained)
-        slots = rng.integers(
-            0,
-            population_indices.size,
-            size=max(32, remaining * 2),
-        )
+    if retained_size == population:
+        return np.flatnonzero(mask)
+    rng = np.random.default_rng(np.random.SeedSequence(list(seed_components)))
+    selected = np.empty(retained_size, dtype=np.int64)
+    filled = 0
+    seen: set[int] = set()
+    width = int(mask.size)
+    while filled < retained_size:
+        need = retained_size - filled
+        slots = rng.integers(0, width, size=max(need * 4, 64))
+        slots = slots[mask[slots]]
         for slot_value in slots:
             slot = int(slot_value)
-            if slot in selected_slots:
+            if slot in seen:
                 continue
-            occurrence = int(population_indices[slot])
-            if occurrence in excluded:
-                continue
-            selected_slots.add(slot)
-            retained.append(occurrence)
-            if len(retained) == retained_size:
+            seen.add(slot)
+            selected[filled] = slot
+            filled += 1
+            if filled == retained_size:
                 break
-    return np.asarray(retained, dtype=np.int64)
+    return selected
 
 
 def _sample_cluster_excluded_reference(
@@ -2333,7 +2317,6 @@ def _sample_cluster_excluded_reference(
         semantic_embeddings.link_author_ids,
         semantic_embeddings.base.author_ids,
     )
-    base_indices = np.flatnonzero(base_covered)
     invalid_by_cluster = [
         semantic_embeddings.invalid_indices_for_cluster(cluster)
         for cluster in range(cluster_count)
@@ -2348,28 +2331,28 @@ def _sample_cluster_excluded_reference(
         right,
         invalid_union,
     )
+    # One reusable mask avoids concatenating, uniquifying, and hashing every
+    # excluded pair once per cluster. A year has millions of pairs and there
+    # are thousands of clusters, so that temporary set was retained by the
+    # allocator across the whole run.
+    available = np.array(base_covered, dtype=bool, copy=True)
 
     sampled_keys: list[np.ndarray] = []
     sampled_clusters: list[np.ndarray] = []
     populations = np.zeros(cluster_count, dtype=np.int64)
     for cluster, invalid in enumerate(invalid_by_cluster):
-        parts = [
-            incident_positions[int(author)]
-            for author in invalid
-            if int(author) in incident_positions
-        ]
-        if parts:
-            excluded = np.unique(np.concatenate(parts))
-            excluded = excluded[base_covered[excluded]]
-        else:
-            excluded = np.empty(0, dtype=np.int64)
-        population = int(base_indices.size - excluded.size)
+        available[:] = base_covered
+        for author in invalid:
+            positions = incident_positions.get(int(author))
+            if positions is not None:
+                available[positions] = False
+        population = int(np.count_nonzero(available))
         populations[cluster] = population
-        retained = _uniform_sample_excluding(
-            base_indices,
-            excluded,
-            min(sample_size, population),
+        retained = _sample_true_indices(
+            available,
+            sample_size,
             [*seed_components, cluster],
+            population=population,
         )
         sampled_keys.append(pair_keys[retained])
         sampled_clusters.append(
