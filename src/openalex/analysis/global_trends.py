@@ -21,7 +21,6 @@ from openalex.visualizations.cluster_topics import (
     _load_topic_assignments,
     _load_topic_vectors,
     _normalized_topic_vectors,
-    _rao_stirling_diversity,
     _read_json,
 )
 
@@ -98,6 +97,7 @@ def build_global_trends(
             )
         ]
         for year in publication_years:
+            logger.info("Summarizing publication year %s", year)
             summary = _summarize_database_year(
                 connection,
                 year,
@@ -190,13 +190,63 @@ def collaborator_topic_metrics(
     topic_vectors: sparse.csr_matrix,
 ) -> tuple[int, float, float]:
     """Return distinct-topic count, out-of-topic share, and Rao--Stirling diversity."""
+    return _collaborator_topic_metrics(
+        focal_topic,
+        collaborator_topics,
+        vector_lookup,
+        _topic_gram(topic_vectors),
+    )
+
+
+def _topic_gram(topic_vectors: sparse.csr_matrix) -> np.ndarray:
+    """Return topic-vector inner products.
+
+    Rao--Stirling diversity is ``1 - ||sum_t p_t v_t||^2``. Expanding the
+    squared norm gives ``p^T G p`` with ``G = V V^T``. ``V`` has a few hundred
+    topics and several hundred thousand terms, so forming ``G`` once replaces a
+    sparse multiply per author.
+    """
+    product = topic_vectors @ topic_vectors.T
+    return np.asarray(product.toarray(), dtype=np.float64)
+
+
+def _collaborator_topic_metrics(
+    focal_topic: int,
+    collaborator_topics: Sequence[int],
+    vector_lookup: Mapping[int, int],
+    topic_gram: np.ndarray,
+) -> tuple[int, float, float]:
     if not collaborator_topics:
         raise ValueError("Collaborator metrics require at least one classified collaborator")
     counts = Counter(int(topic) for topic in collaborator_topics)
     total = len(collaborator_topics)
-    out_share = sum(topic != int(focal_topic) for topic in counts.elements()) / total
-    diversity = _rao_stirling_diversity(counts, vector_lookup, topic_vectors)
+    out_share = (total - counts.get(int(focal_topic), 0)) / total
+    diversity = _rao_stirling_from_gram(counts, vector_lookup, topic_gram)
     return len(counts), float(out_share), float(diversity)
+
+
+def _rao_stirling_from_gram(
+    counts: Mapping[int, int | float],
+    vector_lookup: Mapping[int, int],
+    topic_gram: np.ndarray,
+) -> float:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return float("nan")
+    topics = list(counts)
+    indices = np.fromiter(
+        (vector_lookup[int(topic)] for topic in topics),
+        dtype=np.int64,
+        count=len(topics),
+    )
+    weights = np.fromiter(
+        (float(counts[int(topic)]) / total for topic in topics),
+        dtype=np.float64,
+        count=len(topics),
+    )
+    block = topic_gram[np.ix_(indices, indices)]
+    squared_norm = float(weights @ block @ weights)
+    return min(1.0, max(0.0, 1.0 - squared_norm))
 
 
 def fit_pre_break_trend(
@@ -265,6 +315,7 @@ def summarize_publication_year(
                 other for other in unique_authors if other != author
             )
 
+    topic_gram = _topic_gram(topic_vectors)
     primary_topics: dict[int, int | None] = {}
 
     def primary_topic(author: int) -> int | None:
@@ -301,11 +352,11 @@ def summarize_publication_year(
         if not classified:
             missing_collaborator += 1
             continue
-        metrics = collaborator_topic_metrics(
+        metrics = _collaborator_topic_metrics(
             focal,
             classified,
             vector_lookup,
-            topic_vectors,
+            topic_gram,
         )
         eligible += 1
         totals = [total + value for total, value in zip(totals, metrics, strict=True)]
@@ -525,6 +576,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
     args = build_parser().parse_args(argv)
     build_global_trends(
         args.db_path,

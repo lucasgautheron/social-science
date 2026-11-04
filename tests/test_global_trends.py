@@ -47,6 +47,18 @@ def test_collaborator_metrics_match_the_existing_rao_stirling_helper():
     )
     assert diversity == pytest.approx(4 / 9)
     assert topic_ids.tolist() == [1, 2]
+    overlapping = sparse.csr_matrix(
+        np.asarray([[1.0, 0.0], [0.6, 0.8]], dtype=np.float64)
+    )
+    overlapping_diversity = collaborator_topic_metrics(
+        1,
+        [1, 2],
+        lookup,
+        overlapping,
+    )[2]
+    assert overlapping_diversity == pytest.approx(
+        _rao_stirling_diversity(Counter({1: 1, 2: 1}), lookup, overlapping)
+    )
 
 
 def test_global_trends_increase_after_a_flat_pre_2022_line(tmp_path):
