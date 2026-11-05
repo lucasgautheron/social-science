@@ -1571,17 +1571,26 @@ def _process_year(
         event_record_count,
     )
 
-    cluster_id = _attribute_clusters(
-        new_keys, new_paper_counts, event_pair_keys, event_pair_clusters
+    combo_keys, combo_clusters, combo_counts = _event_pair_combinations(
+        event_pair_keys,
+        event_pair_clusters,
     )
-    repeat_within, repeat_outside = _repeat_counts_by_lag(
+    cluster_id = _attribute_clusters_from_combinations(
+        new_keys,
+        new_paper_counts,
+        combo_keys,
+        combo_clusters,
+        combo_counts,
+    )
+    repeat_within, repeat_outside = _repeat_counts_from_combinations(
         repeat_keys,
         repeat_clusters,
         repeat_years,
         pair_keys,
         paper_counts,
-        event_pair_keys,
-        event_pair_clusters,
+        combo_keys,
+        combo_clusters,
+        combo_counts,
         year,
         first_year,
         cluster_count,
@@ -2053,19 +2062,55 @@ def _attribute_clusters(
     event_keys: np.ndarray,
     event_clusters: np.ndarray,
 ) -> np.ndarray:
-    result = np.full(new_keys.size, NO_CLUSTER, dtype=np.int32)
-    if new_keys.size == 0 or event_keys.size == 0:
-        return result
+    combo_keys, combo_clusters, combo_counts = _event_pair_combinations(
+        event_keys,
+        event_clusters,
+    )
+    return _attribute_clusters_from_combinations(
+        new_keys,
+        paper_counts,
+        combo_keys,
+        combo_clusters,
+        combo_counts,
+    )
+
+
+def _event_pair_combinations(
+    event_keys: np.ndarray,
+    event_clusters: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sort event records once and count each pair/cluster combination."""
+    if event_keys.size == 0:
+        return (
+            np.empty(0, dtype=np.uint64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int64),
+        )
+    if event_keys.shape != event_clusters.shape:
+        raise ValueError("Event pair keys and clusters do not align")
     order = np.lexsort((event_clusters, event_keys))
     keys = event_keys[order]
     clusters = event_clusters[order]
     boundary = np.ones(keys.size, dtype=bool)
     boundary[1:] = (keys[1:] != keys[:-1]) | (clusters[1:] != clusters[:-1])
     starts = np.flatnonzero(boundary)
-    combo_keys = keys[starts]
-    combo_clusters = clusters[starts]
-    combo_counts = np.diff(np.append(starts, keys.size)).astype(np.int64, copy=False)
+    return (
+        keys[starts],
+        clusters[starts],
+        np.diff(np.append(starts, keys.size)).astype(np.int64, copy=False),
+    )
 
+
+def _attribute_clusters_from_combinations(
+    new_keys: np.ndarray,
+    paper_counts: np.ndarray,
+    combo_keys: np.ndarray,
+    combo_clusters: np.ndarray,
+    combo_counts: np.ndarray,
+) -> np.ndarray:
+    result = np.full(new_keys.size, NO_CLUSTER, dtype=np.int32)
+    if new_keys.size == 0 or combo_keys.size == 0:
+        return result
     positions = np.searchsorted(new_keys, combo_keys)
     matched = positions < new_keys.size
     matched[matched] &= new_keys[positions[matched]] == combo_keys[matched]
@@ -2097,6 +2142,38 @@ def _repeat_counts_by_lag(
     first_year: int,
     cluster_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    combo_keys, combo_clusters, combo_counts = _event_pair_combinations(
+        event_keys,
+        event_clusters,
+    )
+    return _repeat_counts_from_combinations(
+        cohort_keys,
+        cohort_clusters,
+        cohort_years,
+        current_keys,
+        current_paper_counts,
+        combo_keys,
+        combo_clusters,
+        combo_counts,
+        year,
+        first_year,
+        cluster_count,
+    )
+
+
+def _repeat_counts_from_combinations(
+    cohort_keys: np.ndarray,
+    cohort_clusters: np.ndarray,
+    cohort_years: np.ndarray,
+    current_keys: np.ndarray,
+    current_paper_counts: np.ndarray,
+    combo_keys: np.ndarray,
+    combo_clusters: np.ndarray,
+    combo_counts: np.ndarray,
+    year: int,
+    first_year: int,
+    cluster_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """Count cohort links repeating within and outside their origin cluster.
 
     Every current-year paper is in exactly one context for an origin cluster:
@@ -2118,38 +2195,16 @@ def _repeat_counts_by_lag(
         cohort_keys.shape == cohort_clusters.shape == cohort_years.shape
     ):
         raise ValueError("Repeat-link cohort arrays do not align")
-    repeated_keys, cohort_positions, current_positions = np.intersect1d(
+    cohort_positions, current_positions = _sorted_intersection_positions(
         cohort_keys,
         current_keys,
-        assume_unique=True,
-        return_indices=True,
     )
-    if repeated_keys.size == 0:
+    if cohort_positions.size == 0:
         return within_counts, outside_counts
-
-    if event_keys.size:
-        order = np.lexsort((event_clusters, event_keys))
-        sorted_keys = event_keys[order]
-        sorted_clusters = event_clusters[order]
-        boundary = np.ones(sorted_keys.size, dtype=bool)
-        boundary[1:] = (
-            (sorted_keys[1:] != sorted_keys[:-1])
-            | (sorted_clusters[1:] != sorted_clusters[:-1])
-        )
-        starts = np.flatnonzero(boundary)
-        combo_keys = sorted_keys[starts]
-        combo_clusters = sorted_clusters[starts]
-        combo_counts = np.diff(
-            np.append(starts, sorted_keys.size)
-        ).astype(np.int64, copy=False)
-    else:
-        combo_keys = np.empty(0, dtype=np.uint64)
-        combo_clusters = np.empty(0, dtype=np.int32)
-        combo_counts = np.empty(0, dtype=np.int64)
 
     origins = cohort_clusters[cohort_positions]
     origin_paper_counts = _origin_cluster_paper_counts(
-        repeated_keys,
+        cohort_keys[cohort_positions],
         origins,
         combo_keys,
         combo_clusters,
@@ -2179,6 +2234,43 @@ def _repeat_counts_by_lag(
             minlength=flat_size,
         ).reshape(shape)
     return within_counts, outside_counts
+
+
+@njit(cache=True)
+def _sorted_intersection_positions(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return matching positions with linear scans and exact-size outputs."""
+    first_index = 0
+    second_index = 0
+    match_count = 0
+    while first_index < first.size and second_index < second.size:
+        if first[first_index] < second[second_index]:
+            first_index += 1
+        elif second[second_index] < first[first_index]:
+            second_index += 1
+        else:
+            match_count += 1
+            first_index += 1
+            second_index += 1
+    first_positions = np.empty(match_count, dtype=np.int64)
+    second_positions = np.empty(match_count, dtype=np.int64)
+    first_index = 0
+    second_index = 0
+    output = 0
+    while first_index < first.size and second_index < second.size:
+        if first[first_index] < second[second_index]:
+            first_index += 1
+        elif second[second_index] < first[first_index]:
+            second_index += 1
+        else:
+            first_positions[output] = first_index
+            second_positions[output] = second_index
+            output += 1
+            first_index += 1
+            second_index += 1
+    return first_positions, second_positions
 
 
 @njit(cache=True)

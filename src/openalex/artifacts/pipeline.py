@@ -14,6 +14,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from openalex.analysis.new_links import (
+    ARTIFACT_VERSION as NEW_LINK_ARTIFACT_VERSION,
+)
+from openalex.visualizations.new_links import (
+    ARTIFACT_VERSION as NEW_LINK_VISUALIZATION_ARTIFACT_VERSION,
+)
+
 from .manifest import (
     ArtifactValidationError,
     ValidationResult,
@@ -170,7 +177,7 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
         "new-links",
         "output/new_links",
         "cpu",
-        11,
+        NEW_LINK_ARTIFACT_VERSION,
         (
             ("events", "events"),
             ("clusters", "cluster-events"),
@@ -204,7 +211,7 @@ WEBSITE_STAGES: tuple[StageSpec, ...] = (
         "visualize-new-links",
         "output/new_link_visualizations",
         "cpu",
-        1,
+        NEW_LINK_VISUALIZATION_ARTIFACT_VERSION,
         (("new_links", "new-links"),),
         (
             "openalex",

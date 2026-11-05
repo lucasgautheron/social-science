@@ -20,6 +20,7 @@ from openalex.analysis.new_links import (
     _sample_cluster_observations,
     _sample_links,
     _sample_semantic_observations,
+    _sorted_intersection_positions,
     build_new_links,
     load_new_links,
 )
@@ -1542,6 +1543,28 @@ def test_repeat_counts_classify_each_future_paper_context():
 
     assert within.tolist() == [[1, 0]]
     assert outside.tolist() == [[2, 0]]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected_first", "expected_second"),
+    [
+        ([2, 8], [1, 2, 4, 8, 16], [0, 1], [1, 3]),
+        ([1, 2, 4, 8, 16], [2, 8], [1, 3], [0, 1]),
+    ],
+)
+def test_sorted_intersection_positions_handles_either_input_order(
+    first,
+    second,
+    expected_first,
+    expected_second,
+):
+    first_positions, second_positions = _sorted_intersection_positions(
+        np.asarray(first, dtype=np.uint64),
+        np.asarray(second, dtype=np.uint64),
+    )
+
+    assert first_positions.tolist() == expected_first
+    assert second_positions.tolist() == expected_second
 
 
 def test_residual_highlights_choose_both_extremes_in_each_size_quantile():

@@ -19,6 +19,7 @@ from openalex.artifacts.manifest import complete_manifest, manifest_sha256
 
 logger = logging.getLogger(__name__)
 
+ARTIFACT_VERSION = 2
 DEFAULT_DPI = 180
 DEFAULT_BOOTSTRAP_REPLICATES = 250
 DEFAULT_PERMUTATION_REPLICATES = 499
@@ -697,7 +698,7 @@ def build_cluster_link_plots(
     complete_manifest(
         output,
         {
-            "artifact_version": 2,
+            "artifact_version": ARTIFACT_VERSION,
             "new_links_manifest_sha256": source_digest,
             "summary": summary_path.name,
             "plots": [

@@ -5,6 +5,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openalex.analysis.new_links import (
+    ARTIFACT_VERSION as NEW_LINK_ARTIFACT_VERSION,
+)
 from openalex.artifacts.cache import ArtifactCache
 from openalex.artifacts.lockfile import ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import (
@@ -21,6 +24,9 @@ from openalex.artifacts.pipeline import (
 from openalex.artifacts.resolver import ArtifactResolver
 from openalex.artifacts.s3_store import S3ArtifactStore
 from openalex.artifacts.specs import dependency_paths, validate_dependency
+from openalex.visualizations.new_links import (
+    ARTIFACT_VERSION as NEW_LINK_VISUALIZATION_ARTIFACT_VERSION,
+)
 
 
 class FakeS3:
@@ -193,6 +199,14 @@ def test_website_pipeline_graph_and_workers_are_deterministic():
     assert names.index("global-trends") < names.index("build-website")
     assert names[-1] == "build-website"
     assert STAGES["embeddings"].worker == "gpu"
+    assert (
+        STAGES["new-links"].artifact_version
+        == NEW_LINK_ARTIFACT_VERSION
+    )
+    assert (
+        STAGES["visualize-new-links"].artifact_version
+        == NEW_LINK_VISUALIZATION_ARTIFACT_VERSION
+    )
     assert all(
         stage.worker == "cpu"
         for stage in WEBSITE_STAGES
