@@ -4,6 +4,8 @@
   const svg = document.querySelector("#link-scatter");
   const details = document.querySelector("#link-details");
   const tooltip = document.querySelector("#link-tooltip");
+  const repeatGrid = document.querySelector("#repeat-grid");
+  const repeatCharts = [...document.querySelectorAll("[data-repeat-lag]")];
   const summary = document.querySelector("#summary");
   const search = document.querySelector("#cluster-search");
   const tabs = [...document.querySelectorAll("[data-measure]")];
@@ -58,6 +60,11 @@
       yearly: "all_link_distance_by_year",
       label: "Average all-link graph distance",
       description: "all coauthor-pair observations on cluster papers measured in the graph",
+    },
+    repeat: {
+      label: "Exact-lag repeat probability",
+      description: "first coauthorship links repeating within or outside their originating cluster",
+      repeat: true,
     },
     diversity: {
       distance: "rao_stirling_diversity",
@@ -150,6 +157,16 @@
       ["Sampled occurrences", "Number retained in the cluster’s uniform global reservoir."],
       ["Reference distribution", "Embedding-covered pair occurrences sampled from all analyzed papers separately for each cluster and year, using the same cluster exclusion and matched to the selected year mix."],
       ["Histogram and yearly mean", "Histogram bars use cosine-distance bins of width 0.05 on [0,2]; yearly points summarize sampled covered occurrences accepted in that year."],
+    ],
+    repeat: [
+      ...clusterMethodology,
+      ["Created link", "An unordered author pair in its first observed coauthorship year y, uniquely attributed to a cluster because that cluster—and no second cluster—appears on every paper creating the link in y."],
+      ["Exact lag", "The y+t probability uses coauthorship papers published exactly t calendar years after formation, not repeats accumulated through y+t."],
+      ["Eligible links", "At lag t, the denominator includes only created links whose formation year y satisfies y+t ≤ the final analyzed year."],
+      ["Within repeat", "The pair has at least one paper at y+t belonging to its originating cluster."],
+      ["Outside repeat", "The pair has at least one paper at y+t not belonging to its originating cluster."],
+      ["Paper context", "Each repeat paper is within or outside for the originating cluster. If a pair has separate papers in both contexts at the same lag, it contributes once to each independently measured probability."],
+      ["Probability", "Links with at least one qualifying repeat / eligible created links. Multiple papers in one context do not increase a link’s contribution."],
     ],
     diversity: [
       ...clusterMethodology,
@@ -727,10 +744,161 @@
       : "Year-matched new links outside clusters";
   }
 
+  function repeatPoint(row, lag) {
+    return (row.repeat_link_probability_by_lag || [])
+      .find((item) => Number(item.lag) === Number(lag));
+  }
+
+  function repeatLagChart(values) {
+    const chart = svgNode("svg", {
+      class: "line-chart link-curve",
+      viewBox: "0 0 340 190",
+      role: "img",
+    });
+    const points = (values || []).filter(
+      (item) => Number(item.eligible_links) > 0,
+    );
+    if (!points.length) {
+      const message = svgNode("text", { class: "axis-label", x: 16, y: 30 });
+      message.textContent = "No observable repeat lags";
+      chart.append(message);
+      return chart;
+    }
+    const padding = { left: 52, right: 12, top: 16, bottom: 34 };
+    const maxLag = Math.max(...points.map((item) => Number(item.lag)));
+    const x = (lag) => padding.left
+      + ((Number(lag) - 1) / Math.max(1, maxLag - 1))
+        * (340 - padding.left - padding.right);
+    const y = (probability) => 190 - padding.bottom
+      - Number(probability) * (190 - padding.top - padding.bottom);
+    chart.append(svgNode("path", {
+      class: "axis",
+      d: `M ${padding.left} ${padding.top} V ${190 - padding.bottom} H ${340 - padding.right}`,
+    }));
+    for (const context of ["within", "outside"]) {
+      chart.append(svgNode("path", {
+        class: `${context}-series`,
+        d: points.map(
+          (item, index) => `${index ? "L" : "M"} ${x(item.lag)} ${y(item[`${context}_probability`])}`,
+        ).join(" "),
+      }));
+      for (const item of points) {
+        const point = svgNode("circle", {
+          class: `${context}-point`,
+          cx: x(item.lag),
+          cy: y(item[`${context}_probability`]),
+          r: 3.2,
+        });
+        const title = svgNode("title");
+        title.textContent = `y+${item.lag}, ${context}: ${formatPercent(item[`${context}_probability`])} (${Number(item[`${context}_count`]).toLocaleString()} of ${Number(item.eligible_links).toLocaleString()} links)`;
+        point.append(title);
+        chart.append(point);
+      }
+    }
+    for (const lag of [...new Set([1, maxLag])]) {
+      const label = svgNode("text", {
+        class: "axis-label",
+        x: x(lag),
+        y: 174,
+        "text-anchor": lag === 1 ? "start" : "end",
+      });
+      label.textContent = `y+${lag}`;
+      chart.append(label);
+    }
+    const maximum = svgNode("text", { class: "axis-label", x: 4, y: padding.top + 4 });
+    maximum.textContent = "100%";
+    const xLabel = svgNode("text", {
+      class: "axis-label",
+      x: (padding.left + 340 - padding.right) / 2,
+      y: 189,
+      "text-anchor": "middle",
+    });
+    xLabel.textContent = "Exact years after link formation";
+    chart.append(maximum, xLabel);
+    chart.setAttribute(
+      "aria-label",
+      `Exact-lag repeat probabilities: ${points.map(
+        (item) => `y plus ${item.lag}, within ${formatPercent(item.within_probability)}, outside ${formatPercent(item.outside_probability)}`,
+      ).join(", ")}`,
+    );
+    return chart;
+  }
+
+  function showRepeat(row) {
+    state.hovered = row;
+    details.replaceChildren();
+    const eyebrow = document.createElement("p");
+    eyebrow.className = "eyebrow";
+    eyebrow.textContent = `Cluster ${row.cluster_id}`;
+    const heading = document.createElement("h2");
+    heading.textContent = row.label;
+    const type = document.createElement("p");
+    type.className = "cluster-type";
+    type.dataset.type = row.cluster_type || "";
+    type.textContent = row.cluster_type || "Unclassified";
+    const stats = document.createElement("div");
+    stats.className = "link-stats";
+    const lag1 = repeatPoint(row, 1);
+    const lag3 = repeatPoint(row, 3);
+    const values = [
+      ["Cluster size", `${Number(row.paper_count).toLocaleString()} papers`],
+      ["Eligible at y+1", lag1 ? Number(lag1.eligible_links).toLocaleString() : "—"],
+      ["Within at y+1", lag1 ? formatPercent(lag1.within_probability) : "—"],
+      ["Outside at y+1", lag1 ? formatPercent(lag1.outside_probability) : "—"],
+      ["Within at y+3", lag3 ? formatPercent(lag3.within_probability) : "—"],
+      ["Outside at y+3", lag3 ? formatPercent(lag3.outside_probability) : "—"],
+    ];
+    for (const [label, value] of values) {
+      const item = document.createElement("div");
+      const term = document.createElement("span");
+      term.textContent = label;
+      const number = document.createElement("strong");
+      number.textContent = value;
+      item.append(term, number);
+      stats.append(item);
+    }
+    const chartTitle = document.createElement("h3");
+    chartTitle.textContent = "Repeat probability by exact lag";
+    const legend = document.createElement("div");
+    legend.className = "distance-legend";
+    legend.innerHTML = '<span><i class="cluster-swatch"></i>Within originating cluster</span><span><i class="outside-swatch"></i>Outside originating cluster</span>';
+    details.append(
+      eyebrow,
+      heading,
+      type,
+      stats,
+      chartTitle,
+      legend,
+      repeatLagChart(row.repeat_link_probability_by_lag || []),
+    );
+    if (row.keywords && row.keywords.length) {
+      const wordTitle = document.createElement("h3");
+      wordTitle.textContent = "Included keywords";
+      const words = document.createElement("div");
+      words.className = "tags";
+      for (const keyword of row.keywords) {
+        const tag = document.createElement("span");
+        tag.textContent = keyword;
+        words.append(tag);
+      }
+      details.append(wordTitle, words);
+    }
+    details.append(methodologyPanel("repeat"));
+    for (const point of repeatGrid.querySelectorAll(".scatter-point")) {
+      const active = Number(point.dataset.clusterId) === row.cluster_id;
+      point.classList.toggle("active", active);
+      point.setAttribute("r", active ? "7" : "5");
+    }
+  }
+
   function show(row) {
     state.hovered = row;
     details.replaceChildren();
     const config = measures[state.measure];
+    if (config.repeat) {
+      showRepeat(row);
+      return;
+    }
     const eyebrow = document.createElement("p");
     eyebrow.className = "eyebrow";
     eyebrow.textContent = `Cluster ${row.cluster_id}`;
@@ -922,6 +1090,14 @@
 
   function observableRows() {
     const config = measures[state.measure];
+    if (config.repeat) {
+      return state.rows.filter(
+        (row) => row.paper_count > 0
+          && (row.repeat_link_probability_by_lag || []).some(
+            (item) => Number(item.eligible_links) > 0,
+          ),
+      );
+    }
     return state.rows.filter(
       (row) => row.paper_count > 0
         && Number.isFinite(row[config.distance])
@@ -929,12 +1105,150 @@
     );
   }
 
+  function drawRepeatChart(chart) {
+    const lag = Number(chart.dataset.repeatLag);
+    const context = chart.dataset.repeatContext;
+    const probabilityField = `${context}_probability`;
+    const rect = chart.getBoundingClientRect();
+    const width = Math.max(300, rect.width);
+    const height = Math.max(260, rect.height);
+    const padding = { left: 58, right: 18, top: 18, bottom: 52 };
+    const domain = observableRows();
+    const rows = filteredRows().filter((row) => {
+      const item = repeatPoint(row, lag);
+      return row.paper_count > 0
+        && item
+        && Number(item.eligible_links) > 0
+        && Number.isFinite(Number(item[probabilityField]));
+    });
+    chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    chart.replaceChildren();
+    if (!domain.length) {
+      const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
+      message.textContent = "No clusters have observable repeat cohorts";
+      chart.append(message);
+      return;
+    }
+    const minLog = Math.log10(Math.min(...domain.map((row) => row.paper_count)));
+    const maxLog = Math.log10(Math.max(...domain.map((row) => row.paper_count)));
+    const x = (count) => padding.left
+      + ((Math.log10(count) - minLog) / Math.max(0.1, maxLog - minLog))
+        * (width - padding.left - padding.right);
+    const y = (value) => height - padding.bottom
+      - Number(value) * (height - padding.top - padding.bottom);
+    const grid = svgNode("g", { class: "plot-grid" });
+    const axes = svgNode("g");
+    for (let index = 0; index <= 4; index += 1) {
+      const value = index / 4;
+      const py = y(value);
+      grid.append(svgNode("line", {
+        x1: padding.left,
+        y1: py,
+        x2: width - padding.right,
+        y2: py,
+      }));
+      const label = svgNode("text", {
+        class: "plot-tick",
+        x: padding.left - 8,
+        y: py + 4,
+        "text-anchor": "end",
+      });
+      label.textContent = formatPercent(value);
+      axes.append(label);
+    }
+    const xTicks = [];
+    for (
+      let power = Math.ceil(minLog);
+      power <= Math.floor(maxLog);
+      power += 1
+    ) xTicks.push(10 ** power);
+    const smallest = Math.min(...domain.map((row) => row.paper_count));
+    if (!xTicks.length || xTicks[0] > smallest * 2) xTicks.unshift(smallest);
+    for (const value of xTicks) {
+      const px = x(value);
+      grid.append(svgNode("line", {
+        x1: px,
+        y1: padding.top,
+        x2: px,
+        y2: height - padding.bottom,
+      }));
+      const label = svgNode("text", {
+        class: "plot-tick",
+        x: px,
+        y: height - padding.bottom + 20,
+        "text-anchor": "middle",
+      });
+      label.textContent = Number(value).toLocaleString();
+      axes.append(label);
+    }
+    axes.append(svgNode("path", {
+      class: "axis",
+      d: `M ${padding.left} ${padding.top} V ${height - padding.bottom} H ${width - padding.right}`,
+    }));
+    const xLabel = svgNode("text", {
+      class: "plot-axis-title",
+      x: (padding.left + width - padding.right) / 2,
+      y: height - 12,
+      "text-anchor": "middle",
+    });
+    xLabel.textContent = "Cluster size (papers, log scale)";
+    axes.append(xLabel);
+    const marks = svgNode("g");
+    if (!rows.length) {
+      const message = svgNode("text", { class: "plot-empty", x: width / 2, y: height / 2 });
+      message.textContent = "No matching clusters";
+      marks.append(message);
+    }
+    for (const row of rows) {
+      const item = repeatPoint(row, lag);
+      const point = svgNode("circle", {
+        class: `scatter-point${row === state.hovered ? " active" : ""}`,
+        cx: x(row.paper_count),
+        cy: y(item[probabilityField]),
+        r: row === state.hovered ? 7 : 5,
+        tabindex: 0,
+        "data-cluster-id": row.cluster_id,
+        "data-type": row.cluster_type || "",
+        "aria-label": `${row.label}: ${Number(row.paper_count).toLocaleString()} papers, y plus ${lag} ${context} repeat probability ${formatPercent(item[probabilityField])}`,
+      });
+      const select = () => {
+        show(row);
+        const frame = repeatGrid.getBoundingClientRect();
+        const bounds = chart.getBoundingClientRect();
+        tooltip.hidden = false;
+        tooltip.textContent = `${row.label} · y+${lag} ${context} ${formatPercent(item[probabilityField])}`;
+        tooltip.style.left = `${bounds.left - frame.left + x(row.paper_count) + 12}px`;
+        tooltip.style.top = `${bounds.top - frame.top + y(item[probabilityField]) - 10}px`;
+      };
+      point.addEventListener("focus", select);
+      point.addEventListener("pointerenter", select);
+      point.addEventListener("pointerleave", () => {
+        tooltip.hidden = true;
+      });
+      marks.append(point);
+    }
+    chart.append(grid, axes, marks);
+  }
+
+  function drawRepeat() {
+    state.points = [];
+    for (const chart of repeatCharts) drawRepeatChart(chart);
+  }
+
   function draw() {
+    const config = measures[state.measure];
+    if (config.repeat) {
+      svg.style.display = "none";
+      repeatGrid.hidden = false;
+      drawRepeat();
+      return;
+    }
+    svg.style.removeProperty("display");
+    repeatGrid.hidden = true;
     const rect = svg.getBoundingClientRect();
     const width = Math.max(520, rect.width);
     const height = Math.max(380, rect.height);
     const padding = { left: 72, right: 28, top: 26, bottom: 62 };
-    const config = measures[state.measure];
     const comparison = Boolean(config.diversityComparison);
     const domain = observableRows();
     const rows = filteredRows().filter(
@@ -1092,7 +1406,15 @@
       updateSummary();
       if (
         state.hovered
-        && Number.isFinite(state.hovered[measures[state.measure].distance])
+        && (
+          measures[state.measure].repeat
+            ? (state.hovered.repeat_link_probability_by_lag || []).some(
+              (item) => Number(item.eligible_links) > 0,
+            )
+            : Number.isFinite(
+              state.hovered[measures[state.measure].distance],
+            )
+        )
       ) {
         show(state.hovered);
       } else {

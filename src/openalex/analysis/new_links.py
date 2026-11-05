@@ -52,6 +52,7 @@ DEFAULT_CACHE_MB = 2048
 SEMANTIC_VECTOR_BATCH_SIZE = 100_000
 SEMANTIC_PREPARE_BATCH_SIZE = 20_000
 AUTHOR_EMBEDDING_ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 12
 AUTHOR_EMBEDDING_DATABASE = "author_embeddings.db"
 AUTHOR_EMBEDDING_ENCODING = "little-endian-float32"
 _FETCH_SIZE = 200_000
@@ -654,9 +655,12 @@ def build_new_links(
     manifest_path = output / "manifest.json"
 
     existing = _load_manifest(manifest_path) if resume and manifest_path.exists() else None
-    if existing is not None and int(existing.get("artifact_version", 0)) != 11:
+    if (
+        existing is not None
+        and int(existing.get("artifact_version", 0)) != ARTIFACT_VERSION
+    ):
         raise ValueError(
-            "Existing output predates cluster-excluded semantic distances. "
+            "Existing output predates exact repeat-link cohorts. "
             "Use a new --output-dir."
         )
     if existing is not None and existing.get("distance_mode") != "exact":
@@ -768,6 +772,11 @@ def build_new_links(
     graph, parent, size, seen_keys = _restore_prior_graph(
         scratch, years, completed, int(author_ids.size)
     )
+    repeat_keys, repeat_clusters, repeat_years = _restore_repeat_cohorts(
+        scratch,
+        years,
+        completed,
+    )
     (
         cluster_reservoirs,
         cluster_reservoir_years,
@@ -837,13 +846,25 @@ def build_new_links(
             semantic_observation_population,
             semantic_excluded_population,
             seen_keys,
+            repeat_keys,
+            repeat_clusters,
+            repeat_years,
+            years[0],
             semantic_embeddings,
         )
         _save_year(_year_path(output, year), arrays)
+        full_cluster_ids = cluster_observations.pop(
+            "_new_link_cluster_id"
+        )
         _save_cluster_year(
             _cluster_year_path(output, year), cluster_observations
         )
-        _save_edges(_edge_path(scratch, year), all_left, all_right)
+        _save_edges(
+            _edge_path(scratch, year),
+            all_left,
+            all_right,
+            full_cluster_ids,
+        )
         _save_cluster_reservoir(
             _reservoir_path(scratch, year),
             cluster_reservoirs,
@@ -862,6 +883,14 @@ def build_new_links(
         _union_edges(parent, size, all_left, all_right)
         graph = _add_graph_edges(graph, all_left, all_right, int(author_ids.size))
         seen_keys = _merge_sorted_unique(seen_keys, year_keys)
+        repeat_keys, repeat_clusters, repeat_years = _merge_repeat_cohorts(
+            repeat_keys,
+            repeat_clusters,
+            repeat_years,
+            year_keys,
+            full_cluster_ids,
+            year,
+        )
 
         completed.add(year)
         manifest["completed_years"] = sorted(completed)
@@ -1457,6 +1486,10 @@ def _process_year(
     semantic_observation_population: np.ndarray,
     semantic_excluded_population: np.ndarray,
     seen_keys: np.ndarray,
+    repeat_keys: np.ndarray,
+    repeat_clusters: np.ndarray,
+    repeat_years: np.ndarray,
+    first_year: int,
     semantic_embeddings: ClusterExcludedEmbeddingStore,
 ) -> tuple[
     dict[str, np.ndarray],
@@ -1516,7 +1549,7 @@ def _process_year(
     known[known] &= seen_keys[prior_positions[known]] == pair_keys[known]
     new_keys = pair_keys[~known]
     new_paper_counts = paper_counts[~known].astype(np.int64, copy=False)
-    del pair_keys, paper_counts, prior_positions, known
+    del prior_positions, known
 
     positions = np.searchsorted(event_ids, article_ids)
     matches = positions < event_ids.size
@@ -1541,6 +1574,19 @@ def _process_year(
     cluster_id = _attribute_clusters(
         new_keys, new_paper_counts, event_pair_keys, event_pair_clusters
     )
+    repeat_within, repeat_outside = _repeat_counts_by_lag(
+        repeat_keys,
+        repeat_clusters,
+        repeat_years,
+        pair_keys,
+        paper_counts,
+        event_pair_keys,
+        event_pair_clusters,
+        year,
+        first_year,
+        cluster_count,
+    )
+    del pair_keys, paper_counts
     while True:
         unavailable_before = len(semantic_embeddings._unavailable_vectors)
         (
@@ -1723,6 +1769,9 @@ def _process_year(
     cluster_observations["attributed_new_link_disconnected"] = np.bincount(
         cluster_id[attributed & ~new_connected], minlength=cluster_count
     ).astype(np.int64)
+    cluster_observations["repeat_within_count_by_lag"] = repeat_within
+    cluster_observations["repeat_outside_count_by_lag"] = repeat_outside
+    cluster_observations["_new_link_cluster_id"] = cluster_id
 
     sampled_new_event_keys = sampled_event_keys[~sampled_event_existing]
     reference_distance_keys = reference_keys[reference_new_connected]
@@ -2033,6 +2082,132 @@ def _attribute_clusters(
         np.cumsum(counts[:-1], out=candidate_starts[1:])
     single = counts == 1
     result[unique_positions[single]] = candidates[candidate_starts[single]]
+    return result
+
+
+def _repeat_counts_by_lag(
+    cohort_keys: np.ndarray,
+    cohort_clusters: np.ndarray,
+    cohort_years: np.ndarray,
+    current_keys: np.ndarray,
+    current_paper_counts: np.ndarray,
+    event_keys: np.ndarray,
+    event_clusters: np.ndarray,
+    year: int,
+    first_year: int,
+    cluster_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Count cohort links repeating within and outside their origin cluster.
+
+    Every current-year paper is in exactly one context for an origin cluster:
+    within when the paper belongs to that cluster, and outside otherwise.
+    A link can contribute to both counts at one lag when separate papers occur
+    in both contexts.
+    """
+    lag_count = max(0, int(year) - int(first_year))
+    shape = (lag_count, cluster_count)
+    within_counts = np.zeros(shape, dtype=np.int64)
+    outside_counts = np.zeros(shape, dtype=np.int64)
+    if (
+        cohort_keys.size == 0
+        or current_keys.size == 0
+        or lag_count == 0
+    ):
+        return within_counts, outside_counts
+    if not (
+        cohort_keys.shape == cohort_clusters.shape == cohort_years.shape
+    ):
+        raise ValueError("Repeat-link cohort arrays do not align")
+    repeated_keys, cohort_positions, current_positions = np.intersect1d(
+        cohort_keys,
+        current_keys,
+        assume_unique=True,
+        return_indices=True,
+    )
+    if repeated_keys.size == 0:
+        return within_counts, outside_counts
+
+    if event_keys.size:
+        order = np.lexsort((event_clusters, event_keys))
+        sorted_keys = event_keys[order]
+        sorted_clusters = event_clusters[order]
+        boundary = np.ones(sorted_keys.size, dtype=bool)
+        boundary[1:] = (
+            (sorted_keys[1:] != sorted_keys[:-1])
+            | (sorted_clusters[1:] != sorted_clusters[:-1])
+        )
+        starts = np.flatnonzero(boundary)
+        combo_keys = sorted_keys[starts]
+        combo_clusters = sorted_clusters[starts]
+        combo_counts = np.diff(
+            np.append(starts, sorted_keys.size)
+        ).astype(np.int64, copy=False)
+    else:
+        combo_keys = np.empty(0, dtype=np.uint64)
+        combo_clusters = np.empty(0, dtype=np.int32)
+        combo_counts = np.empty(0, dtype=np.int64)
+
+    origins = cohort_clusters[cohort_positions]
+    origin_paper_counts = _origin_cluster_paper_counts(
+        repeated_keys,
+        origins,
+        combo_keys,
+        combo_clusters,
+        combo_counts,
+    )
+    lags = int(year) - cohort_years[cohort_positions]
+    valid = (
+        (origins >= 0)
+        & (origins < cluster_count)
+        & (lags >= 1)
+        & (lags <= lag_count)
+    )
+    flat_size = lag_count * cluster_count
+    flat_indices = (lags - 1) * cluster_count + origins
+    within = valid & (origin_paper_counts > 0)
+    outside = valid & (
+        current_paper_counts[current_positions] > origin_paper_counts
+    )
+    if np.any(within):
+        within_counts[:] = np.bincount(
+            flat_indices[within],
+            minlength=flat_size,
+        ).reshape(shape)
+    if np.any(outside):
+        outside_counts[:] = np.bincount(
+            flat_indices[outside],
+            minlength=flat_size,
+        ).reshape(shape)
+    return within_counts, outside_counts
+
+
+@njit(cache=True)
+def _origin_cluster_paper_counts(
+    repeated_keys: np.ndarray,
+    origin_clusters: np.ndarray,
+    combo_keys: np.ndarray,
+    combo_clusters: np.ndarray,
+    combo_counts: np.ndarray,
+) -> np.ndarray:
+    result = np.zeros(repeated_keys.size, dtype=np.int64)
+    combo = 0
+    for index in range(repeated_keys.size):
+        key = repeated_keys[index]
+        cluster = origin_clusters[index]
+        while combo < combo_keys.size and (
+            combo_keys[combo] < key
+            or (
+                combo_keys[combo] == key
+                and combo_clusters[combo] < cluster
+            )
+        ):
+            combo += 1
+        if (
+            combo < combo_keys.size
+            and combo_keys[combo] == key
+            and combo_clusters[combo] == cluster
+        ):
+            result[index] = combo_counts[combo]
     return result
 
 
@@ -3178,6 +3353,51 @@ def _restore_prior_graph(
     return graph, parent, size, seen
 
 
+def _restore_repeat_cohorts(
+    scratch: Path,
+    years: Sequence[int],
+    completed: set[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    key_parts: list[np.ndarray] = []
+    cluster_parts: list[np.ndarray] = []
+    year_parts: list[np.ndarray] = []
+    for year in years:
+        if year not in completed:
+            break
+        path = _edge_path(scratch, year)
+        if not path.exists():
+            raise RuntimeError(
+                f"Completed year {year} is missing resumable full-edge scratch"
+            )
+        with np.load(path, allow_pickle=False) as payload:
+            left = payload["author_i"].astype(np.int32, copy=False)
+            right = payload["author_j"].astype(np.int32, copy=False)
+            clusters = payload["cluster_id"].astype(np.int32, copy=False)
+        if not (left.shape == right.shape == clusters.shape):
+            raise RuntimeError(
+                f"Completed year {year} repeat-link scratch does not align"
+            )
+        attributed = clusters >= 0
+        if np.any(attributed):
+            keys = _encode_pairs(left[attributed], right[attributed])
+            key_parts.append(keys)
+            cluster_parts.append(clusters[attributed].copy())
+            year_parts.append(
+                np.full(keys.size, int(year), dtype=np.int32)
+            )
+    if not key_parts:
+        return (
+            np.empty(0, dtype=np.uint64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+        )
+    keys = np.concatenate(key_parts)
+    clusters = np.concatenate(cluster_parts)
+    origin_years = np.concatenate(year_parts)
+    order = np.argsort(keys, kind="stable")
+    return keys[order], clusters[order], origin_years[order]
+
+
 def _restore_cluster_reservoir(
     scratch: Path,
     years: Sequence[int],
@@ -3293,6 +3513,70 @@ def _merge_sorted_unique(first: np.ndarray, second: np.ndarray) -> np.ndarray:
     return _merge_disjoint(first, second)
 
 
+def _merge_repeat_cohorts(
+    cohort_keys: np.ndarray,
+    cohort_clusters: np.ndarray,
+    cohort_years: np.ndarray,
+    new_keys: np.ndarray,
+    new_clusters: np.ndarray,
+    year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    attributed = new_clusters >= 0
+    if not np.any(attributed):
+        return cohort_keys, cohort_clusters, cohort_years
+    return _merge_repeat_cohort_arrays(
+        cohort_keys,
+        cohort_clusters,
+        cohort_years,
+        new_keys[attributed],
+        new_clusters[attributed],
+        int(year),
+    )
+
+
+@njit(cache=True)
+def _merge_repeat_cohort_arrays(
+    first_keys: np.ndarray,
+    first_clusters: np.ndarray,
+    first_years: np.ndarray,
+    second_keys: np.ndarray,
+    second_clusters: np.ndarray,
+    second_year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    size = first_keys.size + second_keys.size
+    keys = np.empty(size, dtype=np.uint64)
+    clusters = np.empty(size, dtype=np.int32)
+    years = np.empty(size, dtype=np.int32)
+    first = 0
+    second = 0
+    output = 0
+    while first < first_keys.size and second < second_keys.size:
+        if first_keys[first] < second_keys[second]:
+            keys[output] = first_keys[first]
+            clusters[output] = first_clusters[first]
+            years[output] = first_years[first]
+            first += 1
+        else:
+            keys[output] = second_keys[second]
+            clusters[output] = second_clusters[second]
+            years[output] = second_year
+            second += 1
+        output += 1
+    while first < first_keys.size:
+        keys[output] = first_keys[first]
+        clusters[output] = first_clusters[first]
+        years[output] = first_years[first]
+        first += 1
+        output += 1
+    while second < second_keys.size:
+        keys[output] = second_keys[second]
+        clusters[output] = second_clusters[second]
+        years[output] = second_year
+        second += 1
+        output += 1
+    return keys, clusters, years
+
+
 @njit(cache=True)
 def _merge_disjoint(first: np.ndarray, second: np.ndarray) -> np.ndarray:
     result = np.empty(first.size + second.size, dtype=np.uint64)
@@ -3327,7 +3611,7 @@ def _fresh_manifest(
 ) -> dict:
     return {
         **config,
-        "artifact_version": 11,
+        "artifact_version": ARTIFACT_VERSION,
         "author_count": int(author_ids.size),
         "cluster_level": None,
         "cluster_metadata": "cluster_metadata.npz",
@@ -3444,8 +3728,20 @@ def _save_year(path: Path, arrays: dict[str, np.ndarray]) -> None:
     os.replace(temporary, path)
 
 
-def _save_edges(path: Path, left: np.ndarray, right: np.ndarray) -> None:
-    _save_year(path, {"author_i": left, "author_j": right})
+def _save_edges(
+    path: Path,
+    left: np.ndarray,
+    right: np.ndarray,
+    cluster_ids: np.ndarray,
+) -> None:
+    _save_year(
+        path,
+        {
+            "author_i": left,
+            "author_j": right,
+            "cluster_id": cluster_ids,
+        },
+    )
 
 
 def _save_cluster_metadata(

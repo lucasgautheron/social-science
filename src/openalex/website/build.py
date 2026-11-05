@@ -779,6 +779,23 @@ def load_link_distance_summary(
                     {"year": int(year), "distance": float(distance)}
                     for year, distance in json.loads(raw)
                 ]
+            row["repeat_link_probability_by_lag"] = [
+                {
+                    "lag": int(item["lag"]),
+                    "eligible_links": int(item["eligible_links"]),
+                    "within_count": int(item["within_count"]),
+                    "outside_count": int(item["outside_count"]),
+                    "within_probability": float(
+                        item["within_probability"]
+                    ),
+                    "outside_probability": float(
+                        item["outside_probability"]
+                    ),
+                }
+                for item in json.loads(
+                    source.get("repeat_link_probability_by_lag") or "[]"
+                )
+            ]
             rows.append(row)
     return rows
 

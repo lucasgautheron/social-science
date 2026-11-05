@@ -39,7 +39,7 @@
         <h2>Formula and methodology</h2>
         <dl>
           <dt>Log activity</dt>
-          <dd>Each year is log((papers + pseudocount) / corpus size). The pseudocount is 5% of that cluster’s peak yearly count, so a year with almost no papers is not a steep ramp in log space. A year with share zero uses the median corpus size of the years that have a positive share.</dd>
+          <dd>Each year is log((papers + 1) / corpus size). The fixed one-paper pseudocount keeps zero-paper years finite without making earlier years depend on the cluster’s eventual peak. A year with share zero uses the median corpus size of the years that have a positive share.</dd>
           <dt>Topic adjustment</dt>
           <dd>The reference for a topic is the median demeaned trajectory of clusters whose largest topic is that topic, when at least 15 clusters share it. Otherwise the reference is the median of every cluster. Each cluster is corrected by the share-weighted mix of those references. Weight that is not assigned to a topic stays on the global median.</dd>
           <dt>Shape comparison</dt>

@@ -66,13 +66,13 @@ def test_topic_reference_removes_a_shared_trajectory():
     assert np.std(adjusted_other[-1]) > 0.2
 
 
-def test_log_activity_uses_the_peak_pseudocount_and_median_corpus_size():
+def test_log_activity_uses_a_fixed_pseudocount_and_median_corpus_size():
     count = np.array([[0.0, 10.0, 40.0]])
     share = np.array([[0.0, 0.1, 0.2]])
     logged = log_activity(count, share)
     total = np.array([100.0, 100.0, 200.0])
     total[0] = np.median([100.0, 200.0])
-    expected = np.log((count + 0.05 * 40.0) / total)
+    expected = np.log((count + 1.0) / total)
     assert logged == pytest.approx(expected)
 
 
@@ -83,9 +83,16 @@ def test_link_distance_class_collapses_rise_and_decline():
     assert link_distance_class("steady decline") == "decline"
     assert link_distance_class("accelerating decline") == "decline"
     assert link_distance_class("flattening decline") == "decline"
-    assert link_distance_class("rise then fall") == "rise then fall"
     assert link_distance_class("shock: transient") == "shock: transient"
     assert RISE_CLASSES.isdisjoint(DECLINE_CLASSES)
+
+
+def test_quadratic_turn_is_classified_by_net_direction():
+    years = np.arange(2000, 2016)
+    position = np.linspace(-1.0, 1.0, years.size)
+    row = classify(position**2 + 0.2 * position, years)
+    assert row["cls"] == "quad"
+    assert row["sub"] == "accelerating rise"
 
 
 def test_short_cluster_list_stays_unclassified():

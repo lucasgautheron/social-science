@@ -204,7 +204,8 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "semantic_link_baseline_distance_distribution,"
         "new_link_distance_by_year,all_link_distance_by_year,"
         "first_semantic_link_distance_by_year,"
-        "semantic_link_distance_by_year\n"
+        "semantic_link_distance_by_year,"
+        "repeat_link_probability_by_lag\n"
         '0,beta,4,2.5,8,2,1.25,10,2,2,12,0.3,6,1,4,0.4,11,1,5,'
         '"[[1,8],[2,2]]","[[0,2],[2,8]]",'
         '"[[2,20],[3,5]]","[[1,4],[2,6]]",'
@@ -213,10 +214,13 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         '"[[0.35,0.4,3],[0.4,0.45,2]]",'
         '"[[0.2,0.25,3],[0.4,0.45,2]]",'
         '"[[2020,2.5],[2021,1.5]]","[[2020,1.25]]",'
-        '"[[2020,0.3]]","[[2020,0.4]]"\n'
+        '"[[2020,0.3]]","[[2020,0.4]]",'
+        '"[{""lag"":1,""eligible_links"":5,""within_count"":2,'
+        '""outside_count"":1,""within_probability"":0.4,'
+        '""outside_probability"":0.2}]"\n'
         '1,gamma,2,nan,0,3,3.0,4,3,1,7,nan,0,3,0,nan,0,7,0,[],'
         '"[[0,1],[3,3]]",'
-        '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[],[],[],[]\n',
+        '"[[3,2]]","[[1,1],[3,3]]",[],[],[],[],[],[],[],[],[]\n',
         encoding="utf-8",
     )
 
@@ -268,6 +272,16 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     assert first["semantic_link_distance_by_year"] == [
         {"year": 2020, "distance": 0.4},
     ]
+    assert first["repeat_link_probability_by_lag"] == [
+        {
+            "lag": 1,
+            "eligible_links": 5,
+            "within_count": 2,
+            "outside_count": 1,
+            "within_probability": 0.4,
+            "outside_probability": 0.2,
+        }
+    ]
     assert second["new_link_distance_by_year"] == []
     assert first["new_link_baseline_distance_distribution"] == [
         [2, 20.0],
@@ -296,12 +310,12 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
     page = (site_dir / "link-distances.html").read_text(encoding="utf-8")
     assert 'id="cluster-search"' in page
     assert 'data-measure="semantic"' in page
+    assert 'data-measure="repeat"' in page
+    assert 'id="repeat-grid"' in page
     for cluster_type in (
         "stable",
         "rise",
         "decline",
-        "rise then fall",
-        "fall then rise",
         "shock: transient",
         "shock: lasting",
         "abrupt drop",
@@ -319,6 +333,7 @@ def test_link_distance_page_joins_plot_summary_to_temporal_curves(tmp_path):
         "Paper topic",
         "Leave-cluster-out primary topic",
         "Within-collaboration diversity (paper)",
+        "Exact lag",
     ):
         assert definition in script
 

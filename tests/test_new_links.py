@@ -16,6 +16,7 @@ from openalex.analysis.new_links import (
     _distances,
     _finish_cluster_reservoir,
     _grouped_exact_bfs,
+    _repeat_counts_by_lag,
     _sample_cluster_observations,
     _sample_links,
     _sample_semantic_observations,
@@ -358,7 +359,7 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
     assert 20 not in author_ids
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_version"] == 11
+    assert manifest["artifact_version"] == 12
     assert manifest["baseline_sample"] == 2_000
     assert manifest["completed_years"] == [2019, 2020, 2021]
     assert manifest["clustered_link_counts"]["2020"] == 1
@@ -413,6 +414,14 @@ def test_new_links_distances_clusters_and_read_only(tmp_path):
         assert stats["reservoir_acceptances"].tolist() == [1, 0]
         assert stats["connected_distance_sum"].tolist() == [1, 0]
         assert stats["existing_pair_observations"].tolist() == [1, 0]
+        assert stats["repeat_within_count_by_lag"].tolist() == [
+            [1, 0],
+            [0, 0],
+        ]
+        assert stats["repeat_outside_count_by_lag"].tolist() == [
+            [0, 0],
+            [0, 0],
+        ]
     with np.load(
         output / "cluster_distance_reservoir.npz", allow_pickle=False
     ) as reservoir:
@@ -1465,6 +1474,16 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
     assert 0 <= float(rows[0]["new_link_wasserstein_p_value"]) <= 1
     assert 0 <= float(rows[0]["new_link_wasserstein_q_value"]) <= 1
     assert float(rows[0]["all_link_repeat_probability"]) == pytest.approx(1 / 3)
+    assert json.loads(rows[0]["repeat_link_probability_by_lag"]) == [
+        {
+            "lag": 1,
+            "eligible_links": 1,
+            "within_count": 1,
+            "outside_count": 0,
+            "within_probability": 1.0,
+            "outside_probability": 0.0,
+        }
+    ]
     assert float(rows[1]["average_all_link_distance"]) == pytest.approx(2)
     assert int(rows[1]["all_link_disconnected_count"]) == 3
     assert float(rows[0]["average_semantic_link_distance"]) == pytest.approx(
@@ -1503,6 +1522,26 @@ def test_cluster_link_visualizations_use_paper_counts_and_existing_zeros(tmp_pat
         plots / "cluster_first_semantic_link_distance.png"
     ).stat().st_size > 0
     assert (plots / "cluster_semantic_link_distance.png").stat().st_size > 0
+    assert (plots / "cluster_repeat_y_plus_1_within.png").stat().st_size > 0
+    assert (plots / "cluster_repeat_y_plus_3_outside.png").stat().st_size > 0
+
+
+def test_repeat_counts_classify_each_future_paper_context():
+    within, outside = _repeat_counts_by_lag(
+        np.array([10, 20], dtype=np.uint64),
+        np.array([0, 0], dtype=np.int32),
+        np.array([2020, 2020], dtype=np.int32),
+        np.array([10, 20], dtype=np.uint64),
+        np.array([2, 1], dtype=np.int64),
+        np.array([10, 20], dtype=np.uint64),
+        np.array([0, 1], dtype=np.int32),
+        2021,
+        2020,
+        2,
+    )
+
+    assert within.tolist() == [[1, 0]]
+    assert outside.tolist() == [[2, 0]]
 
 
 def test_residual_highlights_choose_both_extremes_in_each_size_quantile():

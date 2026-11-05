@@ -20,7 +20,7 @@
             <a href="global-trends.html">Global trends</a>
           </nav>
         </div>
-        <p class="intro">Compare cluster size with coauthor-network distance, semantic distance, paper-topic diversity, or author primary-topic diversity. Hover a cluster for its publication curve and detailed distribution.</p>
+        <p class="intro">Compare cluster size with coauthor-network distance, semantic distance, exact-lag link repetition, paper-topic diversity, or author primary-topic diversity. Hover a cluster for its temporal curves and detailed distribution.</p>
       </header>
       <section class="link-workspace card">
         <div class="scatter-panel">
@@ -30,6 +30,7 @@
               <button type="button" data-measure="first-semantic" aria-pressed="false">First link (semantic)</button>
               <button type="button" data-measure="all" aria-pressed="false">All links (graph)</button>
               <button type="button" data-measure="semantic" aria-pressed="false">All links (semantic)</button>
+              <button type="button" data-measure="repeat" aria-pressed="false">Repeat links</button>
               <button type="button" data-measure="diversity" aria-pressed="false">Topic diversity</button>
               <button type="button" data-measure="author-diversity" aria-pressed="false">Author diversity</button>
               <button type="button" data-measure="within-collaboration-diversity" aria-pressed="false">Within vs overall diversity</button>
@@ -43,8 +44,6 @@
               <button type="button" data-cluster-type="stable" aria-pressed="true"><i></i>Stable</button>
               <button type="button" data-cluster-type="rise" aria-pressed="true"><i></i>Rise</button>
               <button type="button" data-cluster-type="decline" aria-pressed="true"><i></i>Decline</button>
-              <button type="button" data-cluster-type="rise then fall" aria-pressed="true"><i></i>Rise then fall</button>
-              <button type="button" data-cluster-type="fall then rise" aria-pressed="true"><i></i>Fall then rise</button>
               <button type="button" data-cluster-type="shock: transient" aria-pressed="true"><i></i>Shock: transient</button>
               <button type="button" data-cluster-type="shock: lasting" aria-pressed="true"><i></i>Shock: lasting</button>
               <button type="button" data-cluster-type="abrupt drop" aria-pressed="true"><i></i>Abrupt drop</button>
@@ -52,6 +51,24 @@
           </div>
           <div class="scatter-frame">
             <svg id="link-scatter" role="img" aria-label="Clusters by paper count and average link distance"></svg>
+            <div id="repeat-grid" class="repeat-grid" hidden>
+              <section>
+                <h3>Within cluster · y+1</h3>
+                <svg data-repeat-lag="1" data-repeat-context="within" role="img" aria-label="Within-cluster repeat probability at y plus 1 by cluster size"></svg>
+              </section>
+              <section>
+                <h3>Outside cluster · y+1</h3>
+                <svg data-repeat-lag="1" data-repeat-context="outside" role="img" aria-label="Outside-cluster repeat probability at y plus 1 by cluster size"></svg>
+              </section>
+              <section>
+                <h3>Within cluster · y+3</h3>
+                <svg data-repeat-lag="3" data-repeat-context="within" role="img" aria-label="Within-cluster repeat probability at y plus 3 by cluster size"></svg>
+              </section>
+              <section>
+                <h3>Outside cluster · y+3</h3>
+                <svg data-repeat-lag="3" data-repeat-context="outside" role="img" aria-label="Outside-cluster repeat probability at y plus 3 by cluster size"></svg>
+              </section>
+            </div>
             <div id="link-tooltip" class="tooltip scatter-tooltip" hidden></div>
           </div>
           <p class="hint scatter-hint">Hover a point for its temporal curves and detailed distribution</p>

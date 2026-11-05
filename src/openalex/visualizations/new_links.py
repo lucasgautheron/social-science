@@ -85,9 +85,9 @@ def build_cluster_link_plots(
     root = Path(new_links_dir).expanduser().resolve()
     output = Path(output_dir).expanduser().resolve()
     manifest = _read_json(root / "manifest.json")
-    if int(manifest.get("artifact_version", 0)) < 11:
+    if int(manifest.get("artifact_version", 0)) < 12:
         raise ValueError(
-            "New-link artifacts lack cluster-excluded semantic distances; "
+            "New-link artifacts lack exact repeat-link cohorts; "
             "rebuild them."
         )
     years = [int(year) for year in manifest.get("years", [])]
@@ -109,6 +109,16 @@ def build_cluster_link_plots(
         (year_count, cluster_count), dtype=np.int64
     )
     all_total_by_year = np.zeros((year_count, cluster_count), dtype=np.int64)
+    attributed_new_by_year = np.zeros(
+        (year_count, cluster_count), dtype=np.int64
+    )
+    max_repeat_lag = max(years) - min(years) if years else 0
+    repeat_within_counts = np.zeros(
+        (max_repeat_lag, cluster_count), dtype=np.int64
+    )
+    repeat_outside_counts = np.zeros(
+        (max_repeat_lag, cluster_count), dtype=np.int64
+    )
     new_distance_sum = np.zeros(cluster_count, dtype=np.float64)
     new_distance_histograms: list[defaultdict[int, float]] = [
         defaultdict(float) for _ in range(cluster_count)
@@ -221,6 +231,28 @@ def build_cluster_link_plots(
                 "new_connected_pair_observations"
             ]
             all_total_by_year[year_index] = stats["total_pair_observations"]
+            attributed_new_by_year[year_index] = stats[
+                "attributed_new_link_population"
+            ]
+            within_by_lag = stats["repeat_within_count_by_lag"].astype(
+                np.int64, copy=False
+            )
+            outside_by_lag = stats["repeat_outside_count_by_lag"].astype(
+                np.int64, copy=False
+            )
+            expected_repeat_shape = (
+                max(0, int(year) - min(years)),
+                cluster_count,
+            )
+            if (
+                within_by_lag.shape != expected_repeat_shape
+                or outside_by_lag.shape != expected_repeat_shape
+            ):
+                raise ValueError(
+                    f"Year {year} repeat-link counts do not align"
+                )
+            repeat_within_counts[: within_by_lag.shape[0]] += within_by_lag
+            repeat_outside_counts[: outside_by_lag.shape[0]] += outside_by_lag
             semantic_reference_clusters = stats[
                 "semantic_reference_cluster_id"
             ].astype(np.int32, copy=False)
@@ -480,6 +512,25 @@ def build_cluster_link_plots(
     all_existing = all_existing_by_year.sum(axis=0)
     all_new_connected = all_new_connected_by_year.sum(axis=0)
     all_total = all_total_by_year.sum(axis=0)
+    repeat_denominators = _repeat_denominators(
+        years,
+        attributed_new_by_year,
+    )
+    repeat_within_probability = _safe_probability_matrix(
+        repeat_within_counts,
+        repeat_denominators,
+    )
+    repeat_outside_probability = _safe_probability_matrix(
+        repeat_outside_counts,
+        repeat_denominators,
+    )
+    repeat_probability_by_lag = _repeat_probability_series(
+        repeat_denominators,
+        repeat_within_counts,
+        repeat_outside_counts,
+        repeat_within_probability,
+        repeat_outside_probability,
+    )
     average_new = _safe_average(new_distance_sum, new_connected)
     average_all = _safe_average(all_distance_sum, all_connected)
     def compare_cluster(
@@ -568,6 +619,7 @@ def build_cluster_link_plots(
         semantic_histograms,
         semantic_baseline_histograms,
         semantic_distance_by_year,
+        repeat_probability_by_lag,
     )
 
     output.mkdir(parents=True, exist_ok=True)
@@ -613,11 +665,39 @@ def build_cluster_link_plots(
         y_label="Average link distance (connected only; existing links = 1)",
         dpi=dpi,
     )
+    repeat_plot_names = []
+    for lag, context, probabilities in (
+        (1, "within", repeat_within_probability),
+        (1, "outside", repeat_outside_probability),
+        (3, "within", repeat_within_probability),
+        (3, "outside", repeat_outside_probability),
+    ):
+        values = (
+            probabilities[lag - 1]
+            if probabilities.shape[0] >= lag
+            else np.full(cluster_count, np.nan, dtype=np.float64)
+        )
+        filename = f"cluster_repeat_y_plus_{lag}_{context}.png"
+        repeat_plot_names.append(filename)
+        _write_scatter(
+            output / filename,
+            paper_counts,
+            values,
+            labels,
+            _residual_highlights(paper_counts, values),
+            title=(
+                f"Cluster size and y+{lag} repeat probability "
+                f"{context} the originating cluster"
+            ),
+            y_label=f"Exact y+{lag} repeat probability ({context})",
+            dpi=dpi,
+            probability=True,
+        )
     source_digest = manifest_sha256(root / "manifest.json")
     complete_manifest(
         output,
         {
-            "artifact_version": 1,
+            "artifact_version": 2,
             "new_links_manifest_sha256": source_digest,
             "summary": summary_path.name,
             "plots": [
@@ -625,6 +705,7 @@ def build_cluster_link_plots(
                 "cluster_first_semantic_link_distance.png",
                 "cluster_semantic_link_distance.png",
                 "cluster_all_link_distance.png",
+                *repeat_plot_names,
             ],
         },
         stage="visualize-new-links",
@@ -1239,6 +1320,71 @@ def _safe_average(total: np.ndarray, count: np.ndarray) -> np.ndarray:
     return result
 
 
+def _repeat_denominators(
+    years: Sequence[int],
+    attributed_new_by_year: np.ndarray,
+) -> np.ndarray:
+    if not years:
+        return np.zeros((0, attributed_new_by_year.shape[1]), dtype=np.int64)
+    max_lag = max(years) - min(years)
+    result = np.zeros(
+        (max_lag, attributed_new_by_year.shape[1]),
+        dtype=np.int64,
+    )
+    final_year = max(years)
+    for year_index, origin_year in enumerate(years):
+        observable_lags = final_year - int(origin_year)
+        if observable_lags > 0:
+            result[:observable_lags] += attributed_new_by_year[year_index]
+    return result
+
+
+def _safe_probability_matrix(
+    count: np.ndarray,
+    denominator: np.ndarray,
+) -> np.ndarray:
+    result = np.full(count.shape, np.nan, dtype=np.float64)
+    np.divide(count, denominator, out=result, where=denominator > 0)
+    return result
+
+
+def _repeat_probability_series(
+    denominators: np.ndarray,
+    within_counts: np.ndarray,
+    outside_counts: np.ndarray,
+    within_probabilities: np.ndarray,
+    outside_probabilities: np.ndarray,
+) -> list[list[dict[str, int | float]]]:
+    if not (
+        denominators.shape
+        == within_counts.shape
+        == outside_counts.shape
+        == within_probabilities.shape
+        == outside_probabilities.shape
+    ):
+        raise ValueError("Repeat-link summary matrices do not align")
+    cluster_count = denominators.shape[1]
+    return [
+        [
+            {
+                "lag": lag + 1,
+                "eligible_links": int(denominators[lag, cluster]),
+                "within_count": int(within_counts[lag, cluster]),
+                "outside_count": int(outside_counts[lag, cluster]),
+                "within_probability": float(
+                    within_probabilities[lag, cluster]
+                ),
+                "outside_probability": float(
+                    outside_probabilities[lag, cluster]
+                ),
+            }
+            for lag in range(denominators.shape[0])
+            if denominators[lag, cluster] > 0
+        ]
+        for cluster in range(cluster_count)
+    ]
+
+
 def _residual_highlights(
     paper_counts: np.ndarray, averages: np.ndarray
 ) -> ResidualSelection:
@@ -1334,6 +1480,9 @@ def _summary_rows(
     ],
     semantic_distance_by_year: Sequence[
         Sequence[Sequence[int | float]]
+    ],
+    repeat_probability_by_lag: Sequence[
+        Sequence[Mapping[str, int | float]]
     ],
 ) -> list[dict[str, object]]:
     new_highlighted = set(int(index) for index in new_selection.highlighted)
@@ -1455,6 +1604,10 @@ def _summary_rows(
                 "semantic_link_distance_by_year": _series_json(
                     semantic_distance_by_year[index]
                 ),
+                "repeat_link_probability_by_lag": json.dumps(
+                    repeat_probability_by_lag[index],
+                    separators=(",", ":"),
+                ),
             }
         )
     return rows
@@ -1568,6 +1721,7 @@ def _write_summary(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         "semantic_link_distance_distribution",
         "semantic_link_baseline_distance_distribution",
         "semantic_link_distance_by_year",
+        "repeat_link_probability_by_lag",
     ]
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", newline="", encoding="utf-8") as handle:
@@ -1615,11 +1769,13 @@ def _write_scatter(
     title: str,
     y_label: str,
     dpi: int,
+    probability: bool = False,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
+    from matplotlib.ticker import PercentFormatter
 
     valid = (paper_counts > 0) & np.isfinite(averages)
     figure, axis = plt.subplots(figsize=(9.5, 6.2), facecolor="white")
@@ -1687,12 +1843,15 @@ def _write_scatter(
         axis.text(
             0.5,
             0.5,
-            "No clusters have connected distance observations",
+            "No clusters have observations",
             ha="center",
             va="center",
             transform=axis.transAxes,
         )
     axis.set_xscale("log")
+    if probability:
+        axis.set_ylim(0.0, 1.0)
+        axis.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     axis.set_xlabel("Cluster size (papers, log scale)")
     axis.set_ylabel(y_label)
     axis.set_title(title, loc="left", fontsize=13, fontweight="medium", pad=12)

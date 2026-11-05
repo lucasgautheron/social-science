@@ -1,8 +1,8 @@
 """Shape classes for cluster publication series.
 
 Each series is a yearly paper count divided by that year's corpus size. The
-count is logged with a pseudocount of 5% of the series peak, then a
-topic-specific year effect is removed. Flat, linear, and quadratic trends
+count is logged with a fixed one-paper pseudocount, then a topic-specific year
+effect is removed. Flat, linear, and quadratic trends
 compete with a permanent step and a positive decaying shock. Every candidate
 includes an offset for 2023–2025 when both sides of that break are observed.
 The abrupt shape is kept only when it beats the best smooth trend by more than
@@ -33,21 +33,18 @@ TRENDS_CSV = "cluster_trends.csv"
 MIN_YEARS = 8
 MIN_DBIC = 6.0
 MIN_BURST = 0.15
-PSEUDO_FRACTION = 0.05
+PSEUDO_COUNT = 1.0
 BREAK_YEAR = 2023
 ONSET_FIRST = 2011
 ONSET_LAST = 2022
 TOPIC_REF_MIN = 15
 LAMBDAS = (0.15, 0.25, 0.35, 0.5, 0.7, 1.0, 1.5, 2.5)
-ARM_RATIO = 0.35
 
 SHAPE_CLASSES = (
     "stable",
     "steady rise",
     "accelerating rise",
     "saturating rise",
-    "rise then fall",
-    "fall then rise",
     "steady decline",
     "accelerating decline",
     "flattening decline",
@@ -63,8 +60,6 @@ LINK_DISTANCE_CLASSES = (
     "stable",
     "rise",
     "decline",
-    "rise then fall",
-    "fall then rise",
     "shock: transient",
     "shock: lasting",
     "abrupt drop",
@@ -102,7 +97,7 @@ def link_distance_class(subclass: str) -> str:
 
 
 def log_activity(count: np.ndarray, share: np.ndarray) -> np.ndarray:
-    """Log share with a pseudocount of 5% of each series' peak count.
+    """Log share with a fixed one-paper pseudocount.
 
     Years with a zero share take the median corpus size of the positive
     shares, so a missing year is not a divide-by-zero.
@@ -118,8 +113,7 @@ def log_activity(count: np.ndarray, share: np.ndarray) -> np.ndarray:
     total = np.array(total, copy=True)
     total[share == 0] = np.median(positive)
     total = np.maximum(total, 1e-12)
-    pseudo = PSEUDO_FRACTION * count.max(axis=1, keepdims=True)
-    numerator = np.maximum(count + pseudo, 1e-12)
+    numerator = np.maximum(count + PSEUDO_COUNT, 1e-12)
     return np.log(numerator / total)
 
 
@@ -544,16 +538,7 @@ def _subclass(
     if chosen == "linear":
         return "steady rise" if fitted[-1] > fitted[0] else "steady decline"
     if chosen == "quad":
-        quadratic, slope, offset = np.polyfit(rescaled, fitted, 2)
-        if quadratic != 0:
-            vertex = float(np.clip(-slope / (2 * quadratic), -1, 1))
-        else:
-            vertex = 1.0
-        turning = float(np.polyval([quadratic, slope, offset], vertex))
-        left = abs(turning - fitted[0])
-        right = abs(fitted[-1] - turning)
-        if min(left, right) > ARM_RATIO * max(left, right):
-            return "rise then fall" if quadratic < 0 else "fall then rise"
+        quadratic = float(np.polyfit(rescaled, fitted, 2)[0])
         if trend > 0:
             return "accelerating rise" if quadratic > 0 else "saturating rise"
         return "accelerating decline" if quadratic < 0 else "flattening decline"
