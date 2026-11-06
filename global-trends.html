@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Yearly collaborator topic breadth, out-of-topic share, and Rao–Stirling diversity">
+    <title>Global trends · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app list-app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Global trends</h1>
+          <nav aria-label="Site">
+            <a href="clusters.html">Clusters</a>
+            <a href="link-distances.html">Link distances</a>
+            <a href="shapes.html">Shapes</a>
+            <a href="global-trends.html" aria-current="page">Global trends</a>
+          </nav>
+        </div>
+        <p class="intro">Mean collaborator-topic breadth, the share of collaborators from another primary topic, and Rao–Stirling diversity. Each author has equal weight. The dashed line continues the unweighted pre-2022 trend.</p>
+      </header>
+      <p id="summary" class="summary">Loading global trends…</p>
+      <p class="distance-legend" aria-hidden="true">
+        <span><i class="cluster-swatch"></i>Observed</span>
+        <span><i class="baseline-swatch"></i>Expected from before 2022</span>
+      </p>
+      <section id="trends" class="trend-grid" aria-label="Global topic trends"></section>
+      <section class="card methodology">
+        <h2>Formula and methodology</h2>
+        <dl>
+          <dt>Population</dt>
+          <dd>For year t, an author is eligible when they have at least one unique coauthor on their year-t papers and both the author and that coauthor have a leave-year-out primary topic. Collaborators are distinct people. Solo papers contribute to topic profiles but create no collaborators. Every eligible author receives equal weight, and all three panels use this population.</dd>
+          <dt>Leave-year-out primary topic</dt>
+          <dd>Start from the stored fractional author-topic profile, subtract the 1/n weight of each paper published in year t, and discard nonpositive weights, topic outliers, and topics without vectors. The primary topic is the largest remaining weight. Equal weights use the smaller topic ID.</dd>
+          <dt>Collaborators' primary topics</dt>
+          <dd>The number of distinct primary topics among the author's classified coauthors.</dd>
+          <dt>Out-of-topic collaborators</dt>
+          <dd>The share of classified coauthors whose primary topic differs from the focal author's primary topic.</dd>
+          <dt>Rao–Stirling diversity</dt>
+          <dd>D = 1 − ||Σ pᵢvᵢ||², using equal-person topic shares among classified coauthors and the normalized c-TF-IDF topic vectors.</dd>
+          <dt>Coverage</dt>
+          <dd>Each year reports collaborating authors, authors without a leave-year-out primary topic, authors whose coauthors are all unclassified, and eligible authors. An author without a classified collaborator is excluded from every panel.</dd>
+          <dt>Expected trend</dt>
+          <dd>The dashed line is an unweighted OLS fit of each yearly mean against year for years before 2022. It is drawn from 2022 through the final year. Both observed and expected endpoints are labeled, and 2022 is marked.</dd>
+        </dl>
+      </section>
+    </main>
+    <script src="global-trends.js" defer></script>
+  </body>
+</html>

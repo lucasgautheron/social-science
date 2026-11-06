@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Shape classes of keyword-cluster publication series">
+    <title>Shapes · OpenAlex Events</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app list-app">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow">OpenAlex events</p>
+          <h1>Shapes</h1>
+          <nav aria-label="Site">
+            <a href="clusters.html">Clusters</a>
+            <a href="link-distances.html">Link distances</a>
+            <a href="shapes.html" aria-current="page">Shapes</a>
+            <a href="global-trends.html">Global trends</a>
+          </nav>
+        </div>
+        <p class="intro">Topic-adjusted log activity of every keyword cluster, classed by its smooth trend or an abrupt shock. Hover a point or a curve to see the cluster.</p>
+      </header>
+      <p id="summary" class="summary">Loading shape classes…</p>
+      <section class="card shape-card shape-section">
+        <h2>Trend and burstiness</h2>
+        <div class="shape-scatter-frame">
+          <svg id="shape-scatter" role="img" aria-label="Clusters by net trend and burstiness"></svg>
+          <div id="shape-tooltip" class="tooltip" hidden></div>
+        </div>
+        <div id="shape-legend" class="shape-legend"></div>
+      </section>
+      <section class="shape-section" aria-label="Shape class gallery">
+        <h2>Shape classes</h2>
+        <div id="shape-gallery" class="shape-gallery"></div>
+      </section>
+      <section class="card methodology">
+        <h2>Formula and methodology</h2>
+        <dl>
+          <dt>Log activity</dt>
+          <dd>Each year is log((papers + 1) / corpus size). The fixed one-paper pseudocount keeps zero-paper years finite without making earlier years depend on the cluster’s eventual peak. A year with share zero uses the median corpus size of the years that have a positive share.</dd>
+          <dt>Topic adjustment</dt>
+          <dd>The reference for a topic is the median demeaned trajectory of clusters whose largest topic is that topic, when at least 15 clusters share it. Otherwise the reference is the median of every cluster. Each cluster is corrected by the share-weighted mix of those references. Weight that is not assigned to a topic stays on the global median.</dd>
+          <dt>Shape comparison</dt>
+          <dd>Flat, linear, and quadratic curves compete with a permanent step and a positive shock that decays exponentially. Every candidate includes an offset for 2023–2025 when the year grid contains years on both sides of 2023. The abrupt shape is kept only when its BIC beats the best smooth curve by more than 6 and the jump explains at least 15% of the variance beyond that curve.</dd>
+          <dt>Gallery scaling</dt>
+          <dd>Each curve is the topic-adjusted log activity after subtracting its mean and dividing by the larger of its standard deviation and 0.5. Abrupt classes are aligned on the fitted onset. The grey band marks 2023–2025, the years absorbed by the break offset. The black line is the class median.</dd>
+        </dl>
+      </section>
+    </main>
+    <script src="shapes.js" defer></script>
+  </body>
+</html>
