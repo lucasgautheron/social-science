@@ -1,9 +1,9 @@
 """Slide figures for cluster shape classes.
 
 Four galleries show yearly publication frequency, its logarithm, and the
-topic-adjusted log share, with and without per-curve scaling. Three violins
+topic-adjusted log share, with and without per-curve scaling. Violins
 summarize author primary-topic diversity and the number of new links that
-publish again inside the originating cluster at y+1 and y+3.
+publish again inside or outside the originating cluster at y+1 and y+3.
 """
 
 from __future__ import annotations
@@ -76,6 +76,12 @@ OUTPUT_NAMES = (
     "author_primary_topic_diversity.pdf",
     "persistent_new_links_y_plus_1.pdf",
     "persistent_new_links_y_plus_3.pdf",
+    "outside_new_links_y_plus_1.pdf",
+    "outside_new_links_y_plus_3.pdf",
+    "persistent_new_links_by_size_y_plus_1.pdf",
+    "persistent_new_links_by_size_y_plus_3.pdf",
+    "outside_new_links_by_size_y_plus_1.pdf",
+    "outside_new_links_by_size_y_plus_3.pdf",
 )
 
 
@@ -92,6 +98,8 @@ class ClusterSeries:
     adjusted: np.ndarray
     diversity: float | None
     within_by_lag: Mapping[int, int | None]
+    outside_by_lag: Mapping[int, int | None]
+    papers: int
 
     @property
     def share_range(self) -> float:
@@ -200,7 +208,7 @@ def write_shape_gallery(
 ) -> list[Path]:
     """Write the slide PDFs and return their paths.
 
-    The two persistent-link violins are omitted when ``persistent`` is false.
+    Link violins and scatters are omitted when ``persistent`` is false.
     """
     if not series:
         raise ValueError("At least one classified cluster is required")
@@ -243,10 +251,44 @@ def write_shape_gallery(
                 destination / "persistent_new_links_y_plus_3.pdf",
             )
         )
-    else:
-        logger.warning(
-            "Skipping persistent-link violins; repeat counts are not available"
+        written.append(
+            _save(
+                _persistent_figure(series, lag=1, patterns=patterns, kind="outside"),
+                destination / "outside_new_links_y_plus_1.pdf",
+            )
         )
+        written.append(
+            _save(
+                _persistent_figure(series, lag=3, patterns=patterns, kind="outside"),
+                destination / "outside_new_links_y_plus_3.pdf",
+            )
+        )
+        written.append(
+            _save(
+                _persistent_size_figure(series, lag=1, patterns=patterns),
+                destination / "persistent_new_links_by_size_y_plus_1.pdf",
+            )
+        )
+        written.append(
+            _save(
+                _persistent_size_figure(series, lag=3, patterns=patterns),
+                destination / "persistent_new_links_by_size_y_plus_3.pdf",
+            )
+        )
+        written.append(
+            _save(
+                _persistent_size_figure(series, lag=1, patterns=patterns, kind="outside"),
+                destination / "outside_new_links_by_size_y_plus_1.pdf",
+            )
+        )
+        written.append(
+            _save(
+                _persistent_size_figure(series, lag=3, patterns=patterns, kind="outside"),
+                destination / "outside_new_links_by_size_y_plus_3.pdf",
+            )
+        )
+    else:
+        logger.warning("Skipping link figures; repeat counts are not available")
     logger.info("Wrote %s shape figures to %s", len(written), destination)
     return written
 
@@ -298,6 +340,9 @@ def load_trends(
                     f"Cluster {group} activity length does not match the year grid"
                 )
             papers, share = _align_counts(observed, group, years)
+            within_by_lag, outside_by_lag = (
+                ({}, {}) if repeats is None else repeats.get(group, ({}, {}))
+            )
             keywords = tuple(
                 part.strip() for part in row["keywords"].split(";") if part.strip()
             )
@@ -311,7 +356,9 @@ def load_trends(
                     log_share=log_share(papers, share),
                     adjusted=activity,
                     diversity=diversity.get(group),
-                    within_by_lag={} if repeats is None else repeats.get(group, {}),
+                    within_by_lag=within_by_lag,
+                    outside_by_lag=outside_by_lag,
+                    papers=int(round(float(papers.sum()))),
                 )
             )
     if not series:
@@ -333,12 +380,21 @@ def _align_counts(
     return papers, share
 
 
-def _within_by_lag(raw: object) -> dict[int, int | None]:
+def _optional_count(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _repeat_counts(raw: object) -> tuple[dict[int, int | None], dict[int, int | None]]:
     repeats = json.loads(raw) if isinstance(raw, str) else raw
-    found: dict[int, int | None] = {}
+    within: dict[int, int | None] = {}
+    outside: dict[int, int | None] = {}
     for item in repeats or []:
-        found[int(item["lag"])] = int(item["within_count"])
-    return found
+        lag = int(item["lag"])
+        within[lag] = _optional_count(item.get("within_count"))
+        outside[lag] = _optional_count(item.get("outside_count"))
+    return within, outside
 
 
 def _read_diversity(root: Path) -> dict[int, float | None]:
@@ -367,26 +423,28 @@ def _read_diversity(root: Path) -> dict[int, float | None]:
     return diversity
 
 
-def _read_repeats(root: Path) -> dict[int, dict[int, int | None]] | None:
-    """Return within-cluster repeat counts, or None when they are unavailable."""
+def _read_repeats(
+    root: Path,
+) -> dict[int, tuple[dict[int, int | None], dict[int, int | None]]] | None:
+    """Return within- and outside-cluster counts, or None when unavailable."""
     path = root.expanduser().resolve() / "cluster_link_distance_summary.csv"
     if not path.is_file():
         logger.warning(
-            "%s was not found. Persistent-link violins will be skipped.", path
+            "%s was not found. Link figures will be skipped.", path
         )
         return None
-    repeats: dict[int, dict[int, int | None]] = {}
+    repeats: dict[int, tuple[dict[int, int | None], dict[int, int | None]]] = {}
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or "repeat_link_probability_by_lag" not in reader.fieldnames:
             logger.warning(
                 "%s has no repeat_link_probability_by_lag column. "
-                "Persistent-link violins will be skipped.",
+                "Link figures will be skipped.",
                 path,
             )
             return None
         for row in reader:
-            repeats[int(row["cluster_id"])] = _within_by_lag(
+            repeats[int(row["cluster_id"])] = _repeat_counts(
                 row["repeat_link_probability_by_lag"]
             )
     return repeats
@@ -545,11 +603,25 @@ def _diversity_figure(
     return figure
 
 
+def _repeat_ylabel(kind: str) -> str:
+    if kind == "within":
+        return "Persistent new links"
+    if kind == "outside":
+        return "Outside-cluster repeats"
+    raise ValueError(f"Unknown repeat kind {kind!r}")
+
+
+def _lag_count(row: ClusterSeries, *, kind: str, lag: int) -> int | None:
+    counts = row.within_by_lag if kind == "within" else row.outside_by_lag
+    return counts.get(lag)
+
+
 def _persistent_figure(
     series: Sequence[ClusterSeries],
     *,
     lag: int,
     patterns: Mapping[str, str] | None = None,
+    kind: str = "within",
 ):
     samples = []
     for _title, classes, _pattern in PANELS:
@@ -557,23 +629,111 @@ def _persistent_figure(
         for row in series:
             if row.subclass not in classes:
                 continue
-            count = row.within_by_lag.get(lag)
+            count = _lag_count(row, kind=kind, lag=lag)
             if count is None or count <= 0:
                 continue
             counts.append(float(count))
         samples.append(np.asarray(counts, dtype=float))
     return _violin(
         samples,
-        "Persistent new links",
+        _repeat_ylabel(kind),
         mean_digits=1,
         log=True,
         exemplars=_exemplar_marks(
             series,
             patterns,
-            lambda row: row.within_by_lag.get(lag),
+            lambda row: _lag_count(row, kind=kind, lag=lag),
             positive=True,
         ),
     )
+
+
+def _persistent_size_figure(
+    series: Sequence[ClusterSeries],
+    *,
+    lag: int,
+    patterns: Mapping[str, str] | None = None,
+    kind: str = "within",
+):
+    """Scatter cluster size against within- or outside-cluster repeat counts."""
+    plt = _pyplot()
+    from matplotlib.ticker import LogFormatterMathtext
+
+    figure, axis = plt.subplots(figsize=FIGURE_SIZE, facecolor="white")
+    _style_axis(axis)
+    marks = _exemplar_marks(
+        series,
+        patterns,
+        lambda row: _lag_count(row, kind=kind, lag=lag),
+        positive=True,
+    )
+    highlighted = {label for panel in marks for label, _value in panel}
+    for index, (title, classes, _pattern) in enumerate(PANELS):
+        rows = [
+            row
+            for row in series
+            if row.subclass in classes
+            and row.label not in highlighted
+            and row.papers > 0
+            and (_lag_count(row, kind=kind, lag=lag) or 0) > 0
+        ]
+        if not rows:
+            continue
+        axis.scatter(
+            [row.papers for row in rows],
+            [float(_lag_count(row, kind=kind, lag=lag) or 0) for row in rows],
+            s=46,
+            color=PANEL_COLORS[index],
+            alpha=0.45,
+            edgecolors="none",
+            zorder=2,
+            label=title,
+        )
+    for panel in marks:
+        for label, value in panel:
+            row = next(item for item in series if item.label == label)
+            if row.papers <= 0:
+                continue
+            axis.scatter(
+                [row.papers],
+                [value],
+                s=90,
+                color=INK,
+                edgecolor="white",
+                linewidths=1.4,
+                zorder=4,
+            )
+            axis.annotate(
+                label,
+                (row.papers, value),
+                xytext=(6, _glyph_center_shift(label, 15)),
+                textcoords="offset points",
+                ha="left",
+                va="baseline",
+                color=INK,
+                fontsize=15,
+                fontweight="bold",
+                annotation_clip=False,
+                zorder=5,
+            )
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    formatter = LogFormatterMathtext(base=10)
+    axis.xaxis.set_major_formatter(formatter)
+    axis.yaxis.set_major_formatter(formatter)
+    axis.set_xlabel("Cluster size", color=INK, fontsize=20, fontweight="bold")
+    axis.set_ylabel(_repeat_ylabel(kind), color=INK, fontsize=20, fontweight="bold")
+    handles, labels = axis.get_legend_handles_labels()
+    if handles:
+        legend = axis.legend(
+            handles, labels, frameon=False, loc="upper left", fontsize=16
+        )
+        for text in legend.get_texts():
+            text.set_color(INK)
+            text.set_fontweight("bold")
+    figure.tight_layout()
+    _bold_ticks(figure, size=16)
+    return figure
 
 
 def _exemplar_marks(
@@ -600,8 +760,23 @@ def _exemplar_marks(
     return marks
 
 
+def _glyph_center_shift(label: str, fontsize: float) -> float:
+    """Return the point offset that puts the drawn glyphs on the anchor."""
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+
+    ink = TextPath(
+        (0, 0),
+        label,
+        size=fontsize,
+        prop=FontProperties(size=fontsize, weight="bold"),
+    ).get_extents()
+    return -0.5 * (float(ink.y0) + float(ink.y1))
+
+
 def _draw_exemplar_points(axis, marks: Sequence[Sequence[tuple[str, float]]]) -> None:
     positions = (1, 2, 3, 4)
+    label_size = 15
     for position, panel in zip(positions, marks, strict=True):
         for index, (label, value) in enumerate(panel):
             x = position + 0.22 + 0.07 * index
@@ -617,12 +792,12 @@ def _draw_exemplar_points(axis, marks: Sequence[Sequence[tuple[str, float]]]) ->
             axis.annotate(
                 label,
                 (x, value),
-                xytext=(6, 0),
+                xytext=(6, _glyph_center_shift(label, label_size)),
                 textcoords="offset points",
                 ha="left",
-                va="center",
+                va="baseline",
                 color=INK,
-                fontsize=15,
+                fontsize=label_size,
                 fontweight="bold",
                 annotation_clip=False,
                 zorder=9,

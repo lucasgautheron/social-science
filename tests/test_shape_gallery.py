@@ -15,7 +15,9 @@ from openalex.visualizations.shape_gallery import (
     ClusterSeries,
     _diversity_figure,
     _gallery_figure,
+    _glyph_center_shift,
     _persistent_figure,
+    _persistent_size_figure,
     keyword_match,
     load_trends,
     log_share,
@@ -47,6 +49,7 @@ def _cluster(
     keywords: tuple[str, ...] | None = None,
     diversity: float | None = 0.5,
     within: dict[int, int | None] | None = None,
+    outside: dict[int, int | None] | None = None,
     adjusted_shift: float = 3.0,
 ) -> ClusterSeries:
     words = keywords if keywords is not None else (label,)
@@ -61,6 +64,8 @@ def _cluster(
         adjusted=share + adjusted_shift,
         diversity=diversity,
         within_by_lag={1: 4, 3: 2} if within is None else within,
+        outside_by_lag={1: 1, 3: 1} if outside is None else outside,
+        papers=int(round(float(papers.sum()))),
     )
 
 
@@ -74,6 +79,7 @@ def _corpus() -> list[ClusterSeries]:
             _share(0.004, 0.003),
             diversity=0.2,
             within={1: 0, 3: 2},
+            outside={1: 3, 3: 0},
         ),
         _cluster(
             2,
@@ -82,6 +88,7 @@ def _corpus() -> list[ClusterSeries]:
             _share(0.002),
             diversity=0.4,
             within={1: 4, 3: 6},
+            outside={1: 0, 3: 4},
         ),
         _cluster(
             3,
@@ -91,6 +98,7 @@ def _corpus() -> list[ClusterSeries]:
             keywords=("nanotube",),
             diversity=0.5,
             within={1: 10, 3: 8},
+            outside={1: 11, 3: 2},
         ),
         _cluster(
             4,
@@ -100,6 +108,7 @@ def _corpus() -> list[ClusterSeries]:
             keywords=("nanowires",),
             diversity=0.7,
             within={1: 6, 3: 4},
+            outside={1: 1, 3: 0},
         ),
         _cluster(
             5,
@@ -109,6 +118,7 @@ def _corpus() -> list[ClusterSeries]:
             keywords=("nanopowders",),
             diversity=None,
             within={1: 2, 3: 1},
+            outside={1: 0, 3: 5},
         ),
         _cluster(
             6,
@@ -117,6 +127,7 @@ def _corpus() -> list[ClusterSeries]:
             _share(0.001, spike=shock_index),
             diversity=0.6,
             within={1: 0, 3: 3},
+            outside={1: 8, 3: 0},
         ),
         _cluster(
             7,
@@ -125,6 +136,7 @@ def _corpus() -> list[ClusterSeries]:
             _share(0.001, spike=shock_index),
             diversity=0.8,
             within={1: 5, 3: 7},
+            outside={1: 0, 3: 6},
         ),
         _cluster(
             8,
@@ -133,6 +145,7 @@ def _corpus() -> list[ClusterSeries]:
             _share(0.003, 0.004),
             diversity=0.9,
             within={1: 9, 3: 5},
+            outside={1: 2, 3: 7},
         ),
         _cluster(
             9,
@@ -142,6 +155,7 @@ def _corpus() -> list[ClusterSeries]:
             keywords=("covid-19",),
             diversity=0.3,
             within={1: 3, 3: 1},
+            outside={1: 4, 3: 1},
         ),
     ]
 
@@ -290,6 +304,8 @@ def test_diversity_mean_matches_the_plotted_clusters():
     labels = _labels(figure.axes[0])
     assert labels["0.300"].get_text() == "0.300"
     assert "0.600" in labels
+    assert labels["llm"].get_va() == "baseline"
+    assert labels["llm"].xyann[1] == pytest.approx(_glyph_center_shift("llm", 15))
     assert labels["llm"].xy[1] == pytest.approx(0.2)
     assert labels["nanowires"].xy[1] == pytest.approx(0.7)
     assert labels["nanotube"].xy[1] == pytest.approx(0.5)
@@ -315,6 +331,45 @@ def test_zero_repeat_counts_are_omitted_from_the_log_axis():
     assert "hydroxychloroquine" not in _labels(axis)
     assert sorted(point[1] for point in _ink_scatter(axis)) == pytest.approx([6.0, 9.0, 10.0])
     figure.clf()
+
+
+def test_size_scatter_plots_within_counts_against_cluster_size():
+    series = _corpus()
+    figure = _persistent_size_figure(series, lag=1)
+    axis = figure.axes[0]
+    assert axis.get_xscale() == "log"
+    assert axis.get_yscale() == "log"
+    assert axis.get_xlabel() == "Cluster size"
+    offsets = [point for collection in axis.collections for point in collection.get_offsets()]
+    plotted = {int(round(point[1])) for point in offsets}
+    assert plotted == {2, 3, 4, 5, 6, 9, 10}
+    assert "llm" not in _labels(axis)
+    assert "hydroxychloroquine" not in _labels(axis)
+    nanotube = next(row for row in series if row.label == "nanotube")
+    nanotube_point = next(point for point in offsets if int(round(point[1])) == 10)
+    assert nanotube_point[0] == pytest.approx(nanotube.papers)
+    figure.clf()
+
+
+def test_outside_repeats_use_the_outside_count():
+    series = _corpus()
+    figure = _persistent_figure(series, lag=1, kind="outside")
+    axis = figure.axes[0]
+    assert axis.get_ylabel() == "Outside-cluster repeats"
+    assert "n=1" in axis.get_xticklabels()[0].get_text()
+    assert "n=2" in axis.get_xticklabels()[1].get_text()
+    assert _labels(axis)["8.0"].get_text() == "8.0"
+    assert "llm" in _labels(axis)
+    assert "hydroxychloroquine" in _labels(axis)
+    assert "other-rise" not in _labels(axis)
+    figure.clf()
+    scatter = _persistent_size_figure(series, lag=1, kind="outside")
+    offsets = [
+        point for collection in scatter.axes[0].collections for point in collection.get_offsets()
+    ]
+    assert {int(round(point[1])) for point in offsets} == {1, 2, 3, 4, 8, 11}
+    assert scatter.axes[0].get_ylabel() == "Outside-cluster repeats"
+    scatter.clf()
 
 
 def test_write_shape_gallery_writes_seven_pdfs(tmp_path: Path):
@@ -371,7 +426,7 @@ def test_load_trends_rebuilds_the_year_grid(tmp_path: Path):
             {
                 "cluster_id": 4,
                 "repeat_link_probability_by_lag": json.dumps(
-                    [{"lag": 1, "within_count": 8}]
+                    [{"lag": 1, "within_count": 8, "outside_count": 5}]
                 ),
             }
         )
@@ -388,6 +443,8 @@ def test_load_trends_rebuilds_the_year_grid(tmp_path: Path):
     assert series[0].adjusted.tolist() == [1.0, 2.0]
     assert series[0].diversity == pytest.approx(0.4)
     assert series[0].within_by_lag == {1: 8}
+    assert series[0].outside_by_lag == {1: 5}
+    assert series[0].papers == 10
 
 
 def test_missing_repeat_column_skips_link_violins(tmp_path: Path):
@@ -449,3 +506,4 @@ def test_missing_repeat_column_skips_link_violins(tmp_path: Path):
     paths = write_shape_gallery(_corpus(), YEARS, tmp_path / "figures", persistent=False)
     assert [path.name for path in paths] == list(OUTPUT_NAMES[:5])
     assert not (tmp_path / "figures" / "persistent_new_links_y_plus_1.pdf").exists()
+    assert not (tmp_path / "figures" / "outside_new_links_y_plus_1.pdf").exists()
