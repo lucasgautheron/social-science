@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -60,7 +61,7 @@ PANEL_ALIASES = {
 }
 GALLERIES = (
     ("shapes_normalized.pdf", "share_scaled", "Scaled share of publications", True),
-    ("shapes_unnormalized.pdf", "log_share", "Log share of publications", False),
+    ("shapes_unnormalized.pdf", "log_share", "Share of publications", False),
     (
         "shapes_topic_adjusted_normalized.pdf",
         "adjusted_scaled",
@@ -224,18 +225,21 @@ def write_shape_gallery(
         for name, key, ylabel, symmetric in GALLERIES
     ]
     written.append(
-        _save(_diversity_figure(series), destination / "author_primary_topic_diversity.pdf")
+        _save(
+            _diversity_figure(series, patterns),
+            destination / "author_primary_topic_diversity.pdf",
+        )
     )
     if persistent:
         written.append(
             _save(
-                _persistent_figure(series, lag=1),
+                _persistent_figure(series, lag=1, patterns=patterns),
                 destination / "persistent_new_links_y_plus_1.pdf",
             )
         )
         written.append(
             _save(
-                _persistent_figure(series, lag=3),
+                _persistent_figure(series, lag=3, patterns=patterns),
                 destination / "persistent_new_links_y_plus_3.pdf",
             )
         )
@@ -430,7 +434,7 @@ def _gallery_figure(
             values = row.values(key)
             axis.plot(years, values, color="white", lw=5.4, zorder=4, solid_capstyle="round")
             axis.plot(years, values, color=INK, lw=2.6, zorder=5, solid_capstyle="round")
-        _place_labels(axis, highlights, key, years, ylim)
+        _place_labels(axis, highlights, key)
         axis.set_title(
             f"{title}   (n={len(members):,})",
             color=INK,
@@ -439,6 +443,8 @@ def _gallery_figure(
             pad=10,
         )
     _year_ticks(axes.ravel(), years)
+    if key == "log_share":
+        _log_share_ticks(axes.ravel())
     figure.supxlabel("Year", fontsize=20, fontweight="bold", color=INK)
     figure.supylabel(ylabel, fontsize=20, fontweight="bold", color=INK)
     figure.tight_layout(rect=(0.03, 0.03, 0.995, 0.985))
@@ -450,21 +456,20 @@ def _place_labels(
     axis,
     highlights: Sequence[ClusterSeries],
     key: str,
-    years: np.ndarray,
-    ylim: tuple[float, float],
 ) -> None:
-    del ylim
     if not highlights:
         return
-    anchor = min(2, int(years.size) - 1)
-    x = float(years[anchor])
+    from matplotlib.transforms import blended_transform_factory
+
+    transform = blended_transform_factory(axis.transAxes, axis.transData)
     multiple = len(highlights) > 1
     for index, row in enumerate(highlights):
         above = multiple and index == len(highlights) - 1
         axis.annotate(
             row.label,
-            (x, float(row.values(key)[anchor])),
-            xytext=(8, 12 if above else -12),
+            (0.0, float(row.values(key)[0])),
+            xycoords=transform,
+            xytext=(4, 12 if above else -12),
             textcoords="offset points",
             ha="left",
             va="bottom" if above else "top",
@@ -474,6 +479,22 @@ def _place_labels(
             annotation_clip=False,
             zorder=6,
         )
+
+
+def _log_share_ticks(axes) -> None:
+    """Label the logged frequency axis as powers of ten."""
+    low, high = axes[0].get_ylim()
+    start = math.ceil(low - 1e-9)
+    stop = math.floor(high + 1e-9)
+    span = max(stop - start, 0)
+    step = 1 if span <= 8 else 2 if span <= 16 else 5
+    ticks = list(range(start, stop + 1, step))
+    if len(ticks) < 2:
+        ticks = [int(round(low)), int(round(high))]
+    labels = [rf"$10^{{{tick}}}$" for tick in ticks]
+    for axis in axes:
+        axis.set_yticks(ticks)
+        axis.set_yticklabels(labels)
 
 
 def _shared_limits(values: np.ndarray, symmetric: bool) -> tuple[float, float]:
@@ -487,7 +508,10 @@ def _shared_limits(values: np.ndarray, symmetric: bool) -> tuple[float, float]:
     return (float(finite.min()) - pad, float(finite.max()) + pad)
 
 
-def _diversity_figure(series: Sequence[ClusterSeries]):
+def _diversity_figure(
+    series: Sequence[ClusterSeries],
+    patterns: Mapping[str, str] | None = None,
+):
     samples = []
     for _title, classes, _pattern in PANELS:
         values = np.asarray(
@@ -504,6 +528,12 @@ def _diversity_figure(series: Sequence[ClusterSeries]):
         "Author primary-topic diversity",
         mean_digits=3,
         log=False,
+        exemplars=_exemplar_marks(
+            series,
+            patterns,
+            lambda row: row.diversity,
+            positive=False,
+        ),
     )
     finite = [sample for sample in samples if sample.size]
     if finite:
@@ -515,7 +545,12 @@ def _diversity_figure(series: Sequence[ClusterSeries]):
     return figure
 
 
-def _persistent_figure(series: Sequence[ClusterSeries], *, lag: int):
+def _persistent_figure(
+    series: Sequence[ClusterSeries],
+    *,
+    lag: int,
+    patterns: Mapping[str, str] | None = None,
+):
     samples = []
     for _title, classes, _pattern in PANELS:
         counts = []
@@ -527,7 +562,71 @@ def _persistent_figure(series: Sequence[ClusterSeries], *, lag: int):
                 continue
             counts.append(float(count))
         samples.append(np.asarray(counts, dtype=float))
-    return _violin(samples, "Persistent new links", mean_digits=1, log=True)
+    return _violin(
+        samples,
+        "Persistent new links",
+        mean_digits=1,
+        log=True,
+        exemplars=_exemplar_marks(
+            series,
+            patterns,
+            lambda row: row.within_by_lag.get(lag),
+            positive=True,
+        ),
+    )
+
+
+def _exemplar_marks(
+    series: Sequence[ClusterSeries],
+    patterns: Mapping[str, str] | None,
+    reader,
+    *,
+    positive: bool,
+) -> list[list[tuple[str, float]]]:
+    """Return each panel's exemplar labels and plotted values."""
+    selected = patterns if patterns is not None else parse_exemplars(None)
+    marks = []
+    for title, classes, _pattern in PANELS:
+        panel = []
+        for row in select_highlights(series, classes, selected[title]):
+            raw = reader(row)
+            if raw is None:
+                continue
+            value = float(raw)
+            if not np.isfinite(value) or (positive and value <= 0):
+                continue
+            panel.append((row.label, value))
+        marks.append(panel)
+    return marks
+
+
+def _draw_exemplar_points(axis, marks: Sequence[Sequence[tuple[str, float]]]) -> None:
+    positions = (1, 2, 3, 4)
+    for position, panel in zip(positions, marks, strict=True):
+        for index, (label, value) in enumerate(panel):
+            x = position + 0.22 + 0.07 * index
+            axis.scatter(
+                [x],
+                [value],
+                s=86,
+                color=INK,
+                edgecolor="white",
+                linewidths=1.4,
+                zorder=8,
+            )
+            axis.annotate(
+                label,
+                (x, value),
+                xytext=(6, 0),
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                color=INK,
+                fontsize=15,
+                fontweight="bold",
+                annotation_clip=False,
+                zorder=9,
+            )
 
 
 def _violin(
@@ -536,6 +635,7 @@ def _violin(
     *,
     mean_digits: int,
     log: bool,
+    exemplars: Sequence[Sequence[tuple[str, float]]] | None = None,
 ):
     plt = _pyplot()
     figure, axis = plt.subplots(figsize=FIGURE_SIZE, facecolor="white")
@@ -623,6 +723,8 @@ def _violin(
         finite = np.concatenate([sample for _position, sample in observed])
         span = float(finite.max()) - float(finite.min()) or 1.0
         axis.set_ylim(float(finite.min()) - 0.08 * span, float(finite.max()) + 0.22 * span)
+    if exemplars:
+        _draw_exemplar_points(axis, exemplars)
     figure.tight_layout()
     _bold_ticks(figure, size=16, axis="y")
     return figure

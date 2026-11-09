@@ -154,6 +154,16 @@ def _labels(axis) -> dict[str, object]:
     return {text.get_text(): text for text in axis.texts}
 
 
+def _ink_scatter(axis):
+    points = []
+    for collection in axis.collections:
+        colors = collection.get_facecolors()
+        if len(colors) == 0 or to_hex(colors[0]) != INK:
+            continue
+        points.extend((float(x), float(y)) for x, y in collection.get_offsets())
+    return points
+
+
 def test_command_is_registered():
     assert COMMANDS["visualize-shapes"] == "openalex.visualizations.shape_gallery"
 
@@ -238,12 +248,15 @@ def test_unnormalized_gallery_plots_log_share():
         series,
         YEARS,
         "log_share",
-        "Log share of publications",
+        "Share of publications",
         False,
         parse_exemplars(None),
     )
     plotted = _ink_lines(figure.axes[0])[-1].get_ydata()
     assert plotted == pytest.approx(llm.log_share)
+    tick_labels = [tick.get_text() for tick in figure.axes[0].get_yticklabels() if tick.get_text()]
+    assert tick_labels
+    assert all(label.startswith(r"$10^{") and label.endswith(r"}$") for label in tick_labels)
     figure.clf()
 
 
@@ -260,6 +273,8 @@ def test_highlight_labels_are_left_anchored():
     rising = _labels(figure.axes[0])
     declining = _labels(figure.axes[1])
     assert rising["llm"].get_ha() == "left"
+    assert rising["llm"].xy[0] == pytest.approx(0.0)
+    assert rising["llm"].xyann[0] == pytest.approx(4)
     assert rising["llm"].get_va() == "top"
     assert declining["nanotube"].get_va() == "bottom"
     assert declining["nanowires"].get_va() == "top"
@@ -275,6 +290,13 @@ def test_diversity_mean_matches_the_plotted_clusters():
     labels = _labels(figure.axes[0])
     assert labels["0.300"].get_text() == "0.300"
     assert "0.600" in labels
+    assert labels["llm"].xy[1] == pytest.approx(0.2)
+    assert labels["nanowires"].xy[1] == pytest.approx(0.7)
+    assert labels["nanotube"].xy[1] == pytest.approx(0.5)
+    assert labels["hydroxychloroquine"].xy[1] == pytest.approx(0.6)
+    assert labels["covid"].xy[1] == pytest.approx(0.9)
+    scatter = _ink_scatter(figure.axes[0])
+    assert sorted(point[1] for point in scatter) == pytest.approx([0.2, 0.5, 0.6, 0.7, 0.9])
     tick = figure.axes[0].get_xticklabels()[1].get_text()
     assert "n=2" in tick
     figure.clf()
@@ -289,6 +311,9 @@ def test_zero_repeat_counts_are_omitted_from_the_log_axis():
     assert "n=1" in axis.get_xticklabels()[2].get_text()
     assert _labels(axis)["4.0"].get_text() == "4.0"
     assert _labels(axis)["6.0"].get_text() == "6.0"
+    assert "llm" not in _labels(axis)
+    assert "hydroxychloroquine" not in _labels(axis)
+    assert sorted(point[1] for point in _ink_scatter(axis)) == pytest.approx([6.0, 9.0, 10.0])
     figure.clf()
 
 
