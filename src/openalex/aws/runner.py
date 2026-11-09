@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
-from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
+from openalex.artifacts.cache import ArtifactCache
 from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import manifest_sha256
 from openalex.artifacts.resolver import ArtifactResolver
@@ -1909,8 +1909,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument(
         "--artifact-cache",
-        default=str(DEFAULT_CACHE_DIR),
-        help="Local content-addressed artifact cache.",
+        default=None,
+        help=(
+            "Local content-addressed artifact cache. Defaults to "
+            ".openalex-cache/artifacts in the working directory."
+        ),
     )
     submit.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="Remote local scratch directory.")
     submit.add_argument("--executor", choices=["ssm", "ssh"], default="ssm", help="Remote executor.")

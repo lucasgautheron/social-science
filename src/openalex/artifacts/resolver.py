@@ -99,8 +99,10 @@ class ArtifactResolver:
                     f"Artifact {logical} ({digest[:12]}) is not local or cached, "
                     "and no S3 artifact store is configured."
                 )
+            self.cache.root.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(
-                prefix=f"openalex-{digest[:12]}-"
+                prefix=f"openalex-{digest[:12]}-",
+                dir=self.cache.root,
             ) as temp_dir:
                 downloaded = Path(temp_dir) / digest
                 self.store.fetch(digest, downloaded)

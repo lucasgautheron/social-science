@@ -40,7 +40,7 @@ COMMANDS = {
 def _auto_hydrate(command: str, argv: Sequence[str]) -> None:
     if os.environ.get("OPENALEX_AUTO_HYDRATE", "1").lower() in {"0", "false", "no"}:
         return
-    from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
+    from openalex.artifacts.cache import ArtifactCache, default_cache_dir
     from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
     from openalex.artifacts.resolver import ArtifactResolver
     from openalex.artifacts.s3_store import S3ArtifactStore
@@ -77,9 +77,7 @@ def _auto_hydrate(command: str, argv: Sequence[str]) -> None:
         str(state.get("prefix", "")),
     )
     resolver = ArtifactResolver(
-        cache=ArtifactCache(
-            os.environ.get("OPENALEX_ARTIFACT_CACHE", str(DEFAULT_CACHE_DIR))
-        ),
+        cache=ArtifactCache(default_cache_dir()),
         lock=ArtifactLock(
             os.environ.get("OPENALEX_ARTIFACT_LOCK", str(DEFAULT_LOCK_PATH))
         ),

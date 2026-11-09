@@ -8,7 +8,7 @@ import pytest
 from openalex.analysis.new_links import (
     ARTIFACT_VERSION as NEW_LINK_ARTIFACT_VERSION,
 )
-from openalex.artifacts.cache import ArtifactCache
+from openalex.artifacts.cache import ArtifactCache, default_cache_dir
 from openalex.artifacts.lockfile import ArtifactLock, ArtifactPin
 from openalex.artifacts.manifest import (
     ArtifactValidationError,
@@ -69,6 +69,15 @@ def write_artifact(path, *, complete=True):
         {"artifact_version": 1, "complete": complete},
         stage="test",
     )
+
+
+def test_default_cache_dir_stays_in_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENALEX_ARTIFACT_CACHE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert default_cache_dir() == tmp_path / ".openalex-cache" / "artifacts"
+    assert ArtifactCache().root == tmp_path / ".openalex-cache" / "artifacts"
+    monkeypatch.setenv("OPENALEX_ARTIFACT_CACHE", str(tmp_path / "elsewhere"))
+    assert default_cache_dir() == tmp_path / "elsewhere"
 
 
 def test_complete_manifest_detects_corrupt_payload(tmp_path):

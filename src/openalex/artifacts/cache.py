@@ -11,7 +11,17 @@ from typing import Iterator
 
 from .manifest import ValidationResult, validate_artifact
 
-DEFAULT_CACHE_DIR = Path.home() / ".cache" / "openalex" / "artifacts"
+
+def default_cache_dir() -> Path:
+    """Return the artifact cache, outside the home directory by default.
+
+    Home quotas on shared clusters are too small for these payloads. The
+    working directory is used unless ``OPENALEX_ARTIFACT_CACHE`` is set.
+    """
+    configured = os.environ.get("OPENALEX_ARTIFACT_CACHE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.cwd() / ".openalex-cache" / "artifacts"
 
 
 @contextmanager
@@ -29,8 +39,8 @@ def digest_lock(cache_dir: Path, digest: str) -> Iterator[None]:
 
 
 class ArtifactCache:
-    def __init__(self, root: str | Path = DEFAULT_CACHE_DIR):
-        self.root = Path(root).expanduser()
+    def __init__(self, root: str | Path | None = None):
+        self.root = default_cache_dir() if root is None else Path(root).expanduser()
 
     def path_for(self, digest: str) -> Path:
         return self.root / digest

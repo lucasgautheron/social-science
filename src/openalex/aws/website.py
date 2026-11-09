@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from openalex.artifacts.cache import DEFAULT_CACHE_DIR, ArtifactCache
+from openalex.artifacts.cache import ArtifactCache
 from openalex.artifacts.lockfile import DEFAULT_LOCK_PATH, ArtifactLock
 from openalex.artifacts.manifest import ArtifactValidationError, read_json
 from openalex.artifacts.pipeline import (
@@ -165,11 +165,11 @@ def _submit_stage(
         args.last_run_path,
         "--artifact-lock",
         args.artifact_lock,
-        "--artifact-cache",
-        args.artifact_cache,
         "--branch",
         args.branch or runner.DEFAULT_BRANCH,
     ]
+    if args.artifact_cache:
+        values.extend(("--artifact-cache", args.artifact_cache))
     if args.profile:
         values.extend(("--profile", args.profile))
     if args.region:
@@ -425,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", default=None)
     parser.add_argument("--commit", default=None)
     parser.add_argument("--artifact-lock", default=str(DEFAULT_LOCK_PATH))
-    parser.add_argument("--artifact-cache", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--artifact-cache", default=None)
     parser.add_argument(
         "--force",
         action="append",

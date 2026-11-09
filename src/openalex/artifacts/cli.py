@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Sequence
 
-from .cache import DEFAULT_CACHE_DIR, ArtifactCache
+from .cache import ArtifactCache, default_cache_dir
 from .lockfile import DEFAULT_LOCK_PATH, ArtifactLock, ArtifactPin, normalize_logical_path
 from .manifest import read_json, validate_artifact
 from .resolver import ArtifactResolver
@@ -40,7 +40,7 @@ def _store(args: argparse.Namespace) -> S3ArtifactStore:
 def build_resolver(args: argparse.Namespace, *, require_store: bool) -> ArtifactResolver:
     store = _store(args) if require_store or Path(args.state_path).is_file() else None
     return ArtifactResolver(
-        cache=ArtifactCache(args.cache_dir),
+        cache=ArtifactCache(args.cache_dir or default_cache_dir()),
         lock=ArtifactLock(args.lock_path),
         store=store,
     )
@@ -112,7 +112,11 @@ def command_pin(args: argparse.Namespace) -> int:
                 )
                 if part
             ).rstrip("/")
-            with tempfile.TemporaryDirectory(prefix="openalex-run-artifact-") as temp_dir:
+            cache_root = Path(args.cache_dir or default_cache_dir())
+            cache_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="openalex-run-artifact-", dir=cache_root
+            ) as temp_dir:
                 imported = Path(temp_dir) / "artifact"
                 imported.mkdir()
                 objects = []
@@ -138,7 +142,7 @@ def command_pin(args: argparse.Namespace) -> int:
                 published = store.publish(imported)
                 digest = validation.digest
                 published_uri = published["s3_uri"]
-                cache = ArtifactCache(args.cache_dir)
+                cache = ArtifactCache(cache_root)
                 cache.promote(imported, digest)
                 cache.materialize(digest, logical)
                 manifest = validation.manifest
@@ -184,7 +188,14 @@ def command_publish(args: argparse.Namespace) -> int:
 
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lock-path", default=str(DEFAULT_LOCK_PATH))
-    parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help=(
+            "Content-addressed artifact cache. Defaults to "
+            ".openalex-cache/artifacts in the working directory."
+        ),
+    )
     parser.add_argument("--state-path", default=str(DEFAULT_STATE_PATH))
     parser.add_argument("--profile", default=None)
     parser.add_argument("--region", default=None)

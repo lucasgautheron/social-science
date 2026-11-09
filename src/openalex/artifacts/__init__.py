@@ -1,6 +1,6 @@
 """Portable, content-addressed pipeline artifacts."""
 
-from .cache import DEFAULT_CACHE_DIR, ArtifactCache
+from .cache import ArtifactCache, default_cache_dir
 from .lockfile import DEFAULT_LOCK_PATH, ArtifactLock, ArtifactPin
 from .manifest import (
     ARTIFACT_SCHEMA,
@@ -14,7 +14,7 @@ from .s3_store import S3ArtifactStore
 
 __all__ = [
     "ARTIFACT_SCHEMA",
-    "DEFAULT_CACHE_DIR",
+    "default_cache_dir",
     "DEFAULT_LOCK_PATH",
     "INVENTORY_FILENAME",
     "ArtifactCache",
