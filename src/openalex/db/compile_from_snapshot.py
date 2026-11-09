@@ -358,6 +358,7 @@ def make_snapshot_compiler_class(compile_module):
 
 def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description="Compile OpenAlex works from a local works snapshot."
     )
     parser.add_argument(

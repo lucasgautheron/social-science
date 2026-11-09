@@ -465,6 +465,21 @@ openalex cluster-trends \
   --cluster-topic-visualizations-dir output/cluster_topic_visualizations
 ```
 
+`openalex visualize-shapes` writes seven widescreen PDFs for slides. Four
+galleries show the collapsed rise and decline classes and the two shock
+classes, with `llm`, two `nano*` declines, `hydroxychloroquine`, and `covid`
+drawn on top. The curves are the yearly share, its logarithm, and the
+topic-adjusted log share, each also in a shape-scaled form. One violin shows
+author primary-topic diversity. Two more show the number of new links that
+publish again inside the originating cluster at y+1 and at y+3, on a
+logarithmic axis.
+
+```bash
+openalex visualize-shapes \
+  --clusters-dir output/event_clusters \
+  --output-dir output/shape_figures
+```
+
 The generated payload is stored as `data.json.gz`; the browser streams and
 decompresses it client-side so large sites remain below GitHub's 100 MB
 per-file limit.
@@ -567,6 +582,87 @@ openalex-aws logs
 openalex-aws artifacts
 openalex-aws download
 ```
+
+### Streaming a cluster-local snapshot
+
+`import-snapshot` extends the configured SQLite corpus without first copying a
+whole OpenAlex snapshot to S3. Run it on the cluster that holds the snapshot.
+It uploads bounded batches through a transient S3 prefix, prefetches up to ten
+batches concurrently, and imports exactly one batch at a time because SQLite
+supports only one writer:
+
+```bash
+openalex-aws import-snapshot /cluster/path/to/openalex-snapshot \
+  --processed-file /cluster/path/to/original-import/processed \
+  --batch-gib 10 \
+  --prefetch-batches 10 \
+  --yes \
+  -- \
+  --from-year 2010 \
+  --to-publication-date 2025-12-31 \
+  --language en \
+  --domain-id 1,2,3,4 \
+  --work-type article \
+  --require-abstract \
+  --disable-references
+```
+
+Pass the same compile filters as the original partial import. Start without
+`--yes` or add `--dry-run` to inspect the file count, completed checkpoint,
+remaining bytes, batch count, and maximum transient S3 footprint without
+making AWS calls. The original `processed` file is normalized against the
+current snapshot tree; files recorded there are neither uploaded nor parsed.
+
+The command prints a job ID. Its durable state and per-batch logs are stored
+under `s3://BUCKET/PREFIX/import-jobs/JOB_ID/`. Resume from the cluster with
+the same snapshot and compile arguments:
+
+```bash
+openalex-aws import-snapshot /cluster/path/to/openalex-snapshot \
+  --resume-job JOB_ID \
+  --steal-lease \
+  --yes
+```
+
+Uploaded-but-not-imported batches are reused, completed batches are skipped,
+and an in-flight SSM command is reconciled before any retry. Resume
+automatically reuses the job's pinned compile filters, batch size, prefetch
+window, database URI, and CPU instance. A failed batch is not retried
+automatically; inspect its S3 logs and pass `--retry-failed`. Only one cluster
+controller can own a job; after a controller is definitely gone, pass
+`--steal-lease` to take it over. Reference insertion is deliberately not
+supported by this streaming command because the current citation table is not
+replay-idempotent.
+The EC2 database remains on instance-store NVMe until all batches finish.
+Do not stop or terminate the CPU worker during the import: because the default
+policy uploads the database only once at the end, stopping the instance loses
+new progress unless a durable checkpoint exists.
+
+To protect progress before stopping the worker, first stop the cluster
+controller and create a durable checkpoint:
+
+```bash
+openalex-aws checkpoint-snapshot JOB_ID \
+  --steal-lease \
+  --yes
+```
+
+The command waits for a recorded in-flight batch, takes the same EC2 import
+lock, uses SQLite's online backup API, runs `PRAGMA quick_check` against the
+standalone backup, and uploads `articles.db` plus `processed` under a unique
+S3 checkpoint prefix. The job state is updated only after size and SHA-256
+metadata are durable. By default the previous checkpoint is deleted after the
+new one is durable; use `--keep-previous` to retain it or
+`--skip-quick-check` to omit the potentially expensive integrity scan. If
+instance-store is later lost,
+`import-snapshot --resume-job` automatically restores the latest checkpoint,
+resets later batches to pending, and replays only work completed after that
+checkpoint.
+
+At completion, EC2 runs SQLite `PRAGMA quick_check`, uploads a candidate,
+backs up the configured S3 database, promotes the validated candidate, and
+then pauses the worker. `--no-promote` leaves the candidate for manual review;
+`--keep-worker-running` suppresses the final pause.
 
 Run embeddings on the L4 with one CUDA process:
 

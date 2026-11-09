@@ -33,6 +33,7 @@ COMMANDS = {
     "vacuum": "openalex.db.vacuum",
     "visualize-cluster-topics": "openalex.visualizations.cluster_topics",
     "visualize-new-links": "openalex.visualizations.new_links",
+    "visualize-shapes": "openalex.visualizations.shape_gallery",
 }
 
 

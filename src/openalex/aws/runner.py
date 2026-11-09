@@ -1443,14 +1443,20 @@ echo "Started AWS pipeline runner {run_id}"
 """
 
 
-def send_ssm_command(session, instance_id: str, launcher_script: str, run_id: str) -> str:
+def send_ssm_command(
+    session,
+    instance_id: str,
+    launcher_script: str,
+    run_id: str,
+    timeout_seconds: int = 3600,
+) -> str:
     ssm = session.client("ssm")
     response = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
         Comment=f"openalex pipeline run {run_id}",
         Parameters={"commands": [launcher_script]},
-        TimeoutSeconds=3600,
+        TimeoutSeconds=timeout_seconds,
     )
     return response["Command"]["CommandId"]
 

@@ -8,11 +8,11 @@ from collections.abc import Sequence
 
 from openalex.artifacts import cli as artifact_cli
 
-from . import configure, runner, website
+from . import configure, runner, snapshot_checkpoint, snapshot_import, website
 
 LIFECYCLE_COMMANDS = {"setup", "start", "pause", "workers", "notifications", "destroy"}
 RUN_COMMANDS = {"submit", "status", "logs", "artifacts", "download", "cancel"}
-PIPELINE_COMMANDS = {"website"}
+PIPELINE_COMMANDS = {"checkpoint-snapshot", "import-snapshot", "website"}
 ARTIFACT_COMMANDS = {"hydrate", "inspect", "pin", "publish"}
 
 
@@ -39,8 +39,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return configure.main(values)
     if values[0] in RUN_COMMANDS:
         return runner.main(values)
-    if values[0] in PIPELINE_COMMANDS:
+    if values[0] == "website":
         return website.main(values[1:])
+    if values[0] == "import-snapshot":
+        return snapshot_import.main(values[1:])
+    if values[0] == "checkpoint-snapshot":
+        return snapshot_checkpoint.main(values[1:])
     if values[0] in ARTIFACT_COMMANDS:
         return artifact_cli.main(values)
     raise SystemExit(f"Unknown AWS command: {values[0]}")
