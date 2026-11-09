@@ -194,8 +194,13 @@ def write_shape_gallery(
     years: np.ndarray,
     output_dir: str | Path,
     exemplars: Mapping[str, str] | None = None,
+    *,
+    persistent: bool = True,
 ) -> list[Path]:
-    """Write the seven slide PDFs and return their paths."""
+    """Write the slide PDFs and return their paths.
+
+    The two persistent-link violins are omitted when ``persistent`` is false.
+    """
     if not series:
         raise ValueError("At least one classified cluster is required")
     year_grid = np.asarray(years, dtype=int)
@@ -221,18 +226,23 @@ def write_shape_gallery(
     written.append(
         _save(_diversity_figure(series), destination / "author_primary_topic_diversity.pdf")
     )
-    written.append(
-        _save(
-            _persistent_figure(series, lag=1),
-            destination / "persistent_new_links_y_plus_1.pdf",
+    if persistent:
+        written.append(
+            _save(
+                _persistent_figure(series, lag=1),
+                destination / "persistent_new_links_y_plus_1.pdf",
+            )
         )
-    )
-    written.append(
-        _save(
-            _persistent_figure(series, lag=3),
-            destination / "persistent_new_links_y_plus_3.pdf",
+        written.append(
+            _save(
+                _persistent_figure(series, lag=3),
+                destination / "persistent_new_links_y_plus_3.pdf",
+            )
         )
-    )
+    else:
+        logger.warning(
+            "Skipping persistent-link violins; repeat counts are not available"
+        )
     logger.info("Wrote %s shape figures to %s", len(written), destination)
     return written
 
@@ -245,7 +255,7 @@ def load_trends(
     links_dir: str | Path | None = None,
     *,
     level: int = 0,
-) -> tuple[list[ClusterSeries], np.ndarray]:
+) -> tuple[list[ClusterSeries], np.ndarray, bool]:
     """Load classified series from ``cluster_trends.csv`` and its sibling tables."""
     root = Path(clusters_dir).expanduser().resolve()
     observed = _read_cluster_year(root / "cluster_by_year.csv", level)
@@ -297,12 +307,12 @@ def load_trends(
                     log_share=log_share(papers, share),
                     adjusted=activity,
                     diversity=diversity.get(group),
-                    within_by_lag=repeats.get(group, {}),
+                    within_by_lag={} if repeats is None else repeats.get(group, {}),
                 )
             )
     if not series:
         raise ValueError(f"No trend rows at level {level}")
-    return series, years
+    return series, years, repeats is not None
 
 
 def _align_counts(
@@ -353,20 +363,24 @@ def _read_diversity(root: Path) -> dict[int, float | None]:
     return diversity
 
 
-def _read_repeats(root: Path) -> dict[int, dict[int, int | None]]:
+def _read_repeats(root: Path) -> dict[int, dict[int, int | None]] | None:
+    """Return within-cluster repeat counts, or None when they are unavailable."""
     path = root.expanduser().resolve() / "cluster_link_distance_summary.csv"
     if not path.is_file():
-        raise FileNotFoundError(
-            f"{path} was not found. Run visualize-new-links first."
+        logger.warning(
+            "%s was not found. Persistent-link violins will be skipped.", path
         )
+        return None
     repeats: dict[int, dict[int, int | None]] = {}
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or "repeat_link_probability_by_lag" not in reader.fieldnames:
-            raise ValueError(
-                f"{path} has no repeat_link_probability_by_lag column. "
-                "Rerun visualize-new-links."
+            logger.warning(
+                "%s has no repeat_link_probability_by_lag column. "
+                "Persistent-link violins will be skipped.",
+                path,
             )
+            return None
         for row in reader:
             repeats[int(row["cluster_id"])] = _within_by_lag(
                 row["repeat_link_probability_by_lag"]
@@ -705,7 +719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     patterns = parse_exemplars(args.exemplar)
     trends = args.trends or (args.clusters_dir / "cluster_trends.csv")
-    series, years = load_trends(
+    series, years, persistent = load_trends(
         trends,
         args.clusters_dir,
         args.events_dir,
@@ -713,7 +727,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.new_link_visualizations_dir,
         level=args.level,
     )
-    write_shape_gallery(series, years, args.output_dir, patterns)
+    write_shape_gallery(
+        series, years, args.output_dir, patterns, persistent=persistent
+    )
     return 0
 
 

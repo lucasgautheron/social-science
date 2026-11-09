@@ -350,15 +350,77 @@ def test_load_trends_rebuilds_the_year_grid(tmp_path: Path):
                 ),
             }
         )
-    series, years = load_trends(
+    series, years, persistent = load_trends(
         clusters / "cluster_trends.csv",
         clusters,
         topics_dir=topics,
         links_dir=links,
     )
+    assert persistent is True
     assert years.tolist() == [2010, 2011]
     assert series[0].log_share[0] == pytest.approx(np.log(0.01))
     assert series[0].keywords == ("nanotube", "swnts")
     assert series[0].adjusted.tolist() == [1.0, 2.0]
     assert series[0].diversity == pytest.approx(0.4)
     assert series[0].within_by_lag == {1: 8}
+
+
+def test_missing_repeat_column_skips_link_violins(tmp_path: Path):
+    clusters = tmp_path / "event_clusters"
+    clusters.mkdir()
+    with (clusters / "cluster_by_year.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["level", "group", "year", "papers", "share"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"level": 0, "group": 4, "year": 2010, "papers": 0, "share": 0.0}
+        )
+        writer.writerow(
+            {"level": 0, "group": 4, "year": 2011, "papers": 10, "share": 0.1}
+        )
+    with (clusters / "cluster_trends.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["level", "group", "keywords", "sub", "activity"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "level": 0,
+                "group": 4,
+                "keywords": "nanotube",
+                "sub": "steady decline",
+                "activity": "[1.0, 2.0]",
+            }
+        )
+    topics = tmp_path / "topics"
+    topics.mkdir()
+    with (topics / "cluster_topic_summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["cluster_id", "author_rao_stirling_diversity"]
+        )
+        writer.writeheader()
+        writer.writerow({"cluster_id": 4, "author_rao_stirling_diversity": "0.4"})
+    links = tmp_path / "links"
+    links.mkdir()
+    with (links / "cluster_link_distance_summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["cluster_id", "paper_count"])
+        writer.writeheader()
+        writer.writerow({"cluster_id": 4, "paper_count": "10"})
+    _series, _years, persistent = load_trends(
+        clusters / "cluster_trends.csv",
+        clusters,
+        topics_dir=topics,
+        links_dir=links,
+    )
+    assert persistent is False
+    _series, _years, missing_file = load_trends(
+        clusters / "cluster_trends.csv",
+        clusters,
+        topics_dir=topics,
+        links_dir=tmp_path / "missing",
+    )
+    assert missing_file is False
+    paths = write_shape_gallery(_corpus(), YEARS, tmp_path / "figures", persistent=False)
+    assert [path.name for path in paths] == list(OUTPUT_NAMES[:5])
+    assert not (tmp_path / "figures" / "persistent_new_links_y_plus_1.pdf").exists()
