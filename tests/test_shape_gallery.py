@@ -313,6 +313,10 @@ def test_diversity_mean_matches_the_plotted_clusters():
     assert labels["covid"].xy[1] == pytest.approx(0.9)
     scatter = _ink_scatter(figure.axes[0])
     assert sorted(point[1] for point in scatter) == pytest.approx([0.2, 0.5, 0.6, 0.7, 0.9])
+    centers = [float(line.get_xdata().mean()) for line in figure.axes[0].lines]
+    assert all(
+        any(point[0] == pytest.approx(center) for center in centers) for point in scatter
+    )
     tick = figure.axes[0].get_xticklabels()[1].get_text()
     assert "n=2" in tick
     figure.clf()
@@ -330,6 +334,11 @@ def test_zero_repeat_counts_are_omitted_from_the_log_axis():
     assert "llm" not in _labels(axis)
     assert "hydroxychloroquine" not in _labels(axis)
     assert sorted(point[1] for point in _ink_scatter(axis)) == pytest.approx([6.0, 9.0, 10.0])
+    centers = [float(line.get_xdata().mean()) for line in axis.lines]
+    assert all(
+        any(point[0] == pytest.approx(center) for center in centers)
+        for point in _ink_scatter(axis)
+    )
     figure.clf()
 
 

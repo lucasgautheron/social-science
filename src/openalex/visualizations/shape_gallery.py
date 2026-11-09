@@ -778,10 +778,9 @@ def _draw_exemplar_points(axis, marks: Sequence[Sequence[tuple[str, float]]]) ->
     positions = (1, 2, 3, 4)
     label_size = 15
     for position, panel in zip(positions, marks, strict=True):
-        for index, (label, value) in enumerate(panel):
-            x = position + 0.22 + 0.07 * index
+        for label, value in panel:
             axis.scatter(
-                [x],
+                [position],
                 [value],
                 s=86,
                 color=INK,
@@ -791,7 +790,7 @@ def _draw_exemplar_points(axis, marks: Sequence[Sequence[tuple[str, float]]]) ->
             )
             axis.annotate(
                 label,
-                (x, value),
+                (position, value),
                 xytext=(6, _glyph_center_shift(label, label_size)),
                 textcoords="offset points",
                 ha="left",
