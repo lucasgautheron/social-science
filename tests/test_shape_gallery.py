@@ -1,5 +1,6 @@
 import csv
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib
@@ -381,11 +382,33 @@ def test_outside_repeats_use_the_outside_count():
     scatter.clf()
 
 
-def test_write_shape_gallery_writes_seven_pdfs(tmp_path: Path):
+def _slide_names(pdf_names: Sequence[str]) -> list[str]:
+    return [name for pdf in pdf_names for name in (pdf, pdf.replace(".pdf", ".png"))]
+
+
+def _png_dpi(path: Path) -> float:
+    data = path.read_bytes()
+    offset = 8
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        kind = data[offset + 4 : offset + 8]
+        chunk = data[offset + 8 : offset + 8 + length]
+        if kind == b"pHYs":
+            return int.from_bytes(chunk[:4], "big") * 0.0254
+        offset += 12 + length
+    raise AssertionError(f"{path} has no PNG resolution chunk")
+
+
+def test_write_shape_gallery_writes_pdfs_and_pngs(tmp_path: Path):
     paths = write_shape_gallery(_corpus(), YEARS, tmp_path)
-    assert [path.name for path in paths] == list(OUTPUT_NAMES)
+    assert [path.name for path in paths] == _slide_names(OUTPUT_NAMES)
     for path in paths:
-        assert path.read_bytes().startswith(b"%PDF")
+        header = path.read_bytes()[:8]
+        if path.suffix == ".pdf":
+            assert header.startswith(b"%PDF")
+        else:
+            assert header.startswith(b"\x89PNG\r\n\x1a\n")
+            assert _png_dpi(path) == pytest.approx(300, abs=0.1)
 
 
 def test_load_trends_rebuilds_the_year_grid(tmp_path: Path):
@@ -513,6 +536,8 @@ def test_missing_repeat_column_skips_link_violins(tmp_path: Path):
     )
     assert missing_file is False
     paths = write_shape_gallery(_corpus(), YEARS, tmp_path / "figures", persistent=False)
-    assert [path.name for path in paths] == list(OUTPUT_NAMES[:5])
+    assert [path.name for path in paths] == _slide_names(OUTPUT_NAMES[:5])
     assert not (tmp_path / "figures" / "persistent_new_links_y_plus_1.pdf").exists()
+    assert not (tmp_path / "figures" / "persistent_new_links_y_plus_1.png").exists()
     assert not (tmp_path / "figures" / "outside_new_links_y_plus_1.pdf").exists()
+    assert not (tmp_path / "figures" / "outside_new_links_y_plus_1.png").exists()

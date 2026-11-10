@@ -71,6 +71,7 @@ GALLERIES = (
     ("shapes_topic_adjusted.pdf", "adjusted", "Topic-adjusted log share", False),
 )
 FIGURE_SIZE = (13.33, 7.5)
+PNG_DPI = 300
 OUTPUT_NAMES = (
     *(name for name, *_rest in GALLERIES),
     "author_primary_topic_diversity.pdf",
@@ -206,7 +207,7 @@ def write_shape_gallery(
     *,
     persistent: bool = True,
 ) -> list[Path]:
-    """Write the slide PDFs and return their paths.
+    """Write each slide as a PDF and a 300 dpi PNG, and return their paths.
 
     Link violins and scatters are omitted when ``persistent`` is false.
     """
@@ -225,68 +226,50 @@ def write_shape_gallery(
     patterns = dict(exemplars) if exemplars is not None else parse_exemplars(None)
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    written = [
-        _save(
-            _gallery_figure(series, year_grid, key, ylabel, symmetric, patterns),
-            destination / name,
+    written: list[Path] = []
+    for name, key, ylabel, symmetric in GALLERIES:
+        written.extend(
+            _save(
+                _gallery_figure(series, year_grid, key, ylabel, symmetric, patterns),
+                destination / name,
+            )
         )
-        for name, key, ylabel, symmetric in GALLERIES
-    ]
-    written.append(
+    written.extend(
         _save(
             _diversity_figure(series, patterns),
             destination / "author_primary_topic_diversity.pdf",
         )
     )
     if persistent:
-        written.append(
-            _save(
-                _persistent_figure(series, lag=1, patterns=patterns),
-                destination / "persistent_new_links_y_plus_1.pdf",
-            )
-        )
-        written.append(
-            _save(
-                _persistent_figure(series, lag=3, patterns=patterns),
-                destination / "persistent_new_links_y_plus_3.pdf",
-            )
-        )
-        written.append(
-            _save(
+        for name, figure in (
+            ("persistent_new_links_y_plus_1.pdf", _persistent_figure(series, lag=1, patterns=patterns)),
+            ("persistent_new_links_y_plus_3.pdf", _persistent_figure(series, lag=3, patterns=patterns)),
+            (
+                "outside_new_links_y_plus_1.pdf",
                 _persistent_figure(series, lag=1, patterns=patterns, kind="outside"),
-                destination / "outside_new_links_y_plus_1.pdf",
-            )
-        )
-        written.append(
-            _save(
+            ),
+            (
+                "outside_new_links_y_plus_3.pdf",
                 _persistent_figure(series, lag=3, patterns=patterns, kind="outside"),
-                destination / "outside_new_links_y_plus_3.pdf",
-            )
-        )
-        written.append(
-            _save(
+            ),
+            (
+                "persistent_new_links_by_size_y_plus_1.pdf",
                 _persistent_size_figure(series, lag=1, patterns=patterns),
-                destination / "persistent_new_links_by_size_y_plus_1.pdf",
-            )
-        )
-        written.append(
-            _save(
+            ),
+            (
+                "persistent_new_links_by_size_y_plus_3.pdf",
                 _persistent_size_figure(series, lag=3, patterns=patterns),
-                destination / "persistent_new_links_by_size_y_plus_3.pdf",
-            )
-        )
-        written.append(
-            _save(
+            ),
+            (
+                "outside_new_links_by_size_y_plus_1.pdf",
                 _persistent_size_figure(series, lag=1, patterns=patterns, kind="outside"),
-                destination / "outside_new_links_by_size_y_plus_1.pdf",
-            )
-        )
-        written.append(
-            _save(
+            ),
+            (
+                "outside_new_links_by_size_y_plus_3.pdf",
                 _persistent_size_figure(series, lag=3, patterns=patterns, kind="outside"),
-                destination / "outside_new_links_by_size_y_plus_3.pdf",
-            )
-        )
+            ),
+        ):
+            written.extend(_save(figure, destination / name))
     else:
         logger.warning("Skipping link figures; repeat counts are not available")
     logger.info("Wrote %s shape figures to %s", len(written), destination)
@@ -934,14 +917,22 @@ def _bold_ticks(figure, *, size: int, axis: str = "both") -> None:
             label.set_color(INK)
 
 
-def _save(figure, path: Path) -> Path:
+def _save(figure, path: Path) -> list[Path]:
+    """Write a PDF and a 300 dpi PNG, then close the figure."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp.pdf")
-    figure.savefig(temporary, format="pdf")
+    saved = []
+    for suffix, options in (
+        (".pdf", {"format": "pdf"}),
+        (".png", {"format": "png", "dpi": PNG_DPI}),
+    ):
+        target = path.with_suffix(suffix)
+        temporary = target.with_name(f".{target.name}.tmp{suffix}")
+        figure.savefig(temporary, facecolor="white", **options)
+        temporary.replace(target)
+        saved.append(target)
     figure.clf()
     _pyplot().close(figure)
-    temporary.replace(path)
-    return path
+    return saved
 
 
 def _pyplot():
