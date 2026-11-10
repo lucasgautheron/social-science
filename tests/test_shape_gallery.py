@@ -212,7 +212,11 @@ def test_rise_and_decline_subclasses_share_a_panel():
         True,
         parse_exemplars(None),
     )
-    counts = [sum(len(collection.get_segments()) for collection in axis.collections) for axis in figure.axes]
+    panels = [axis for axis in figure.axes if axis.get_label() != "frequency"]
+    counts = [
+        sum(len(collection.get_segments()) for collection in axis.collections)
+        for axis in panels
+    ]
     assert counts == [2, 3, 2, 2]
     assert figure.axes[0].get_title().startswith("Rising")
     assert "Declining" in figure.axes[1].get_title()
@@ -300,6 +304,38 @@ def test_highlight_labels_are_left_anchored():
     figure.clf()
 
 
+def test_frequency_inset_plots_raw_share_in_a_lower_right_square():
+    series = _corpus()
+    llm = series[0]
+    nanowires = next(row for row in series if row.label == "nanowires")
+    nanotube = next(row for row in series if row.label == "nanotube")
+    figure = _gallery_figure(
+        series,
+        YEARS,
+        "log_share",
+        "Share of publications",
+        False,
+        parse_exemplars(None),
+    )
+    figure.canvas.draw()
+    insets = [axis for axis in figure.axes if axis.get_label() == "frequency"]
+    assert len(insets) == 4
+    assert all(axis.get_yscale() == "linear" for axis in insets)
+    rising = _ink_lines(insets[0])
+    declining = _ink_lines(insets[1])
+    assert rising[-1].get_ydata() == pytest.approx(llm.share)
+    assert declining[0].get_ydata() == pytest.approx(nanowires.share)
+    assert declining[1].get_ydata() == pytest.approx(nanotube.share)
+    width, height = figure.get_size_inches()
+    for parent, inset in zip(figure.axes[:4], insets, strict=True):
+        panel = parent.get_position()
+        box = inset.get_position()
+        assert box.width * width == pytest.approx(box.height * height, rel=0.02)
+        assert box.x0 > panel.x0 + 0.45 * panel.width
+        assert box.y1 < panel.y0 + 0.55 * panel.height
+    figure.clf()
+
+
 def test_diversity_mean_matches_the_plotted_clusters():
     figure = _diversity_figure(_corpus())
     labels = _labels(figure.axes[0])
@@ -365,7 +401,7 @@ def test_outside_repeats_use_the_outside_count():
     series = _corpus()
     figure = _persistent_figure(series, lag=1, kind="outside")
     axis = figure.axes[0]
-    assert axis.get_ylabel() == "Outside-cluster repeats"
+    assert axis.get_ylabel() == "New links repeated outside the bubble"
     assert "n=1" in axis.get_xticklabels()[0].get_text()
     assert "n=2" in axis.get_xticklabels()[1].get_text()
     assert _labels(axis)["8.0"].get_text() == "8.0"
@@ -378,7 +414,7 @@ def test_outside_repeats_use_the_outside_count():
         point for collection in scatter.axes[0].collections for point in collection.get_offsets()
     ]
     assert {int(round(point[1])) for point in offsets} == {1, 2, 3, 4, 8, 11}
-    assert scatter.axes[0].get_ylabel() == "Outside-cluster repeats"
+    assert scatter.axes[0].get_ylabel() == "New links repeated outside the bubble"
     scatter.clf()
 
 

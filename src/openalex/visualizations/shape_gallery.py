@@ -490,7 +490,45 @@ def _gallery_figure(
     figure.supylabel(ylabel, fontsize=20, fontweight="bold", color=INK)
     figure.tight_layout(rect=(0.03, 0.03, 0.995, 0.985))
     _bold_ticks(figure, size=16)
+    for axis, (_title, _members, highlights) in zip(axes.ravel(), grouped, strict=True):
+        _frequency_inset(axis, years, highlights)
     return figure
+
+
+def _frequency_inset(axis, years: np.ndarray, highlights: Sequence[ClusterSeries]):
+    """Draw the highlighted clusters' yearly frequency in a square inset."""
+    if not highlights:
+        return
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+    inset = inset_axes(
+        axis,
+        width=1.05,
+        height=1.05,
+        loc="lower right",
+        borderpad=0.45,
+    )
+    inset.set_label("frequency")
+    _style_axis(inset)
+    inset.patch.set_facecolor("white")
+    inset.patch.set_alpha(1)
+    inset.set_zorder(axis.get_zorder() + 5)
+    inset.set_xlim(axis.get_xlim())
+    shares = np.concatenate([np.asarray(row.share, dtype=float) for row in highlights])
+    finite = shares[np.isfinite(shares)]
+    low = min(0.0, float(finite.min()) if finite.size else 0.0)
+    high = max(0.0, float(finite.max()) if finite.size else 1.0)
+    span = high - low or 1.0
+    inset.set_ylim(low, high + 0.14 * span)
+    for row in highlights:
+        inset.plot(years, row.share, color="white", lw=3.2, zorder=4, solid_capstyle="round")
+        inset.plot(years, row.share, color=INK, lw=1.6, zorder=5, solid_capstyle="round")
+    inset.tick_params(axis="x", labelbottom=False, colors=INK, width=0.8, length=2.5)
+    inset.tick_params(axis="y", labelsize=7, colors=INK, width=0.8, length=2.5)
+    inset.set_title("Frequency", color=INK, fontsize=8, fontweight="bold", pad=2)
+    for label in inset.get_yticklabels():
+        label.set_fontweight("bold")
+        label.set_color(INK)
 
 
 def _place_labels(
@@ -590,7 +628,7 @@ def _repeat_ylabel(kind: str) -> str:
     if kind == "within":
         return "Persistent new links"
     if kind == "outside":
-        return "Outside-cluster repeats"
+        return "New links repeated outside the bubble"
     raise ValueError(f"Unknown repeat kind {kind!r}")
 
 
