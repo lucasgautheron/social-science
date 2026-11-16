@@ -513,13 +513,11 @@ def _frequency_inset(axis, years: np.ndarray, highlights: Sequence[ClusterSeries
     inset.patch.set_facecolor("white")
     inset.patch.set_alpha(1)
     inset.set_zorder(axis.get_zorder() + 5)
+    _detach_shared_y(inset)
+    inset.set_yscale("linear")
     inset.set_xlim(axis.get_xlim())
     shares = np.concatenate([np.asarray(row.share, dtype=float) for row in highlights])
-    finite = shares[np.isfinite(shares)]
-    low = min(0.0, float(finite.min()) if finite.size else 0.0)
-    high = max(0.0, float(finite.max()) if finite.size else 1.0)
-    span = high - low or 1.0
-    inset.set_ylim(low, high + 0.14 * span)
+    inset.set_ylim(*_frequency_limits(shares))
     for row in highlights:
         inset.plot(years, row.share, color="white", lw=3.2, zorder=4, solid_capstyle="round")
         inset.plot(years, row.share, color=INK, lw=1.6, zorder=5, solid_capstyle="round")
@@ -529,6 +527,26 @@ def _frequency_inset(axis, years: np.ndarray, highlights: Sequence[ClusterSeries
     for label in inset.get_yticklabels():
         label.set_fontweight("bold")
         label.set_color(INK)
+
+
+def _detach_shared_y(axis) -> None:
+    """Keep this axes from following another axes' y limits."""
+    group = axis.get_shared_y_axes()
+    for other in list(group.get_siblings(axis)):
+        if other is not axis:
+            group.remove(other)
+
+
+def _frequency_limits(values: np.ndarray) -> tuple[float, float]:
+    """Scale one inset from zero to its own highlighted frequencies."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return (0.0, 1.0)
+    low = min(0.0, float(finite.min()))
+    high = max(0.0, float(finite.max()))
+    span = high - low or 1.0
+    return (low, high + 0.14 * span)
 
 
 def _place_labels(

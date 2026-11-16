@@ -321,6 +321,13 @@ def test_frequency_inset_plots_raw_share_in_a_lower_right_square():
     insets = [axis for axis in figure.axes if axis.get_label() == "frequency"]
     assert len(insets) == 4
     assert all(axis.get_yscale() == "linear" for axis in insets)
+    rising_low, rising_high = insets[0].get_ylim()
+    assert rising_low == pytest.approx(0.0)
+    assert rising_high == pytest.approx(float(llm.share.max()) * 1.14)
+    shock = next(row for row in series if row.label == "hydroxychloroquine")
+    assert insets[2].get_ylim()[1] > shock.share.max()
+    assert rising_high < insets[2].get_ylim()[1]
+    assert len({tuple(round(value, 6) for value in axis.get_ylim()) for axis in insets}) == 4
     rising = _ink_lines(insets[0])
     declining = _ink_lines(insets[1])
     assert rising[-1].get_ydata() == pytest.approx(llm.share)
