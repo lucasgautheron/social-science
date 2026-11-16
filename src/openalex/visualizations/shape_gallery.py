@@ -760,7 +760,7 @@ def _persistent_size_figure(
     formatter = LogFormatterMathtext(base=10)
     axis.xaxis.set_major_formatter(formatter)
     axis.yaxis.set_major_formatter(formatter)
-    axis.set_xlabel("Cluster size", color=INK, fontsize=20, fontweight="bold")
+    axis.set_xlabel("Bubble size", color=INK, fontsize=20, fontweight="bold")
     axis.set_ylabel(_repeat_ylabel(kind), color=INK, fontsize=20, fontweight="bold")
     handles, labels = axis.get_legend_handles_labels()
     if handles:

@@ -465,14 +465,17 @@ openalex cluster-trends \
   --cluster-topic-visualizations-dir output/cluster_topic_visualizations
 ```
 
-`openalex visualize-shapes` writes seven widescreen PDFs for slides. Four
+`openalex visualize-shapes` writes each widescreen slide as a PDF and a 300 dpi PNG. Four
 galleries show the collapsed rise and decline classes and the two shock
 classes, with `llm`, two `nano*` declines, `hydroxychloroquine`, and `covid`
-drawn on top. The curves are the yearly share, its logarithm, and the
+drawn on top. Each panel has a square inset of those highlighted
+clusters' yearly frequency. The curves are the yearly share, its logarithm, and the
 topic-adjusted log share, each also in a shape-scaled form. One violin shows
-author primary-topic diversity. Two more show the number of new links that
-publish again inside the originating cluster at y+1 and at y+3, on a
-logarithmic axis.
+author primary-topic diversity. Four more show the number of new links that
+publish again inside the originating cluster, and outside it, at y+1 and at
+y+3, on a logarithmic axis. Four scatters plot bubble size against those
+same counts. The link figures are skipped when the link-distance summary has
+no repeat-count column, and the other five slides are still written.
 
 ```bash
 openalex visualize-shapes \
@@ -754,9 +757,10 @@ without refitting:
 openalex topics --output-dir output/topics --export-topic-vectors
 ```
 
-Set `OPENALEX_AUTO_HYDRATE=0` to disable local preflight. Cache, lockfile, and
-state paths can be overridden with `OPENALEX_ARTIFACT_CACHE`,
-`OPENALEX_ARTIFACT_LOCK`, and `OPENALEX_ARTIFACT_STATE`.
+Set `OPENALEX_AUTO_HYDRATE=0` to disable local preflight. The artifact cache
+is `.openalex-cache/artifacts` in the working directory. Lockfile and state
+paths can be overridden with `OPENALEX_ARTIFACT_LOCK` and
+`OPENALEX_ARTIFACT_STATE`. Set `OPENALEX_ARTIFACT_CACHE` to move the cache.
 
 `status` reads the durable run state from S3. Add `--live` to query the worker
 directly through SSM and display the process state, fast-storage usage, database

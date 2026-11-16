@@ -392,7 +392,7 @@ def test_size_scatter_plots_within_counts_against_cluster_size():
     axis = figure.axes[0]
     assert axis.get_xscale() == "log"
     assert axis.get_yscale() == "log"
-    assert axis.get_xlabel() == "Cluster size"
+    assert axis.get_xlabel() == "Bubble size"
     offsets = [point for collection in axis.collections for point in collection.get_offsets()]
     plotted = {int(round(point[1])) for point in offsets}
     assert plotted == {2, 3, 4, 5, 6, 9, 10}
